@@ -5,7 +5,7 @@ Currently supports Open-Meteo (historical and forecast).
 import pandas as pd
 import numpy as np
 from datetime import date, datetime, timedelta
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import requests
 import json
 from pathlib import Path
@@ -264,6 +264,12 @@ class OpenMeteoSource(WeatherSource):
         site_coords = {
             "test_site_001": (35.222866, 9.090245),
             "test_site_002": (34.0, 8.0),
+            "test_nairobi": (-1.2921, 36.8219),
+            "kenya_eldoret": (0.5143, 35.2698),
+            "kenya_nairobi": (-1.2921, 36.8219),
+            "ghana_kumasi": (6.6885, -1.6244),
+            "ethiopia_addis": (9.0320, 38.7497),
+            "nigeria_kano": (12.0022, 8.5919),
         }
 
         if site_id in site_coords:

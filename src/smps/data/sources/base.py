@@ -328,6 +328,32 @@ class SoilSource(DataSource):
         """Fetch soil profile data"""
         pass
 
+    def fetch(self, request: DataFetchRequest) -> DataFetchResult:
+        """Implementation of base fetch method for soil sources"""
+        start_time = datetime.now()
+
+        try:
+            # Get soil profile
+            profile = self.fetch_soil_profile(request.site_id)
+
+            return DataFetchResult(
+                data=profile,
+                metadata={
+                    'source': self.name,
+                    'site_id': request.site_id
+                },
+                quality_score=profile.confidence if hasattr(profile, 'confidence') else 1.0,
+                cache_hit=False,
+                processing_time_ms=(datetime.now() - start_time).total_seconds() * 1000
+            )
+        except Exception as e:
+            return DataFetchResult(
+                data=None,
+                metadata={'error': str(e)},
+                quality_score=0.0,
+                errors=[str(e)]
+            )
+
     def _get_max_cache_age_hours(self, request: DataFetchRequest) -> float:
         """Soil data changes very slowly - cache for 30 days"""
         return 30 * 24  # 30 days

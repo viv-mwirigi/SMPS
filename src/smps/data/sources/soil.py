@@ -11,9 +11,8 @@ import json
 from smps.data.sources.base import SoilSource, DataFetchRequest
 from smps.data.contracts import SoilProfile
 from smps.physics.pedotransfer import (
-    estimate_soil_properties_from_texture,
+    estimate_soil_parameters_saxton as estimate_soil_properties_from_texture,
     classify_soil_texture,
-    estimate_hydraulic_conductivity
 )
 from smps.core.exceptions import DataSourceError
 from smps.core.types import SiteID

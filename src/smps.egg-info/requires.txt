@@ -1,0 +1,9 @@
+numpy
+pandas
+scipy
+requests
+matplotlib
+
+[dev]
+pytest
+pytest-cov

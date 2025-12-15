@@ -56,12 +56,12 @@ class SoilParameters:
     van_genuchten_n: Optional[float] = None
     bulk_density_g_cm3: Optional[float] = None
     organic_matter_percent: Optional[float] = None
-    
+
     @property
     def sand_fraction(self) -> float:
         """Sand content as fraction"""
         return self.sand_percent / 100.0
-    
+
     @property
     def clay_fraction(self) -> float:
         """Clay content as fraction"""
@@ -73,7 +73,7 @@ class SoilLayer(str, Enum):
     SURFACE = "surface"  # 0-10cm
     ROOT_ZONE = "root_zone"  # 10-40cm
     DEEP = "deep"  # 40-100cm
-    
+
     @property
     def depth_range_cm(self) -> Tuple[int, int]:
         ranges = {
@@ -117,6 +117,7 @@ class DataQualityFlag(Enum):
     CLIMATOLOGY = auto()
     UNCERTAIN = auto()
     FAILED_QC = auto()
+    FLAGGED = auto()  # Generic flag for questionable data
 
 
 @dataclass
@@ -133,10 +134,11 @@ class QualityControlResult:
 @runtime_checkable
 class DataSource(Protocol):
     """Protocol for data sources"""
+
     def fetch(self, site_id: SiteID, start_date: Date, end_date: Date) -> pd.DataFrame:
         """Fetch data for given site and date range"""
         ...
-    
+
     def get_metadata(self) -> Dict[str, Any]:
         """Get source metadata (resolution, coverage, etc.)"""
         ...
@@ -145,22 +147,23 @@ class DataSource(Protocol):
 @runtime_checkable
 class SoilMoistureModel(Protocol):
     """Protocol for soil moisture prediction models"""
+
     def fit(self, X: pd.DataFrame, y: pd.DataFrame) -> "SoilMoistureModel":
         """Train model"""
         ...
-    
+
     def predict(self, X: pd.DataFrame, return_std: bool = False) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
         """Make predictions"""
         ...
-    
+
     def explain(self, X: pd.DataFrame) -> pd.DataFrame:
         """Explain predictions (SHAP, feature importance)"""
         ...
-    
+
     def save(self, path: Path):
         """Save model to disk"""
         ...
-    
+
     @classmethod
     def load(cls, path: Path) -> "SoilMoistureModel":
         """Load model from disk"""

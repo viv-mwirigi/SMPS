@@ -373,7 +373,6 @@ def estimate_soil_parameters_rosetta(
         saturated_hydraulic_conductivity_cm_day=k_sat_cm_day,
         van_genuchten_alpha=alpha_kpa,
         van_genuchten_n=n,
-        residual_water_content=theta_r,
         bulk_density_g_cm3=bulk_density_g_cm3
     )
 
