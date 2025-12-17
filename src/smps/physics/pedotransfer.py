@@ -2,12 +2,12 @@
 Pedotransfer functions for estimating soil hydraulic parameters from texture.
 Implements multiple established methods with uncertainty estimation.
 """
+from typing import Literal
 import numpy as np
 from typing import Dict, Optional, Tuple, List
 from dataclasses import dataclass
 
 from smps.core.types import SoilParameters
-
 
 
 @dataclass
@@ -24,13 +24,18 @@ class TextureClass:
 # USDA soil texture classes
 TEXTURE_CLASSES = [
     TextureClass("sand", (85, 100), (0, 10), (0, 15), "Sand", "Sand"),
-    TextureClass("loamy_sand", (70, 90), (0, 15), (0, 30), "Loamy Sand", "Loamy Sand"),
-    TextureClass("sandy_loam", (43, 85), (0, 20), (0, 50), "Sandy Loam", "Sandy Loam"),
+    TextureClass("loamy_sand", (70, 90), (0, 15),
+                 (0, 30), "Loamy Sand", "Loamy Sand"),
+    TextureClass("sandy_loam", (43, 85), (0, 20),
+                 (0, 50), "Sandy Loam", "Sandy Loam"),
     TextureClass("loam", (23, 52), (7, 27), (28, 50), "Loam", "Loam"),
-    TextureClass("silt_loam", (0, 50), (0, 27), (50, 88), "Silt Loam", "Silt Loam"),
+    TextureClass("silt_loam", (0, 50), (0, 27),
+                 (50, 88), "Silt Loam", "Silt Loam"),
     TextureClass("silt", (0, 20), (0, 12), (80, 100), "Silt", "Silt"),
-    TextureClass("clay_loam", (20, 45), (27, 40), (15, 53), "Clay Loam", "Clay Loam"),
-    TextureClass("silty_clay_loam", (0, 20), (27, 40), (40, 73), "Silty Clay Loam", "Silty Clay Loam"),
+    TextureClass("clay_loam", (20, 45), (27, 40),
+                 (15, 53), "Clay Loam", "Clay Loam"),
+    TextureClass("silty_clay_loam", (0, 20), (27, 40), (40, 73),
+                 "Silty Clay Loam", "Silty Clay Loam"),
     TextureClass("clay", (0, 45), (40, 100), (0, 40), "Clay", "Clay"),
 ]
 
@@ -66,7 +71,7 @@ def classify_soil_texture(
     for texture_class in TEXTURE_CLASSES:
         if (texture_class.sand_range[0] <= sand_percent <= texture_class.sand_range[1] and
             texture_class.clay_range[0] <= clay_percent <= texture_class.clay_range[1] and
-            texture_class.silt_range[0] <= silt_percent <= texture_class.silt_range[1]):
+                texture_class.silt_range[0] <= silt_percent <= texture_class.silt_range[1]):
             return texture_class.name
 
     # If no exact match, find closest class
@@ -104,6 +109,39 @@ def _find_closest_texture_class(
         distances[texture] = distance
 
     return min(distances.items(), key=lambda x: x[1])[0]
+
+
+def is_tropical_location(lat: float, lon: float) -> bool:
+    """
+    Determine if a location is in the tropical zone where oxide soils dominate.
+
+    This is a simple heuristic based on:
+    - Latitude between ~23.5°N and ~23.5°S (tropics)
+    - Refinements for Africa where oxide soils (Ferralsols, Acrisols) are common
+
+    Args:
+        lat: Latitude in degrees
+        lon: Longitude in degrees
+
+    Returns:
+        True if location is likely to have tropical oxide soil characteristics
+    """
+    # Basic tropical zone check
+    if abs(lat) > 25:
+        return False
+
+    # Africa-specific refinements (where our TAHMO data is)
+    # Most of Sub-Saharan Africa has weathered oxide soils
+    if -20 <= lon <= 55:  # Africa longitude range
+        if -35 <= lat <= 25:  # Africa latitude range
+            return True
+
+    # Other tropical regions (Southeast Asia, South America)
+    # These also have extensive oxide soils
+    if -15 <= lat <= 15:
+        return True
+
+    return False
 
 
 def estimate_soil_parameters_saxton(
@@ -203,18 +241,63 @@ def estimate_soil_parameters_saxton(
         )
 
     if is_tropical_oxide_soil:
-        # Correction for Ferralsols/Oxisols (common in humid Africa)
-        # These soils have high clay but drain fast due to micro-aggregation.
+        # Tropical soil corrections based on TAHMO validation feedback
+        # Two separate phenomena need different corrections:
+        #
+        # 1. OXIDE CLAY EFFECT (clay > 30%):
+        #    Ferralsols/Oxisols have micro-aggregated clays that drain like sand
+        #    Only apply to HIGH CLAY soils - low clay sites don't need this
+        #
+        # 2. SANDY COASTAL EFFECT (sand > 50% AND clay > 18%):
+        #    Sandy soils with moderate clay in hot coastal climates drain very fast
+        #    Pure sandy soils (low clay) are already predicted correctly by Saxton-Rawls
 
-        # Increase Ksat (drainage speed) significantly
-        # Experimental multiplier often 2x to 10x; start conservative.
-        k_sat_cm_day *= 2.0
+        # OXIDE CLAY CORRECTION - only for clay > 30%
+        if clay_percent > 30:
+            # Scale effect from 30% to 45% clay
+            clay_effect = min((clay_percent - 30) / 15.0, 1.0)
 
-        # Decrease Field Capacity (holds less water against gravity than expected)
-        field_capacity *= 0.85
+            # Increase Ksat due to oxide aggregation
+            ksat_multiplier = 1.5 + 2.0 * clay_effect
+            k_sat_cm_day *= ksat_multiplier
 
-        # Adjust Porosity slightly up (granular structure)
-        porosity = min(porosity * 1.05, 0.65)
+            # Reduce FC - oxide clays hold less water than temperate equivalents
+            fc_multiplier = 0.75 - 0.15 * \
+                clay_effect  # 0.75 at 30% clay, 0.60 at 45%
+            field_capacity *= fc_multiplier
+
+            # Reduce WP proportionally
+            wp_multiplier = 0.85 - 0.10 * clay_effect
+            wilting_point *= wp_multiplier
+
+            # Slight porosity reduction
+            porosity *= 0.95
+
+        # SANDY COASTAL CORRECTION - sand > 50% AND clay > 18%
+        # This targets sites like Likoni/BaseTitanium (sandy but with enough clay
+        # to have been incorrectly estimated). Pure sandy soils (clay < 18%)
+        # like Nyankpala/Walembelle are already correct with standard PTF.
+        if sand_percent > 50 and clay_percent > 18:
+            # Scale effect from 50% to 70% sand
+            sand_effect = min((sand_percent - 50) / 20.0, 1.0)
+
+            # Sandy soils in tropics drain faster
+            k_sat_cm_day *= (1.3 + 0.7 * sand_effect)
+
+            # Clamp FC for sandy tropical soils - they hold very little water
+            # Likoni/BaseTitanium reality: FC ~0.05-0.08
+            max_fc_sandy = 0.10 - 0.02 * sand_effect  # 0.10 at 50% sand, 0.08 at 70%
+            if field_capacity > max_fc_sandy:
+                field_capacity = max_fc_sandy
+
+            # WP also very low for sandy soils
+            max_wp_sandy = 0.05 - 0.01 * sand_effect
+            if wilting_point > max_wp_sandy:
+                wilting_point = max_wp_sandy
+
+        # Ensure physical constraint: FC must be above WP
+        if field_capacity <= wilting_point * 1.15:
+            field_capacity = wilting_point * 1.20
 
     # Apply physical bounds
     porosity = np.clip(porosity, 0.30, 0.60)
@@ -269,8 +352,6 @@ def estimate_van_genuchten_parameters(
 
     return alpha_kpa, n
 
-
-from typing import Literal
 
 def estimate_soil_parameters_rosetta(
     sand_percent: float,
@@ -377,8 +458,6 @@ def estimate_soil_parameters_rosetta(
     )
 
 
-
-
 def classify_soil_texture_usda(
     sand_percent: float,
     clay_percent: float
@@ -436,8 +515,6 @@ def classify_soil_texture_usda(
             return "sandy_loam"
 
 
-
-
 def validate_soil_parameters(params: SoilParameters) -> Dict[str, str]:
     """
     Validate soil parameters for physical plausibility.
@@ -454,7 +531,8 @@ def validate_soil_parameters(params: SoilParameters) -> Dict[str, str]:
 
     # Check porosity bounds
     if params.porosity < 0.3 or params.porosity > 0.6:
-        warnings['porosity'] = f"Porosity {params.porosity:.3f} outside typical range (0.3-0.6)"
+        warnings[
+            'porosity'] = f"Porosity {params.porosity:.3f} outside typical range (0.3-0.6)"
 
     # Check field capacity > wilting point
     if params.field_capacity <= params.wilting_point:
@@ -499,10 +577,12 @@ def check_consistency_across_methods(
     for method in methods:
         try:
             if method == "saxton":
-                params = estimate_soil_parameters_saxton(sand_percent, clay_percent)
+                params = estimate_soil_parameters_saxton(
+                    sand_percent, clay_percent)
 
             elif method == "rosetta":
-                params = estimate_soil_parameters_rosetta(sand_percent, clay_percent)
+                params = estimate_soil_parameters_rosetta(
+                    sand_percent, clay_percent)
             else:
                 continue
 
@@ -518,6 +598,7 @@ def check_consistency_across_methods(
             results[method] = {'error': str(e)}
 
     return results
+
 
 def convert_units(
     params: SoilParameters,
@@ -562,6 +643,7 @@ def convert_units(
 
     return converted
 
+
 def estimate_parameter_uncertainty(
     soil_params: SoilParameters,
     confidence_level: float = 0.95
@@ -579,13 +661,15 @@ def estimate_parameter_uncertainty(
         "porosity": 0.10,  # ±10%
         "field_capacity": 0.15,  # ±15%
         "wilting_point": 0.20,  # ±20%
-        "saturated_hydraulic_conductivity_cm_day": 0.50,  # ±50% (high uncertainty)
+        # ±50% (high uncertainty)
+        "saturated_hydraulic_conductivity_cm_day": 0.50,
         "van_genuchten_alpha": 0.30,
         "van_genuchten_n": 0.15,
     }
 
     # Z-score for confidence level
-    z_score = {0.90: 1.645, 0.95: 1.96, 0.99: 2.576}.get(confidence_level, 1.96)
+    z_score = {0.90: 1.645, 0.95: 1.96, 0.99: 2.576}.get(
+        confidence_level, 1.96)
 
     uncertainties = {}
 
