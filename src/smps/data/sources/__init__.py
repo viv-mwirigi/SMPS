@@ -69,12 +69,19 @@ from smps.data.sources.validation_sources import (
     SOIL_MOISTURE_PREDICTION_ATTRIBUTES,
 )
 
-# FLDAS soil moisture reference data
-from smps.data.sources.fldas import (
-    FLDASSource,
-    FLDASObservation,
-    load_fldas_observation,
-)
+# FLDAS soil moisture reference data (optional - may not be available)
+try:
+    from smps.data.sources.fldas import (
+        FLDASSource,
+        FLDASObservation,
+        load_fldas_observation,
+    )
+    _HAS_FLDAS = True
+except ImportError:
+    _HAS_FLDAS = False
+    FLDASSource = None
+    FLDASObservation = None
+    load_fldas_observation = None
 
 # Base classes
 from smps.data.sources.base import (

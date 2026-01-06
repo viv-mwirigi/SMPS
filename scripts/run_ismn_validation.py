@@ -775,7 +775,7 @@ def main():
 
     # Configuration
     START_DATE = date(2020, 1, 1)
-    END_DATE = date(2021, 12, 31)
+    END_DATE = date(2022, 12, 31)
 
     # Depth-based site selection: 4 sites @5cm, 10 @10cm, 6 @20cm, 4 @30cm, 2 @60cm
     DEPTH_COUNTS = {
@@ -789,8 +789,8 @@ def main():
 
     # ISMN data directories
     DATA_DIRS = [
-        '/home/viv/SMPS/data/ismn/Data_separate_files_header_20200101_20211231_12892_kDkY_20251215',
-        '/home/viv/SMPS/data/ismn/Data_separate_files_header_20200101_20211231_12892_n1Fe_20251215'
+        '/home/viv/SMPS/data/ismn/Data_separate_files_header_20170105_20250105_12892_F2PyW_20260105',
+        '/home/viv/SMPS/data/ismn/Data_separate_files_header_20170105_20250105_12892_gdf6E_20260105'
     ]
 
     print(f"Analysis period: {START_DATE} to {END_DATE}")

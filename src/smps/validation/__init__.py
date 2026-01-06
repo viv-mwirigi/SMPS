@@ -1,6 +1,12 @@
 """
 Validation metrics for soil moisture predictions.
 Provides comprehensive statistical metrics for model evaluation.
+
+This module includes:
+- Basic metrics: RMSE, MAE, bias, R², NSE, KGE
+- Extended metrics (Gap 10): ubRMSE, MAPE, KGE decomposition
+- Physics-based validation: mass balance, extreme events, temporal structure
+- Sensitivity analysis (Gap 11): Morris, Sobol, MCMC calibration
 """
 import numpy as np
 import pandas as pd
@@ -9,7 +15,111 @@ from dataclasses import dataclass, field
 from enum import Enum
 import logging
 
+# Import extended validation modules
+from .physics_metrics import (
+    ExtendedMetrics,
+    compute_ubrmse,
+    compute_mape,
+    compute_kge_decomposition,
+    compute_autocorrelation,
+    MassBalanceValidation,
+    validate_mass_balance_series,
+    ExtremeEventType,
+    ExtremeEventMetrics,
+    identify_drought_periods,
+    identify_flood_periods,
+    compute_extreme_event_metrics,
+    TemporalStructureMetrics,
+    compute_temporal_structure,
+    MultiDepthConsistency,
+    compute_multilayer_consistency,
+    FluxValidationMetrics,
+    validate_et_flux,
+    validate_runoff_flux,
+    PhysicsValidationReport,
+    run_physics_validation,
+)
+
+from .sensitivity_analysis import (
+    Parameter,
+    ParameterSpace,
+    create_default_parameter_space,
+    MorrisResults,
+    morris_screening,
+    SobolResults,
+    sobol_analysis,
+    MCMCResults,
+    MCMC,
+    create_gaussian_likelihood,
+    CrossValidationResults,
+    leave_one_site_out_cv,
+    IdentifiabilityResults,
+    analyze_identifiability,
+    compute_jacobian,
+    run_sensitivity_analysis,
+)
+
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    # Basic metrics
+    'ValidationMetrics',
+    'ValidationEngine',
+    'MetricType',
+
+    # Extended metrics (Gap 10)
+    'ExtendedMetrics',
+    'compute_ubrmse',
+    'compute_mape',
+    'compute_kge_decomposition',
+    'compute_autocorrelation',
+
+    # Mass balance validation
+    'MassBalanceValidation',
+    'validate_mass_balance_series',
+
+    # Extreme events
+    'ExtremeEventType',
+    'ExtremeEventMetrics',
+    'identify_drought_periods',
+    'identify_flood_periods',
+    'compute_extreme_event_metrics',
+
+    # Temporal structure
+    'TemporalStructureMetrics',
+    'compute_temporal_structure',
+
+    # Multi-depth
+    'MultiDepthConsistency',
+    'compute_multilayer_consistency',
+
+    # Flux validation
+    'FluxValidationMetrics',
+    'validate_et_flux',
+    'validate_runoff_flux',
+
+    # Comprehensive report
+    'PhysicsValidationReport',
+    'run_physics_validation',
+
+    # Sensitivity analysis (Gap 11)
+    'Parameter',
+    'ParameterSpace',
+    'create_default_parameter_space',
+    'MorrisResults',
+    'morris_screening',
+    'SobolResults',
+    'sobol_analysis',
+    'MCMCResults',
+    'MCMC',
+    'create_gaussian_likelihood',
+    'CrossValidationResults',
+    'leave_one_site_out_cv',
+    'IdentifiabilityResults',
+    'analyze_identifiability',
+    'compute_jacobian',
+    'run_sensitivity_analysis',
+]
 
 
 class MetricType(str, Enum):
@@ -103,9 +213,9 @@ class ValidationEngine:
         self.logger = logging.getLogger("smps.validation")
 
     def compute_metrics(self,
-                       observed: np.ndarray,
-                       predicted: np.ndarray,
-                       weights: Optional[np.ndarray] = None) -> ValidationMetrics:
+                        observed: np.ndarray,
+                        predicted: np.ndarray,
+                        weights: Optional[np.ndarray] = None) -> ValidationMetrics:
         """
         Compute all validation metrics.
 
@@ -200,11 +310,11 @@ class ValidationEngine:
         return results
 
     def compute_temporal_metrics(self,
-                                df: pd.DataFrame,
-                                obs_col: str,
-                                pred_col: str,
-                                date_col: str,
-                                freq: str = 'M') -> pd.DataFrame:
+                                 df: pd.DataFrame,
+                                 obs_col: str,
+                                 pred_col: str,
+                                 date_col: str,
+                                 freq: str = 'M') -> pd.DataFrame:
         """
         Compute metrics over time periods.
 
@@ -293,7 +403,8 @@ class ValidationEngine:
         pred_centered = pred - np.mean(pred)
 
         numerator = np.sum(obs_centered * pred_centered)
-        denominator = np.sqrt(np.sum(obs_centered**2) * np.sum(pred_centered**2))
+        denominator = np.sqrt(np.sum(obs_centered**2) *
+                              np.sum(pred_centered**2))
 
         if denominator < 1e-10:
             return np.nan
@@ -361,7 +472,7 @@ class ValidationEngine:
 
 
 def compute_quick_metrics(observed: np.ndarray,
-                         predicted: np.ndarray) -> Dict[str, float]:
+                          predicted: np.ndarray) -> Dict[str, float]:
     """
     Quick function to compute common metrics.
 
@@ -386,7 +497,7 @@ def compute_quick_metrics(observed: np.ndarray,
 
 
 def print_metrics_comparison(metrics_dict: Dict[str, ValidationMetrics],
-                            title: str = "Model Comparison"):
+                             title: str = "Model Comparison"):
     """
     Print formatted comparison of multiple model metrics.
 

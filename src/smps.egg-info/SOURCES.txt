@@ -14,7 +14,6 @@ src/smps/data/contracts.py
 src/smps/data/quality/__init__.py
 src/smps/data/sources/__init__.py
 src/smps/data/sources/base.py
-src/smps/data/sources/fldas.py
 src/smps/data/sources/gee_satellite.py
 src/smps/data/sources/isda_authenticated.py
 src/smps/data/sources/satellite.py
@@ -24,7 +23,15 @@ src/smps/data/sources/validation_sources.py
 src/smps/data/sources/weather.py
 src/smps/physics/__init__.py
 src/smps/physics/constraints.py
+src/smps/physics/crop_development.py
+src/smps/physics/enhanced_water_balance.py
+src/smps/physics/evapotranspiration.py
+src/smps/physics/infiltration.py
+src/smps/physics/numerical_solver.py
 src/smps/physics/pedotransfer.py
+src/smps/physics/root_uptake.py
+src/smps/physics/soil_hydraulics.py
+src/smps/physics/vertical_flux.py
 src/smps/physics/water_balance.py
 src/smps/pipeline/__init__.py
 src/smps/pipeline/canonical.py
