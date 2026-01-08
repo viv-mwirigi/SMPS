@@ -169,8 +169,14 @@ def compute_kge_decomposition(
 
 def compute_autocorrelation(x: np.ndarray, lag: int = 1) -> float:
     """Compute autocorrelation at specified lag"""
+    # ACF at lag 0 is always 1.0
+    if lag == 0:
+        return 1.0
+
     n = len(x)
-    if n < lag + 2:
+    # Need at least lag+2 elements to compute meaningful autocorrelation
+    # Also handle edge case where lag >= n would produce empty arrays
+    if n < lag + 2 or lag >= n:
         return np.nan
 
     x_centered = x - np.mean(x)

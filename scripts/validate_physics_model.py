@@ -15,19 +15,17 @@ Run from the project root with:
     python scripts/validate_physics_model.py
 """
 
-from smps.validation import ValidationEngine, ValidationMetrics
-from smps.core.types import SoilParameters
-from smps.data.sources.base import DataFetchRequest
-from smps.data.sources.fldas import FLDASSource, FLDASObservation
-from smps.data.sources.gee_satellite import GoogleEarthEngineSatelliteSource
-from smps.data.sources.isda_authenticated import IsdaAfricaAuthenticatedSource
-from smps.data.sources.soil import MockSoilSource
-from smps.data.sources.weather import OpenMeteoSource
-from smps.physics.pedotransfer import estimate_soil_parameters_saxton
-from smps.physics.water_balance import (
-    TwoBucketWaterBalance, ModelParameters, create_two_bucket_model,
-    ThreeLayerWaterBalance, ThreeLayerParameters, create_three_layer_model
+from smps.physics import (
+    EnhancedWaterBalance, EnhancedModelParameters,
+    create_water_balance_model,
 )
+from smps.physics.pedotransfer import estimate_soil_parameters_saxton
+from smps.data.sources.weather import OpenMeteoSource
+from smps.data.sources.soil import MockSoilSource
+from smps.data.sources.isda_authenticated import IsdaAfricaAuthenticatedSource
+from smps.data.sources.gee_satellite import GoogleEarthEngineSatelliteSource
+from smps.data.sources.base import DataFetchRequest
+from smps.core.types import SoilParameters
 import logging
 from datetime import date, timedelta
 import pandas as pd
@@ -257,11 +255,26 @@ def run_physics_model(weather_df: pd.DataFrame, ndvi_df: pd.DataFrame,
         saturated_hydraulic_conductivity_cm_day=soil_profile.saturated_hydraulic_conductivity_cm_day
     )
 
-    # Create model - use 3-layer for FLDAS validation
-    if use_three_layer:
-        model = create_three_layer_model(soil_params)
+    # Determine soil texture for model
+    sand = soil_profile.sand_percent
+    clay = soil_profile.clay_percent
+    if sand > 70:
+        soil_texture = "sand"
+    elif clay > 40:
+        soil_texture = "clay"
+    elif sand > 50 and clay < 20:
+        soil_texture = "sandy_loam"
+    elif clay > 25:
+        soil_texture = "clay_loam"
     else:
-        model = create_two_bucket_model(soil_params)
+        soil_texture = "loam"
+
+    # Create model using factory
+    model = create_water_balance_model(
+        crop_type="maize",
+        soil_texture=soil_texture,
+        use_full_physics=use_three_layer  # Full physics for 3-layer
+    )
 
     # Merge NDVI with weather
     if not ndvi_df.empty and 'ndvi' in ndvi_df.columns:
@@ -278,45 +291,28 @@ def run_physics_model(weather_df: pd.DataFrame, ndvi_df: pd.DataFrame,
         ndvi = row.get('ndvi', 0.5) or 0.5
 
         try:
-            if use_three_layer:
-                # Three-layer model returns dict directly
-                result = model.run_daily(
-                    precipitation_mm=precip,
-                    et0_mm=et0,
-                    ndvi=ndvi,
-                    check_water_balance=True
-                )
-                results.append({
-                    'date': idx,
-                    'theta_surface': result['theta_surface'],
-                    'theta_root': result['theta_root'],
-                    'theta_deep': result['theta_deep'],
-                    # Direct 0-100cm value
-                    'theta_0_100cm': result['theta_0_100cm'],
-                    'et': result.get('evaporation', 0) + result.get('transpiration', 0),
-                    'runoff': result.get('runoff', 0),
-                    'drainage': result.get('drainage', 0),
-                    'water_balance_error': result.get('water_balance_error', 0)
-                })
-            else:
-                # Two-layer model returns PhysicsPriorResult
-                result = model.run_daily(
-                    precipitation_mm=precip,
-                    et0_mm=et0,
-                    ndvi=ndvi,
-                    check_water_balance=True
-                )
-                results.append({
-                    'date': idx,
-                    'theta_surface': result.theta_surface,
-                    'theta_root': result.theta_root,
-                    'theta_deep': np.nan,
-                    'theta_0_100cm': 0.10 * result.theta_surface + 0.90 * result.theta_root,
-                    'et': result.fluxes.get('evapotranspiration', 0),
-                    'runoff': result.fluxes.get('runoff', 0),
-                    'drainage': result.fluxes.get('drainage', 0),
-                    'water_balance_error': result.water_balance_error
-                })
+            # EnhancedWaterBalance always returns (result, fluxes) tuple
+            result, fluxes = model.run_daily(
+                precipitation_mm=precip,
+                et0_mm=et0,
+                ndvi=ndvi
+            )
+
+            theta_surface = result.theta_surface
+            theta_root = result.theta_root
+            theta_deep = result.theta_deep if result.theta_deep is not None else theta_root * 0.9
+
+            results.append({
+                'date': idx,
+                'theta_surface': theta_surface,
+                'theta_root': theta_root,
+                'theta_deep': theta_deep,
+                'theta_0_100cm': (theta_surface + theta_root + theta_deep) / 3,
+                'et': fluxes.actual_et,
+                'runoff': fluxes.runoff,
+                'drainage': fluxes.deep_drainage,
+                'water_balance_error': result.water_balance_error
+            })
         except Exception as e:
             logger.warning(f"Model error on {idx}: {e}")
             results.append({

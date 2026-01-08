@@ -1,951 +1,1095 @@
-#!/usr/bin/env python3
 """
-Run SMPS model validation against ISMN in-situ soil moisture observations.
+ISMN Validation Benchmark for SMPS Physics Model.
 
 This script:
-1. Parses ISMN TAHMO network data files to extract site coordinates and observations
-2. Selects 20 diverse sites across different regions (Kenya and Ghana)
-3. Fetches weather data from Open-Meteo and soil data from iSDA
-4. Runs the physics-based water balance model
-5. Compares model predictions against in-situ measurements
+1. Loads ISMN stations with multi-depth soil moisture observations (2017-2021)
+2. For each station:
+   - Fetches weather data (precipitation, temperature, ET)
+   - Fetches soil properties (from ISMN static vars or iSDA/SoilGrids)
+   - Fetches NDVI/LAI (from MODIS via GEE)
+   - Runs EnhancedWaterBalance physics model
+   - Compares predictions vs observations at multiple depths
+3. Computes physics-based validation metrics:
+   - Standard: RMSE, MAE, Bias, R², NSE, KGE
+   - Extended: ubRMSE, MAPE, KGE decomposition
+   - Multi-depth: Layer consistency, vertical gradients
+   - Temporal: Autocorrelation, seasonal phase
+   - Extreme events: Drought/flood performance
+4. Aggregates results by:
+   - Station
+   - Depth
+   - Time horizon (24h, 72h, 168h)
+   - Season
+5. Exports metrics to CSV/Parquet for analysis
 
-Data period: January 2020 - December 2021
+Usage:
+    python run_ismn_validation.py --data-dir /path/to/ismn --network AMMA-CATCH
+    python run_ismn_validation.py --all-networks --start-date 2017-01-01 --end-date 2021-12-31
 """
 
-from smps.physics.water_balance import (
-    ThreeLayerWaterBalance,
-    ThreeLayerParameters,
-)
-from smps.physics.pedotransfer import estimate_soil_parameters_saxton, is_tropical_location
-from smps.data.sources.weather import OpenMeteoSource
-from smps.data.sources.isda_authenticated import IsdaAfricaAuthenticatedSource
-from smps.data.sources.soil import MockSoilSource
-from smps.data.sources.satellite import MODISNDVISource
-from smps.data.sources.base import DataFetchRequest
-from smps.core.types import SoilParameters
+import logging
+from pathlib import Path
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+import argparse
+import json
+
 import pandas as pd
 import numpy as np
-from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional, Any
-from datetime import datetime, timedelta, date
-import os
-import time
-import json
-import hashlib
-import warnings
-import logging
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
+from tqdm import tqdm
 
-
-warnings.filterwarnings('ignore')
-
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+# SMPS imports
+from smps.data.sources.ismn_loader import ISMNStationLoader, ISMNStationData, get_daily_soil_moisture
+from smps.physics.enhanced_water_balance import EnhancedWaterBalance, EnhancedModelParameters
+from smps.physics.pedotransfer import (
+    estimate_soil_parameters_tropical,
+    TropicalSoilCorrections,
+    estimate_van_genuchten_parameters,
 )
-logger = logging.getLogger(__name__)
+from smps.core.types import SoilParameters
+from smps.validation.physics_metrics import (
+    run_physics_validation,
+    compute_multilayer_consistency,
+    identify_drought_periods,
+    identify_flood_periods,
+    compute_extreme_event_metrics,
+    ExtremeEventType,
+    PhysicsValidationReport
+)
 
-# Cache and rate limiting configuration
-CACHE_DIR = Path(__file__).parent.parent / 'data' / 'cache' / 'weather'
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
+# Data source imports (weather, satellite, soil)
+from smps.data.sources.weather import OpenMeteoSource
+from smps.data.sources.gee_satellite import GoogleEarthEngineSatelliteSource
+from smps.data.sources.base import DataFetchRequest
 
-# Rate limiting: minimum seconds between Open-Meteo API calls
-OPENMETEO_RATE_LIMIT_SECONDS = 1.0
-_last_openmeteo_call = 0.0
-
-# Import SMPS components
-
-
-@dataclass
-class ISMNSite:
-    """ISMN site metadata"""
-    site_id: str
-    network: str
-    station: str
-    latitude: float
-    longitude: float
-    elevation: float
-    country: str
-    region: str
-    depths: List[float]  # Available measurement depths in meters
-    data_files: List[str]
+logger = logging.getLogger("smps.validation.ismn_benchmark")
 
 
-def parse_ismn_stm_header(file_path: str) -> Dict[str, Any]:
+class ISMNValidationRunner:
     """
-    Parse the header line of an ISMN .stm file to extract site metadata.
-
-    Format: Network Network StationName Lat Lon Elevation DepthFrom DepthTo Sensor
+    Orchestrates ISMN validation for SMPS physics model.
     """
-    with open(file_path, 'r') as f:
-        header = f.readline().strip()
 
-    parts = header.split()
-    if len(parts) < 9:
-        raise ValueError(f"Invalid header format in {file_path}: {header}")
+    def __init__(
+        self,
+        ismn_data_dir: Path,
+        output_dir: Path,
+        start_date: str = "2017-01-01",
+        end_date: str = "2021-12-31"
+    ):
+        self.ismn_data_dir = Path(ismn_data_dir)
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    return {
-        'network': parts[0],
-        # Station name often has underscores
-        'station': parts[2].replace('_', ' '),
-        'latitude': float(parts[3]),
-        'longitude': float(parts[4]),
-        'elevation': float(parts[5]),
-        'depth_from': float(parts[6]),
-        'depth_to': float(parts[7]),
-        'sensor': parts[8]
-    }
+        self.start_date = pd.to_datetime(start_date)
+        self.end_date = pd.to_datetime(end_date)
 
+        # Weather cache directory
+        self.weather_cache_dir = Path("data/cache/weather")
+        self.weather_cache_dir.mkdir(parents=True, exist_ok=True)
 
-def load_ismn_observations(file_path: str) -> pd.DataFrame:
-    """
-    Load soil moisture observations from an ISMN .stm file.
+        # Initialize data clients
+        self.ismn_loader = ISMNStationLoader(ismn_data_dir)
+        self.weather_source = OpenMeteoSource(
+            cache_dir=self.output_dir / "cache" / "weather")
+        # Requires GEE authentication
+        self.satellite_source = GoogleEarthEngineSatelliteSource()
 
-    Data format (starting from line 2):
-    YYYY/MM/DD HH:MM soil_moisture quality_flag network_flag
-    """
-    # Parse header for metadata
-    header_info = parse_ismn_stm_header(file_path)
+        # Results storage
+        self.results = []
 
-    # Read data (skip header line)
-    data = []
-    with open(file_path, 'r') as f:
-        next(f)  # Skip header
-        for line in f:
-            parts = line.strip().split()
-            if len(parts) >= 3:
+    def run_validation(
+        self,
+        networks: Optional[List[str]] = None,
+        stations: Optional[List[str]] = None,
+        max_stations: Optional[int] = None
+    ):
+        """
+        Run validation for specified networks/stations.
+
+        Args:
+            networks: List of network names to process (None = all)
+            stations: List of specific station names (None = all in networks)
+            max_stations: Maximum number of stations to process (for testing)
+        """
+        logger.info(
+            f"Starting ISMN validation from {self.start_date.date()} to {self.end_date.date()}")
+
+        # Load stations
+        if stations:
+            # Load specific stations
+            station_data_list = self._load_specific_stations(stations)
+        elif networks:
+            # Load all stations in specified networks
+            station_data_list = []
+            for network in networks:
+                stations_dict = self.ismn_loader.load_network(network)
+                station_data_list.extend(stations_dict.values())
+        else:
+            # Load all stations
+            stations_dict = self.ismn_loader.load_all_stations()
+            station_data_list = list(stations_dict.values())
+
+        if max_stations:
+            station_data_list = station_data_list[:max_stations]
+
+        logger.info(f"Loaded {len(station_data_list)} stations for validation")
+
+        # Process each station
+        for station_data in tqdm(station_data_list, desc="Validating stations"):
+            try:
+                self._validate_station(station_data)
+            except Exception as e:
+                logger.error(
+                    f"Failed to validate {station_data.station_id}: {e}")
+
+            # Rate limiting: wait 2 seconds between stations to avoid API limits
+            import time
+            time.sleep(2)
+
+        # Save results
+        self._save_results()
+
+    def _validate_station(self, station_data: ISMNStationData):
+        """Validate a single station."""
+        logger.info(f"Processing station: {station_data.station_id}")
+        logger.info(
+            f"  Location: ({station_data.latitude:.4f}, {station_data.longitude:.4f})")
+        logger.info(f"  Depths: {station_data.available_depths_cm} cm")
+
+        # 1. Get forcing data (weather + satellite)
+        forcings = self._get_forcing_data(
+            station_data.latitude,
+            station_data.longitude,
+            self.start_date,
+            self.end_date,
+            station_id=station_data.station_id
+        )
+
+        if forcings is None or len(forcings) < 30:
+            logger.warning(
+                f"Insufficient forcing data for {station_data.station_id}")
+            return
+
+        # 2. Get soil parameters
+        soil_params = self._get_soil_parameters(station_data)
+
+        if soil_params is None:
+            logger.warning(
+                f"No reliable soil data for {station_data.station_id}, skipping")
+            return
+
+        # 3. Configure and run physics model
+        model = self._run_physics_model(forcings, soil_params)
+
+        if model is None:
+            logger.warning(f"Model failed for {station_data.station_id}")
+            return
+
+        # 4. Extract model predictions by depth
+        model_predictions = self._extract_model_predictions(
+            model, forcings.index)
+
+        # 5. Get ISMN observations by depth
+        observations = self._get_observations(station_data)
+
+        # 6. Align and validate
+        self._compute_and_store_metrics(
+            station_data,
+            observations,
+            model_predictions,
+            forcings
+        )
+
+    def _get_forcing_data(
+        self,
+        lat: float,
+        lon: float,
+        start_date: pd.Timestamp,
+        end_date: pd.Timestamp,
+        station_id: str = None
+    ) -> Optional[pd.DataFrame]:
+        """Get weather and satellite forcing data with caching."""
+        try:
+            # Use station_id for cache key if provided
+            site_id = station_id or f"site_{lat:.4f}_{lon:.4f}"
+            safe_site_id = site_id.replace(
+                "/", "_").replace(",", "_").replace(" ", "_")
+
+            # Check weather cache first
+            cache_file = self.weather_cache_dir / \
+                f"weather_{safe_site_id}_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.json"
+
+            if cache_file.exists():
+                logger.info(f"✓ Loading cached weather for {site_id}")
                 try:
-                    date_str = parts[0]
-                    time_str = parts[1]
-                    sm_value = float(parts[2])
-                    quality_flag = parts[3] if len(parts) > 3 else 'U'
+                    with open(cache_file, 'r') as f:
+                        cached = json.load(f)
+                    weather_df = pd.DataFrame(cached['data'])
+                    weather_df['date'] = pd.to_datetime(weather_df['date'])
+                    weather_df = weather_df.set_index('date')
+                except Exception as e:
+                    logger.warning(f"Cache read failed, fetching fresh: {e}")
+                    weather_df = None
+            else:
+                weather_df = None
 
-                    # Skip missing values (-9999 is ISMN missing data flag)
-                    if sm_value < -999 or sm_value > 1.0:
-                        continue
+            # Fetch from API if not cached
+            if weather_df is None:
+                request = DataFetchRequest(
+                    site_id=site_id,
+                    start_date=start_date.date(),
+                    end_date=end_date.date(),
+                    parameters={'latitude': lat, 'longitude': lon}
+                )
 
-                    # Only accept valid volumetric water content (0 to 1)
-                    if not (0.0 <= sm_value <= 1.0):
-                        continue
+                # Store coordinates for the weather source to use
+                self.weather_source._site_coordinates = {site_id: (lat, lon)}
 
-                    timestamp = datetime.strptime(
-                        f"{date_str} {time_str}", "%Y/%m/%d %H:%M")
+                weather_data = self.weather_source.fetch_daily_weather(request)
 
-                    data.append({
-                        'timestamp': timestamp,
-                        'soil_moisture': sm_value,
-                        'quality_flag': quality_flag
+                # Convert list of DailyWeather to DataFrame
+                records = []
+                for w in weather_data:
+                    records.append({
+                        'date': w.date,
+                        'precipitation_mm': w.precipitation_mm,
+                        'et0_mm': w.et0_mm,
+                        'temperature_mean_c': w.temperature_mean_c,
+                        'temperature_min_c': w.temperature_min_c,
+                        'temperature_max_c': w.temperature_max_c,
+                        'solar_radiation_mj_m2': w.solar_radiation_mj_m2,
+                        'relative_humidity_mean': w.relative_humidity_mean,
+                        'wind_speed_mean_m_s': w.wind_speed_mean_m_s
                     })
-                except (ValueError, IndexError) as e:
-                    continue
 
-    df = pd.DataFrame(data)
-    if not df.empty:
-        df['depth_m'] = header_info['depth_from']
-        df['station'] = header_info['station']
-        df['latitude'] = header_info['latitude']
-        df['longitude'] = header_info['longitude']
+                weather_df = pd.DataFrame(records)
+                weather_df['date'] = pd.to_datetime(weather_df['date'])
+                weather_df = weather_df.set_index('date')
 
-    return df, header_info
-
-
-def discover_ismn_sites(data_dirs: List[str]) -> Dict[str, ISMNSite]:
-    """
-    Discover all ISMN sites from data directories.
-
-    Args:
-        data_dirs: List of paths to ISMN data directories
-
-    Returns:
-        Dictionary mapping site_id to ISMNSite metadata
-    """
-    sites = {}
-
-    for data_dir in data_dirs:
-        data_path = Path(data_dir)
-        if not data_path.exists():
-            logger.warning(f"Data directory not found: {data_dir}")
-            continue
-
-        # Look for network subdirectory (TAHMO in our case)
-        for network_dir in data_path.iterdir():
-            if not network_dir.is_dir() or network_dir.name.startswith('.'):
-                continue
-            if network_dir.name in ['ISMN_network_flags_descriptions.txt',
-                                    'ISMN_qualityflags_description.txt',
-                                    'Metadata.xml', 'Readme.txt']:
-                continue
-
-            network = network_dir.name
-
-            # Each subdirectory is a station
-            for station_dir in network_dir.iterdir():
-                if not station_dir.is_dir():
-                    continue
-
-                station_name = station_dir.name
-                stm_files = list(station_dir.glob('*.stm'))
-
-                if not stm_files:
-                    continue
-
-                # Parse first file to get site metadata
+                # Cache weather data
                 try:
-                    _, header_info = load_ismn_observations(str(stm_files[0]))
+                    cache_data = {
+                        'site_id': site_id,
+                        'latitude': lat,
+                        'longitude': lon,
+                        'start_date': start_date.strftime('%Y-%m-%d'),
+                        'end_date': end_date.strftime('%Y-%m-%d'),
+                        'data': weather_df.reset_index().to_dict('records')
+                    }
+                    # Convert date objects to strings
+                    for rec in cache_data['data']:
+                        if 'date' in rec:
+                            rec['date'] = str(rec['date'])
+                    with open(cache_file, 'w') as f:
+                        json.dump(cache_data, f, default=str)
+                    logger.info(f"✓ Cached weather for {site_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to cache weather: {e}")
 
-                    # Collect all available depths
-                    depths = set()
-                    for stm_file in stm_files:
-                        try:
-                            _, h = load_ismn_observations(str(stm_file))
-                            depths.add(h['depth_from'])
-                        except:
-                            pass
+            # Satellite data (NDVI, LAI) from GEE
+            # NOTE: This requires GEE authentication
+            try:
+                ndvi_data = self.satellite_source.fetch_ndvi(
+                    lat=lat,
+                    lon=lon,
+                    start_date=start_date.strftime("%Y-%m-%d"),
+                    end_date=end_date.strftime("%Y-%m-%d")
+                )
 
-                    # Determine country/region from coordinates
-                    lat = header_info['latitude']
-                    lon = header_info['longitude']
+                lai_data = self.satellite_source.fetch_lai(
+                    lat=lat,
+                    lon=lon,
+                    start_date=start_date.strftime("%Y-%m-%d"),
+                    end_date=end_date.strftime("%Y-%m-%d")
+                )
 
-                    # Kenya: roughly lat -5 to 5, lon 33 to 42
-                    # Ghana: roughly lat 4 to 12, lon -3 to 2
-                    if 33 <= lon <= 42 and -5 <= lat <= 5:
-                        country = 'Kenya'
-                        region = 'East Africa'
-                    elif -3 <= lon <= 2 and 4 <= lat <= 12:
-                        country = 'Ghana'
-                        region = 'West Africa'
-                    elif -10 <= lon <= 15 and 4 <= lat <= 15:
-                        country = 'West Africa'
-                        region = 'West Africa'
-                    else:
-                        country = 'Unknown'
-                        region = 'Africa'
+                # Build satellite DataFrame
+                satellite_records = []
+                for obs in ndvi_data:
+                    satellite_records.append({
+                        'date': obs.date,
+                        'ndvi': obs.value
+                    })
+                satellite_df = pd.DataFrame(satellite_records)
+                satellite_df['date'] = pd.to_datetime(satellite_df['date'])
 
-                    # Create unique site ID
-                    site_id = f"{network}_{station_name}".replace(
-                        ' ', '_').replace(',', '')
+                # Add LAI
+                lai_dict = {obs.date: obs.value for obs in lai_data}
+                satellite_df['lai'] = satellite_df['date'].map(lai_dict)
+                satellite_df = satellite_df.set_index('date')
 
-                    sites[site_id] = ISMNSite(
-                        site_id=site_id,
-                        network=network,
-                        station=station_name,
-                        latitude=lat,
-                        longitude=lon,
-                        elevation=header_info['elevation'],
-                        country=country,
-                        region=region,
-                        depths=sorted(list(depths)),
-                        data_files=[str(f) for f in stm_files]
+                # Merge
+                forcings = weather_df.join(satellite_df, how='left')
+                # Forward fill satellite data (sparse temporal resolution)
+                forcings['ndvi'] = forcings['ndvi'].ffill().bfill()
+                forcings['lai'] = forcings['lai'].ffill().bfill()
+
+                # Check if we have any satellite data
+                if forcings['ndvi'].isna().all() or forcings['lai'].isna().all():
+                    raise ValueError(
+                        "No satellite data available for this location")
+
+            except Exception as e:
+                logger.warning(
+                    f"Satellite data unavailable for {station_data.station_id}: {e}")
+                logger.info(
+                    f"Skipping station {station_data.station_id} due to missing satellite data")
+                return  # Skip this station
+
+            return forcings
+
+        except Exception as e:
+            logger.error(f"Failed to get forcing data: {e}")
+            return None
+
+    def _get_soil_parameters(self, station_data: ISMNStationData) -> Dict:
+        """
+        Extract soil parameters with multi-tier fallback:
+
+        Priority 1: ISMN static variables (station-specific, most accurate)
+        Priority 2: SoilGrids/iSDA at coordinates (250m-30m resolution)
+        Priority 3: Regional defaults based on climate zone (last resort)
+
+        Args:
+            station_data: ISMNStationData with soil_properties
+
+        Returns:
+            Dict with soil texture and hydraulic parameters
+        """
+        station_id = station_data.station_id
+        lat = station_data.latitude
+        lon = station_data.longitude
+
+        # =========================================================================
+        # PRIORITY 1: ISMN Static Variables (Best)
+        # =========================================================================
+        if station_data.soil_properties:
+            # Use surface layer (0-30 cm) if available
+            layer_keys = sorted(station_data.soil_properties.keys())
+
+            for layer_key in layer_keys:
+                soil_props = station_data.soil_properties[layer_key]
+
+                # Check if we have minimum required data (sand + clay)
+                if soil_props.sand_fraction is not None and soil_props.clay_fraction is not None:
+                    logger.info(
+                        f"✓ Using ISMN soil properties for {station_id} "
+                        f"(layer {layer_key}): "
+                        f"Sand={soil_props.sand_fraction}%, Clay={soil_props.clay_fraction}%"
                     )
 
-                    logger.debug(
-                        f"Found site: {site_id} at ({lat:.4f}, {lon:.4f})")
-
-                except Exception as e:
-                    logger.warning(f"Error parsing {station_dir}: {e}")
-                    continue
-
-    return sites
-
-
-def select_diverse_sites(sites: Dict[str, ISMNSite], n_sites: int = 20) -> List[ISMNSite]:
-    """
-    Select diverse sites from available ISMN stations.
-
-    Aims for geographical diversity and good data coverage.
-    """
-    # Group by region
-    by_region = {}
-    for site in sites.values():
-        if site.region not in by_region:
-            by_region[site.region] = []
-        by_region[site.region].append(site)
-
-    logger.info(
-        f"Sites by region: {[(r, len(s)) for r, s in by_region.items()]}")
-
-    # Select sites proportionally from each region
-    selected = []
-    total_available = sum(len(s) for s in by_region.values())
-
-    for region, region_sites in by_region.items():
-        # Number to select from this region
-        proportion = len(region_sites) / total_available
-        n_from_region = max(1, int(n_sites * proportion))
-
-        # Sort by number of available depths (prefer sites with more data)
-        region_sites_sorted = sorted(region_sites,
-                                     key=lambda s: len(s.depths),
-                                     reverse=True)
-
-        # Select up to n_from_region sites, spread geographically
-        selected.extend(region_sites_sorted[:n_from_region])
-
-    # If we have too few, add more
-    while len(selected) < n_sites and len(selected) < len(sites):
-        remaining = [s for s in sites.values() if s not in selected]
-        if remaining:
-            selected.append(remaining[0])
-
-    # If we have too many, trim
-    selected = selected[:n_sites]
-
-    return selected
-
-
-def select_sites_by_depth(sites: Dict[str, ISMNSite],
-                          depth_counts: Dict[float, int]) -> List[Tuple[ISMNSite, float]]:
-    """
-    Select sites with specific depths according to requested counts.
-
-    Args:
-        sites: Dictionary of all available sites
-        depth_counts: Dict mapping depth (m) to number of sites wanted
-                      e.g. {0.05: 4, 0.10: 10, 0.20: 6, 0.30: 4, 0.60: 2}
-
-    Returns:
-        List of (site, depth) tuples
-    """
-    selected = []
-    used_sites = set()
-
-    # Process depths from deepest to shallowest (prioritize rare deep measurements)
-    for depth in sorted(depth_counts.keys(), reverse=True):
-        count = depth_counts[depth]
-
-        # Find sites with this depth
-        sites_with_depth = [
-            s for s in sites.values()
-            if depth in s.depths and s.site_id not in used_sites
-        ]
-
-        # Sort by number of depths (prefer sites with multiple depths for better comparison)
-        sites_with_depth = sorted(sites_with_depth,
-                                  key=lambda s: len(s.depths),
-                                  reverse=True)
-
-        # Select up to count sites
-        for site in sites_with_depth[:count]:
-            selected.append((site, depth))
-            used_sites.add(site.site_id)
-
-        logger.info(
-            f"  Depth {depth*100:.0f}cm: found {len(sites_with_depth)} sites, selected {min(count, len(sites_with_depth))}")
-
-    return selected
-
-
-def load_site_observations(site: ISMNSite,
-                           start_date: date,
-                           end_date: date,
-                           target_depth: float = 0.10) -> pd.DataFrame:
-    """
-    Load and aggregate observations for a site.
-
-    Args:
-        site: ISMNSite object
-        start_date: Start of analysis period
-        end_date: End of analysis period
-        target_depth: Preferred measurement depth (default 10cm)
-
-    Returns:
-        DataFrame with daily soil moisture observations
-    """
-    # Find best matching depth
-    available_depths = site.depths
-    if target_depth in available_depths:
-        selected_depth = target_depth
-    else:
-        # Find closest depth
-        selected_depth = min(
-            available_depths, key=lambda d: abs(d - target_depth))
-
-    logger.debug(f"Using depth {selected_depth}m for site {site.site_id}")
-
-    # Find file with matching depth
-    all_obs = []
-    for file_path in site.data_files:
-        if f"_{selected_depth:.6f}_{selected_depth:.6f}_" in file_path or \
-           f"_{selected_depth:.2f}" in file_path:
-            try:
-                df, _ = load_ismn_observations(file_path)
-                all_obs.append(df)
-            except Exception as e:
-                logger.warning(f"Error loading {file_path}: {e}")
-
-    # If no exact match, load first available
-    if not all_obs and site.data_files:
-        try:
-            df, _ = load_ismn_observations(site.data_files[0])
-            all_obs.append(df)
-        except Exception as e:
-            logger.warning(f"Error loading first file for {site.site_id}: {e}")
-
-    if not all_obs:
-        return pd.DataFrame()
-
-    # Combine observations
-    df = pd.concat(all_obs, ignore_index=True)
-
-    # Filter by date range
-    df = df[(df['timestamp'] >= datetime.combine(start_date, datetime.min.time())) &
-            (df['timestamp'] <= datetime.combine(end_date, datetime.max.time()))]
-
-    # Filter good quality data (G = good)
-    # G=Good, M=Maybe, 1=good flag
-    df = df[df['quality_flag'].isin(['G', 'M', '1'])]
-
-    if df.empty:
-        return df
-
-    # Aggregate to daily (mean of hourly observations)
-    df['date'] = df['timestamp'].dt.date
-    daily = df.groupby('date').agg({
-        'soil_moisture': 'mean',
-        'depth_m': 'first',
-        'station': 'first',
-        'latitude': 'first',
-        'longitude': 'first'
-    }).reset_index()
-
-    daily['date'] = pd.to_datetime(daily['date'])
-
-    return daily
-
-
-def fetch_soil_data(site_id: str, lat: float, lon: float) -> Dict[str, Any]:
-    """Fetch soil data from iSDA or fallback to defaults."""
-    try:
-        isda = IsdaAfricaAuthenticatedSource()
-        profile = isda.fetch_soil_profile(site_id, latitude=lat, longitude=lon)
-        logger.info(
-            f"  ✓ Soil data from iSDA: Sand={profile.sand_percent:.0f}%, Clay={profile.clay_percent:.0f}%")
-        return {
-            'sand': profile.sand_percent,
-            'clay': profile.clay_percent,
-            'silt': profile.silt_percent,
-            'porosity': profile.porosity,
-            'field_capacity': profile.field_capacity,
-            'wilting_point': profile.wilting_point,
-            'organic_carbon': getattr(profile, 'organic_carbon_percent', 1.5),
-            'bulk_density': getattr(profile, 'bulk_density_g_cm3', 1.3),
-            'source': 'isda'
-        }
-    except Exception as e:
-        logger.warning(f"  iSDA failed: {e}")
-        # Fallback defaults based on region (typical tropical soils)
-        return {
-            'sand': 40,
-            'clay': 30,
-            'silt': 30,
-            'porosity': 0.45,
-            'field_capacity': 0.30,
-            'wilting_point': 0.12,
-            'organic_carbon': 1.5,
-            'bulk_density': 1.3,
-            'source': 'default'
-        }
-
-
-def _get_weather_cache_path(lat: float, lon: float, start_date: date, end_date: date) -> Path:
-    """Generate a unique cache file path for weather data."""
-    # Create a hash from the request parameters
-    key = f"{lat:.4f}_{lon:.4f}_{start_date}_{end_date}"
-    hash_key = hashlib.md5(key.encode()).hexdigest()[:12]
-    return CACHE_DIR / f"weather_{hash_key}.json"
-
-
-def _load_weather_from_cache(cache_path: Path) -> Optional[pd.DataFrame]:
-    """Load weather data from cache if available."""
-    if not cache_path.exists():
-        return None
-    try:
-        with open(cache_path, 'r') as f:
-            data = json.load(f)
-        df = pd.DataFrame(data)
-        df['date'] = pd.to_datetime(df['date'])
-        df = df.set_index('date').sort_index()
-        return df
-    except Exception as e:
-        logger.debug(f"Cache read failed: {e}")
-        return None
-
-
-def _save_weather_to_cache(cache_path: Path, df: pd.DataFrame) -> None:
-    """Save weather data to cache."""
-    try:
-        # Reset index to include date in the data
-        df_to_save = df.reset_index()
-        df_to_save['date'] = df_to_save['date'].dt.strftime('%Y-%m-%d')
-        with open(cache_path, 'w') as f:
-            json.dump(df_to_save.to_dict(orient='records'), f)
-    except Exception as e:
-        logger.debug(f"Cache write failed: {e}")
-
-
-def _rate_limit_openmeteo() -> None:
-    """Apply rate limiting for Open-Meteo API calls."""
-    global _last_openmeteo_call
-    now = time.time()
-    elapsed = now - _last_openmeteo_call
-    if elapsed < OPENMETEO_RATE_LIMIT_SECONDS:
-        sleep_time = OPENMETEO_RATE_LIMIT_SECONDS - elapsed
-        time.sleep(sleep_time)
-    _last_openmeteo_call = time.time()
-
-
-def fetch_weather_data(site_id: str, lat: float, lon: float,
-                       start_date: date, end_date: date) -> pd.DataFrame:
-    """Fetch weather data from Open-Meteo with caching and rate limiting."""
-    # Check cache first
-    cache_path = _get_weather_cache_path(lat, lon, start_date, end_date)
-    cached_df = _load_weather_from_cache(cache_path)
-    if cached_df is not None:
-        logger.info(f"  ✓ Weather data: {len(cached_df)} days from cache")
-        return cached_df
-
-    # Apply rate limiting before API call
-    _rate_limit_openmeteo()
-
-    weather_source = OpenMeteoSource()
-
-    # Monkey-patch coordinate lookup
-    weather_source._get_site_coordinates = lambda s: (lat, lon)
-
-    request = DataFetchRequest(
-        site_id=site_id,
-        start_date=start_date,
-        end_date=end_date,
-        parameters={"include_forecast": False}
-    )
-
-    try:
-        data = weather_source.fetch_daily_weather(request)
-        df = pd.DataFrame([d.model_dump() for d in data])
-        df['date'] = pd.to_datetime(df['date'])
-        df = df.set_index('date').sort_index()
-
-        # Save to cache
-        _save_weather_to_cache(cache_path, df)
-
-        logger.info(f"  ✓ Weather data: {len(df)} days from Open-Meteo")
-        return df
-    except Exception as e:
-        logger.error(f"  Weather fetch failed: {e}")
-        return pd.DataFrame()
-
-
-def fetch_ndvi_data(site_id: str, lat: float, lon: float,
-                    start_date: date, end_date: date) -> pd.DataFrame:
-    """Fetch or generate NDVI data."""
-    ndvi_source = MODISNDVISource()
-    ndvi_source._get_site_coordinates = lambda s: (lat, lon)
-
-    request = DataFetchRequest(
-        site_id=site_id,
-        start_date=start_date,
-        end_date=end_date,
-        parameters={}
-    )
-
-    try:
-        result = ndvi_source.fetch(request)
-        if result.data:
-            df = pd.DataFrame([d.model_dump() for d in result.data])
-            df['date'] = pd.to_datetime(df['date'])
-            df = df.set_index('date').sort_index()
-            logger.info(f"  ✓ NDVI data: {len(df)} observations from MODIS")
-            return df
-    except Exception as e:
-        logger.debug(f"  NDVI fetch failed: {e}")
-
-    # Fallback: generate seasonal NDVI pattern
-    dates = pd.date_range(start_date, end_date, freq='D')
-    doy = dates.dayofyear
-
-    if abs(lat) < 15:  # Tropics - less seasonal variation
-        ndvi_vals = 0.55 + 0.15 * np.sin(2 * np.pi * (doy - 60) / 365)
-    elif lat > 0:  # Northern hemisphere
-        ndvi_vals = 0.35 + 0.35 * np.sin(2 * np.pi * (doy - 100) / 365)
-    else:  # Southern hemisphere
-        ndvi_vals = 0.35 + 0.35 * np.sin(2 * np.pi * (doy + 80) / 365)
-
-    logger.info(f"  ℹ NDVI: Using synthetic seasonal pattern")
-    return pd.DataFrame({'ndvi': ndvi_vals}, index=dates)
-
-
-def run_model_for_site(site: ISMNSite,
-                       observations: pd.DataFrame,
-                       start_date: date,
-                       end_date: date) -> Tuple[Optional[pd.DataFrame], Dict]:
-    """
-    Run the water balance model for a site.
-
-    Returns:
-        Tuple of (model predictions DataFrame, metadata dict)
-    """
-    site_id = site.site_id
-    lat = site.latitude
-    lon = site.longitude
-    sensor_depth_m = observations['depth_m'].iloc[0] if len(
-        observations) > 0 else 0.10
-
-    metadata = {
-        'site_id': site_id,
-        'latitude': lat,
-        'longitude': lon,
-        'country': site.country,
-        'region': site.region,
-        'sensor_depth_m': sensor_depth_m
-    }
-
-    # Fetch soil data
-    soil_data = fetch_soil_data(site_id, lat, lon)
-    metadata['soil_source'] = soil_data.get('source', 'unknown')
-    metadata['sand_pct'] = soil_data['sand']
-    metadata['clay_pct'] = soil_data['clay']
-
-    # Determine if this is a tropical location (for PTF corrections)
-    is_tropical = is_tropical_location(lat, lon)
-    metadata['is_tropical'] = is_tropical
-
-    # Calculate Saxton-Rawls hydraulic parameters with tropical correction
-    sr_params = estimate_soil_parameters_saxton(
-        sand_percent=soil_data['sand'],
-        clay_percent=soil_data['clay'],
-        organic_matter_percent=soil_data['organic_carbon'],
-        is_tropical_oxide_soil=is_tropical
-    )
-
-    metadata['theta_fc'] = sr_params.field_capacity
-    metadata['theta_sat'] = sr_params.porosity
-    metadata['theta_wp'] = sr_params.wilting_point
-    metadata['k_sat'] = sr_params.saturated_hydraulic_conductivity_cm_day
-
-    # Build soil parameters
-    soil_params = SoilParameters(
-        sand_percent=soil_data['sand'],
-        silt_percent=soil_data['silt'],
-        clay_percent=soil_data['clay'],
-        porosity=sr_params.porosity,
-        field_capacity=sr_params.field_capacity,
-        wilting_point=sr_params.wilting_point,
-        saturated_hydraulic_conductivity_cm_day=sr_params.saturated_hydraulic_conductivity_cm_day,
-        bulk_density_g_cm3=soil_data['bulk_density'],
-        organic_matter_percent=soil_data['organic_carbon'],
-    )
-
-    # Create three-layer model
-    params = ThreeLayerParameters.from_soil_parameters(soil_params)
-    model = ThreeLayerWaterBalance(params)
-
-    # Fetch weather data
-    weather_df = fetch_weather_data(site_id, lat, lon, start_date, end_date)
-    if weather_df.empty:
-        logger.error(f"  No weather data for {site_id}")
-        return None, metadata
-
-    # Fetch NDVI data
-    ndvi_df = fetch_ndvi_data(site_id, lat, lon, start_date, end_date)
-
-    # Run daily simulation
-    results = []
-    for day_date in pd.date_range(start_date, end_date, freq='D'):
-        day_date_py = day_date.date()
-
-        # Get weather for this day
-        if day_date not in weather_df.index:
-            continue
-
-        weather = weather_df.loc[day_date]
-        precip = float(weather.get('precipitation_mm', 0))
-        et0 = float(weather.get('et0_mm', 3.0))
-
-        # Get NDVI for this day
-        if day_date in ndvi_df.index:
-            ndvi = float(ndvi_df.loc[day_date].get('ndvi', 0.5))
-        else:
-            ndvi = 0.5
-
-        # Run model step
-        try:
-            result = model.run_daily(
-                precipitation_mm=precip,
-                et0_mm=et0,
-                ndvi=ndvi
+                    # Use tropical PTFs to derive hydraulic parameters
+                    om_pct = soil_props.organic_carbon if soil_props.organic_carbon else 1.5
+                    hydraulic_params = estimate_soil_parameters_tropical(
+                        sand_percent=soil_props.sand_fraction,
+                        clay_percent=soil_props.clay_fraction,
+                        organic_matter_percent=om_pct,
+                        bulk_density_g_cm3=1.4  # Could be improved with actual BD if available
+                    )
+
+                    return {
+                        'source': 'ISMN_static',
+                        'layer': layer_key,
+                        'sand_pct': soil_props.sand_fraction,
+                        'clay_pct': soil_props.clay_fraction,
+                        'silt_pct': soil_props.silt_fraction if soil_props.silt_fraction else None,
+                        'om_pct': om_pct,
+                        'theta_sat': hydraulic_params.porosity,
+                        'theta_fc': hydraulic_params.field_capacity,
+                        'theta_pwp': hydraulic_params.wilting_point,
+                        # cm/day to mm/day
+                        'ksat_mm_day': hydraulic_params.saturated_hydraulic_conductivity_cm_day * 10,
+                        'alpha': hydraulic_params.van_genuchten_alpha,
+                        'n': hydraulic_params.van_genuchten_n
+                    }
+
+            logger.warning(
+                f"⚠ ISMN soil properties exist for {station_id} but missing sand/clay. "
+                f"Available layers: {list(station_data.soil_properties.keys())}"
             )
 
-            # Get soil moisture at sensor depth
-            # Model layers: Surface (0-10cm), Root zone (10-40cm), Deep (40-100cm)
-            if sensor_depth_m <= 0.05:
-                # 5cm - pure surface layer
-                sm_model = result['theta_surface']
-            elif sensor_depth_m <= 0.10:
-                # 10cm - surface layer
-                sm_model = result['theta_surface']
-            elif sensor_depth_m <= 0.20:
-                # 20cm - weighted blend of surface and root zone
-                # 10cm from surface (0-10), 10cm from root (10-20)
-                sm_model = 0.5 * result['theta_surface'] + \
-                    0.5 * result['theta_root']
-            elif sensor_depth_m <= 0.30:
-                # 30cm - mostly root zone
-                # Weighted: surface contributes 10cm/30cm, root zone 20cm/30cm
-                sm_model = (
-                    10/30) * result['theta_surface'] + (20/30) * result['theta_root']
-            elif sensor_depth_m <= 0.40:
-                # 40cm - full root zone integration
-                sm_model = (
-                    10/40) * result['theta_surface'] + (30/40) * result['theta_root']
-            elif sensor_depth_m <= 0.60:
-                # 60cm - surface + root + part of deep
-                # Surface: 10cm, Root: 30cm, Deep: 20cm out of 60cm
-                sm_model = (10/60) * result['theta_surface'] + \
-                           (30/60) * result['theta_root'] + \
-                           (20/60) * result['theta_deep']
-            else:
-                # Deeper - use integrated 0-100cm
-                sm_model = result['theta_0_100cm']
+        # =========================================================================
+        # PRIORITY 2: SoilGrids/iSDA Fallback (Good)
+        # =========================================================================
+        logger.info(
+            f"→ ISMN soil data unavailable, fetching SoilGrids for {station_id}")
 
-            results.append({
-                'date': day_date,
-                'sm_model': sm_model,
-                'sm_surface': result['theta_surface'],
-                'sm_root': result['theta_root'],
-                'sm_deep': result['theta_deep'],
-                'sm_integrated': result['theta_0_100cm'],
-                'precip_mm': precip,
-                'et0_mm': et0,
-                'ndvi': ndvi,
-            })
+        try:
+            from smps.data.sources.soilgrids import SoilGridsClient
+
+            soilgrids = SoilGridsClient()
+            soil_data = soilgrids.get_soil_properties(
+                lat=lat,
+                lon=lon,
+                depths=['0-5cm', '5-15cm']  # Get surface layers
+            )
+
+            if soil_data and '0-5cm' in soil_data:
+                layer_data = soil_data['0-5cm']
+
+                # SoilGrids provides sand, clay, silt in g/kg (convert to %)
+                sand_pct = layer_data.get('sand', 600) / 10  # g/kg → %
+                clay_pct = layer_data.get('clay', 200) / 10
+                silt_pct = layer_data.get('silt', 200) / 10
+                oc_pct = layer_data.get('soc', 15) / 10  # Soil organic carbon
+
+                logger.info(
+                    f"✓ Using SoilGrids data for {station_id}: "
+                    f"Sand={sand_pct:.1f}%, Clay={clay_pct:.1f}%"
+                )
+
+                # Use tropical PTFs
+                hydraulic_params = estimate_soil_parameters_tropical(
+                    sand_percent=sand_pct,
+                    clay_percent=clay_pct,
+                    organic_matter_percent=oc_pct,
+                    bulk_density_g_cm3=1.4
+                )
+
+                return {
+                    'source': 'SoilGrids_250m',
+                    'sand_pct': sand_pct,
+                    'clay_pct': clay_pct,
+                    'silt_pct': silt_pct,
+                    'om_pct': oc_pct,
+                    'theta_sat': hydraulic_params.porosity,
+                    'theta_fc': hydraulic_params.field_capacity,
+                    'theta_pwp': hydraulic_params.wilting_point,
+                    # cm/day to mm/day
+                    'ksat_mm_day': hydraulic_params.saturated_hydraulic_conductivity_cm_day * 10,
+                    'alpha': hydraulic_params.van_genuchten_alpha,
+                    'n': hydraulic_params.van_genuchten_n
+                }
+
+        except ImportError:
+            logger.warning("SoilGridsClient not available (import failed)")
         except Exception as e:
-            logger.debug(f"Model step error on {day_date}: {e}")
-            continue
+            logger.warning(f"SoilGrids fetch failed for {station_id}: {e}")
+
+        # =========================================================================
+        # PRIORITY 3: Regional Defaults (Last Resort) - DISABLED
+        # =========================================================================
+        logger.warning(
+            f"⚠ No reliable soil data available for {station_id} at ({lat:.3f}, {lon:.3f}). "
+            f"Skipping station due to insufficient data quality."
+        )
+        return None
+
+    def _regional_soil_defaults(self, lat: float, lon: float) -> Dict:
+        """
+        Regional soil parameter defaults for Africa.
+
+        Based on FAO soil maps, climate zones, and typical soil types.
+        Should only be used when ISMN and SoilGrids data are unavailable.
+
+        Args:
+            lat: Latitude
+            lon: Longitude
+
+        Returns:
+            Dict with soil parameters including source metadata
+        """
+        region = self._classify_soil_region(lat, lon)
+
+        # Regional defaults based on literature and FAO soil maps
+        regional_params = {
+            'sahel': {
+                'name': 'Sahel - Arenosols/Lixisols',
+                'description': 'Sandy soils with low organic matter',
+                'countries': 'Mauritania, Mali, Niger, Chad',
+                'sand_pct': 75,
+                'clay_pct': 10,
+                'om_pct': 0.8,
+                'theta_sat': 0.41,
+                'theta_fc': 0.18,
+                'theta_pwp': 0.06,
+                'ksat_mm_day': 800,
+                'alpha': 0.04,
+                'n': 1.6
+            },
+            'sudanian': {
+                'name': 'Sudanian - Lixisols/Luvisols',
+                'description': 'Loamy sand to sandy loam, moderate OM',
+                'countries': 'Senegal, Ghana, Benin, Nigeria, Sudan',
+                'sand_pct': 60,
+                'clay_pct': 15,
+                'om_pct': 1.5,
+                'theta_sat': 0.43,
+                'theta_fc': 0.22,
+                'theta_pwp': 0.08,
+                'ksat_mm_day': 500,
+                'alpha': 0.03,
+                'n': 1.5
+            },
+            'guinean': {
+                'name': 'Guinean - Acrisols/Ferralsols',
+                'description': 'Sandy clay loam, higher OM, weathered',
+                'countries': 'Coastal West Africa, Guinea',
+                'sand_pct': 45,
+                'clay_pct': 25,
+                'om_pct': 2.2,
+                'theta_sat': 0.46,
+                'theta_fc': 0.28,
+                'theta_pwp': 0.12,
+                'ksat_mm_day': 250,
+                'alpha': 0.02,
+                'n': 1.4
+            },
+            'east_highlands': {
+                'name': 'East African Highlands - Nitisols/Andosols',
+                'description': 'Clay loam to clay, volcanic influence, high OM',
+                'countries': 'Kenya, Ethiopia, Rwanda, Tanzania highlands',
+                'sand_pct': 35,
+                'clay_pct': 32,
+                'om_pct': 2.8,
+                'theta_sat': 0.48,
+                'theta_fc': 0.32,
+                'theta_pwp': 0.15,
+                'ksat_mm_day': 150,
+                'alpha': 0.015,
+                'n': 1.3
+            },
+            'east_lowlands': {
+                'name': 'East African Lowlands - Cambisols/Vertisols',
+                'description': 'Variable texture, often clay-rich in valleys',
+                'countries': 'Kenya lowlands, Tanzania coast',
+                'sand_pct': 40,
+                'clay_pct': 28,
+                'om_pct': 1.8,
+                'theta_sat': 0.47,
+                'theta_fc': 0.30,
+                'theta_pwp': 0.14,
+                'ksat_mm_day': 200,
+                'alpha': 0.018,
+                'n': 1.35
+            },
+            'humid_forest': {
+                'name': 'Humid Tropical Forest - Ferralsols/Acrisols',
+                'description': 'Highly weathered clays, high OM in topsoil',
+                'countries': 'Congo Basin, Cameroon, Gabon',
+                'sand_pct': 25,
+                'clay_pct': 45,
+                'om_pct': 3.5,
+                'theta_sat': 0.52,
+                'theta_fc': 0.38,
+                'theta_pwp': 0.20,
+                'ksat_mm_day': 80,
+                'alpha': 0.01,
+                'n': 1.2
+            },
+            'southern_savanna': {
+                'name': 'Southern Savanna - Arenosols/Lixisols',
+                'description': 'Sandy loam to loam, moderate drainage',
+                'countries': 'Zimbabwe, Zambia, Mozambique',
+                'sand_pct': 55,
+                'clay_pct': 18,
+                'om_pct': 1.2,
+                'theta_sat': 0.44,
+                'theta_fc': 0.24,
+                'theta_pwp': 0.10,
+                'ksat_mm_day': 400,
+                'alpha': 0.025,
+                'n': 1.4
+            },
+            'southern_arid': {
+                'name': 'Southern Arid - Arenosols/Calcisols',
+                'description': 'Deep sands, very low OM',
+                'countries': 'Kalahari (Botswana, Namibia)',
+                'sand_pct': 85,
+                'clay_pct': 5,
+                'om_pct': 0.5,
+                'theta_sat': 0.38,
+                'theta_fc': 0.14,
+                'theta_pwp': 0.04,
+                'ksat_mm_day': 1200,
+                'alpha': 0.05,
+                'n': 1.7
+            },
+            'mediterranean': {
+                'name': 'Mediterranean - Calcisols/Cambisols',
+                'description': 'Loam to clay loam, moderate OM',
+                'countries': 'North Africa coast, South Africa Cape',
+                'sand_pct': 42,
+                'clay_pct': 22,
+                'om_pct': 1.8,
+                'theta_sat': 0.45,
+                'theta_fc': 0.26,
+                'theta_pwp': 0.11,
+                'ksat_mm_day': 300,
+                'alpha': 0.022,
+                'n': 1.38
+            }
+        }
+
+        params = regional_params.get(region, regional_params['sudanian'])
+
+        logger.info(
+            f"Using regional defaults: {params['name']} - {params['description']}"
+        )
+
+        return {
+            'source': f'Regional_default_{region}',
+            'region': region,
+            'region_name': params['name'],
+            'description': params['description'],
+            'sand_pct': params['sand_pct'],
+            'clay_pct': params['clay_pct'],
+            'om_pct': params['om_pct'],
+            'theta_sat': params['theta_sat'],
+            'theta_fc': params['theta_fc'],
+            'theta_pwp': params['theta_pwp'],
+            'ksat_mm_day': params['ksat_mm_day'],
+            'alpha': params['alpha'],
+            'n': params['n']
+        }
+
+    def _classify_soil_region(self, lat: float, lon: float) -> str:
+        """
+        Classify soil region based on coordinates and climate zones.
+
+        Uses lat/lon as proxy for climate-soil relationships in Africa.
+        Based on FAO soil maps and Köppen climate classification.
+
+        Args:
+            lat: Latitude (-35 to 37 for Africa)
+            lon: Longitude (-18 to 52 for Africa)
+
+        Returns:
+            Region code (e.g., 'sahel', 'east_highlands')
+        """
+        # Sahel belt: 12-18°N, across West-Central Africa
+        if 12 <= lat <= 18 and -18 <= lon <= 35:
+            return 'sahel'
+
+        # Sudanian zone: 8-12°N, West-Central Africa
+        if 8 <= lat <= 12 and -18 <= lon <= 35:
+            return 'sudanian'
+
+        # Guinean zone: 4-8°N, coastal West Africa
+        if 4 <= lat <= 8 and -18 <= lon <= 15:
+            return 'guinean'
+
+        # East African highlands: Elevated areas, use lat/lon box
+        # Kenya highlands: -1 to 2°N, 35-38°E
+        # Ethiopian highlands: 5-15°N, 35-42°E
+        # Tanzania highlands: -10 to -2°S, 30-37°E
+        if ((-1 <= lat <= 2 and 35 <= lon <= 38) or  # Kenya
+            (5 <= lat <= 15 and 35 <= lon <= 42) or   # Ethiopia
+                (-10 <= lat <= -2 and 30 <= lon <= 37)):  # Tanzania
+            return 'east_highlands'
+
+        # East African lowlands
+        if -12 <= lat <= 5 and 30 <= lon <= 42:
+            return 'east_lowlands'
+
+        # Humid tropical forest: Congo Basin + coastal
+        if -5 <= lat <= 5 and 8 <= lon <= 30:
+            return 'humid_forest'
+
+        # Southern African savanna: 10-20°S
+        if -20 <= lat <= -10 and 20 <= lon <= 35:
+            return 'southern_savanna'
+
+        # Southern arid (Kalahari): 20-28°S
+        if -28 <= lat <= -20 and 15 <= lon <= 28:
+            return 'southern_arid'
+
+        # Mediterranean (North Africa coast, South Africa Cape)
+        if ((30 <= lat <= 37 and -10 <= lon <= 35) or  # North
+                (-35 <= lat <= -30 and 15 <= lon <= 25)):   # South Cape
+            return 'mediterranean'
+
+        # Default to Sudanian (most common, middle-of-road properties)
+        return 'sudanian'
+
+    def _run_physics_model(
+        self,
+        forcings: pd.DataFrame,
+        soil_params: Dict
+    ) -> Optional[pd.DataFrame]:
+        """Run EnhancedWaterBalance model and return results DataFrame."""
+        try:
+            from smps.physics.soil_hydraulics import VanGenuchtenParameters
+
+            # Create VG parameters from soil properties
+            vg_params = VanGenuchtenParameters(
+                theta_r=0.05,  # Residual water content
+                theta_s=soil_params['theta_sat'],
+                alpha=soil_params['alpha'],
+                n=soil_params['n'],
+                K_sat=soil_params['ksat_mm_day'] /
+                1000  # Convert mm/day to m/day
+            )
+
+            # Configure model with 3 layers
+            config = EnhancedModelParameters(
+                n_layers=3,
+                layer_depths_m=[0.10, 0.30, 0.60],  # 10, 30, 60 cm
+                # Same params for all layers
+                vg_params=[vg_params, vg_params, vg_params],
+                crop_type="grassland",  # Natural grassland vegetation for ISMN validation
+                use_green_ampt=True,
+                use_fao56_dual=True,
+                use_feddes_uptake=True,
+                use_darcy_flux=True
+            )
+
+            model = EnhancedWaterBalance(config)
+
+            # Prepare forcings - map column names to what model expects
+            run_forcings = forcings.copy()
+
+            # Column mapping from weather data to model inputs
+            column_mapping = {
+                'precipitation_mm': 'precipitation',
+                'temperature_mean_c': 'temperature',
+                'relative_humidity_mean': 'humidity',
+                'wind_speed_mean_m_s': 'wind_speed',
+                'et0_mm': 'et0',
+                'solar_radiation_mj_m2': 'solar_radiation'
+            }
+
+            for old_col, new_col in column_mapping.items():
+                if old_col in run_forcings.columns:
+                    run_forcings[new_col] = run_forcings[old_col]
+
+            # Check required columns
+            required_cols = ['precipitation', 'temperature', 'ndvi', 'lai']
+            missing_cols = [
+                col for col in required_cols if col not in run_forcings.columns]
+            if missing_cols:
+                raise ValueError(
+                    f"Missing required forcing columns: {missing_cols}")
+
+            # Run simulation using run_period method
+            results = model.run_period(
+                forcings=run_forcings,
+                warmup_days=0,  # Use all data
+                return_fluxes=False
+            )
+
+            # Add dates from forcings index
+            results['date'] = forcings.index[:len(results)]
+
+            return results
+
         except Exception as e:
-            logger.debug(f"Model step error on {day_date}: {e}")
-            continue
+            logger.error(f"Model run failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
-    if not results:
-        return None, metadata
+    def _extract_model_predictions(
+        self,
+        model_results: pd.DataFrame,
+        dates: pd.DatetimeIndex
+    ) -> Dict[float, pd.Series]:
+        """
+        Extract model predictions by depth from run results.
 
-    return pd.DataFrame(results), metadata
+        Maps model layers to measurement depths:
+        - Layer 0 (0-10 cm) → 5 cm, 10 cm measurements
+        - Layer 1 (10-30 cm) → 20 cm measurements
+        - Layer 2 (30-60 cm) → 50, 60, 100 cm measurements
+        """
+        predictions = {}
 
+        # Align dates
+        n_results = len(model_results)
+        valid_dates = dates[:n_results]
 
-def calculate_metrics(observed: np.ndarray, predicted: np.ndarray) -> Dict[str, float]:
-    """Calculate validation metrics."""
-    # Filter out NaN values
-    mask = ~(np.isnan(observed) | np.isnan(predicted))
-    obs = observed[mask]
-    pred = predicted[mask]
+        if 'theta_layer_0' in model_results.columns:
+            predictions[5] = pd.Series(
+                model_results['theta_layer_0'].values, index=valid_dates)
+            predictions[10] = pd.Series(
+                model_results['theta_layer_0'].values, index=valid_dates)
+        if 'theta_layer_1' in model_results.columns:
+            predictions[20] = pd.Series(
+                model_results['theta_layer_1'].values, index=valid_dates)
+        if 'theta_layer_2' in model_results.columns:
+            predictions[50] = pd.Series(
+                model_results['theta_layer_2'].values, index=valid_dates)
+            predictions[60] = pd.Series(
+                model_results['theta_layer_2'].values, index=valid_dates)
+            predictions[100] = pd.Series(
+                model_results['theta_layer_2'].values, index=valid_dates)
 
-    if len(obs) < 10:
-        return {'n': len(obs), 'mae': np.nan, 'rmse': np.nan, 'bias': np.nan, 'r': np.nan}
+        # Fallback to surface theta columns if layer columns not found
+        if not predictions and 'theta_phys_surface' in model_results.columns:
+            predictions[10] = pd.Series(
+                model_results['theta_phys_surface'].values, index=valid_dates)
+            predictions[20] = pd.Series(
+                model_results['theta_phys_root'].values, index=valid_dates)
 
-    mae = np.mean(np.abs(obs - pred))
-    rmse = np.sqrt(np.mean((obs - pred) ** 2))
-    bias = np.mean(pred - obs)
+        return predictions
 
-    if np.std(obs) > 0 and np.std(pred) > 0:
-        r = np.corrcoef(obs, pred)[0, 1]
-    else:
-        r = np.nan
+    def _get_observations(
+        self,
+        station_data: ISMNStationData
+    ) -> Dict[float, pd.Series]:
+        """Get ISMN observations organized by depth."""
+        if station_data.daily_data is None:
+            return {}
 
-    return {
-        'n': len(obs),
-        'mae': mae,
-        'rmse': rmse,
-        'bias': bias,
-        'r': r,
-        'obs_mean': np.mean(obs),
-        'pred_mean': np.mean(pred),
-        'obs_std': np.std(obs),
-        'pred_std': np.std(pred)
-    }
+        observations = {}
+        for depth_cm in station_data.available_depths_cm:
+            df = get_daily_soil_moisture(station_data, depth_cm=depth_cm)
+            if not df.empty:
+                series = df.set_index('date')['soil_moisture_mean']
+                observations[depth_cm] = series
+
+        return observations
+
+    def _compute_and_store_metrics(
+        self,
+        station_data: ISMNStationData,
+        observations: Dict[float, pd.Series],
+        predictions: Dict[float, pd.Series],
+        forcings: pd.DataFrame
+    ):
+        """Compute validation metrics and store results."""
+
+        # For each depth with both obs and pred
+        for depth_cm in observations.keys():
+            closest_pred_depth = min(
+                predictions.keys(), key=lambda x: abs(x - depth_cm))
+
+            obs = observations[depth_cm]
+            pred = predictions[closest_pred_depth]
+
+            # Align time series
+            aligned = pd.DataFrame({
+                'obs': obs,
+                'pred': pred
+            }).dropna()
+
+            if len(aligned) < 30:
+                logger.warning(
+                    f"Insufficient overlap for {station_data.station_id} at {depth_cm} cm")
+                continue
+
+            # Compute metrics
+            metrics_result = run_physics_validation(
+                obs=aligned['obs'].values,
+                pred=aligned['pred'].values
+            )
+
+            # Get metrics dict from standard_metrics
+            metrics_dict = {}
+            if metrics_result.standard_metrics is not None:
+                metrics_dict = metrics_result.standard_metrics.to_dict()
+            metrics_dict['overall_score'] = metrics_result.overall_score
+            metrics_dict['passes_validation'] = metrics_result.passes_validation
+
+            # Store result
+            result = {
+                'station_id': station_data.station_id,
+                'network': station_data.network,
+                'station': station_data.station,
+                'latitude': station_data.latitude,
+                'longitude': station_data.longitude,
+                'depth_cm': depth_cm,
+                'pred_depth_cm': closest_pred_depth,
+                'n_days': len(aligned),
+                'start_date': aligned.index.min(),
+                'end_date': aligned.index.max(),
+                **metrics_dict
+            }
+
+            self.results.append(result)
+
+            logger.info(
+                f"  {depth_cm} cm: RMSE={result['RMSE']:.4f}, NSE={result['NSE']:.3f}, KGE={result['KGE']:.3f}")
+
+    def _save_results(self):
+        """Save validation results to files with detailed station-by-station reporting."""
+        if not self.results:
+            logger.warning("No results to save")
+            return
+
+        df = pd.DataFrame(self.results)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+        # Save detailed results as CSV
+        csv_path = self.output_dir / f"ismn_validation_results_{timestamp}.csv"
+        df.to_csv(csv_path, index=False)
+        logger.info(f"Saved results to {csv_path}")
+
+        # Save as Parquet if available (better for large datasets)
+        try:
+            parquet_path = self.output_dir / \
+                f"ismn_validation_results_{timestamp}.parquet"
+            df.to_parquet(parquet_path, index=False)
+            logger.info(f"Saved results to {parquet_path}")
+        except ImportError:
+            logger.info("Parquet export skipped (pyarrow not installed)")
+
+        # =====================================================================
+        # Station-by-Station Summary (Multi-depth)
+        # =====================================================================
+        station_summary = []
+        for station_id in df['station_id'].unique():
+            station_df = df[df['station_id'] == station_id]
+            row = station_df.iloc[0]
+
+            station_row = {
+                'station_id': station_id,
+                'network': row['network'],
+                'latitude': row['latitude'],
+                'longitude': row['longitude'],
+                'n_depths': len(station_df),
+                'depths_cm': ','.join([str(int(d)) for d in sorted(station_df['depth_cm'].unique())]),
+                'total_obs_days': station_df['n_days'].sum(),
+                'date_range': f"{station_df['start_date'].min()} to {station_df['end_date'].max()}",
+            }
+
+            # Aggregate metrics across depths
+            for metric in ['RMSE', 'MAE', 'NSE', 'KGE', 'R²']:
+                if metric in station_df.columns:
+                    station_row[f'{metric}_mean'] = station_df[metric].mean()
+                    station_row[f'{metric}_best'] = station_df[metric].max(
+                    ) if metric in ['NSE', 'KGE', 'R²'] else station_df[metric].min()
+
+            # Per-depth metrics
+            for _, depth_row in station_df.iterrows():
+                depth = int(depth_row['depth_cm'])
+                station_row[f'RMSE_{depth}cm'] = depth_row.get('RMSE')
+                station_row[f'KGE_{depth}cm'] = depth_row.get('KGE')
+                station_row[f'NSE_{depth}cm'] = depth_row.get('NSE')
+
+            station_row['passes_validation'] = station_df['passes_validation'].any()
+            station_summary.append(station_row)
+
+        station_summary_df = pd.DataFrame(station_summary)
+        station_summary_path = self.output_dir / \
+            f"station_summary_{timestamp}.csv"
+        station_summary_df.to_csv(station_summary_path, index=False)
+        logger.info(f"Saved station summary to {station_summary_path}")
+
+        # =====================================================================
+        # Depth-wise Summary
+        # =====================================================================
+        depth_summary = df.groupby('depth_cm').agg({
+            'RMSE': ['mean', 'std', 'min', 'max', 'count'],
+            'MAE': ['mean', 'std'],
+            'NSE': ['mean', 'std', 'min', 'max'],
+            'KGE': ['mean', 'std', 'min', 'max'],
+            'n_days': 'sum'
+        }).round(4)
+        depth_summary.columns = ['_'.join(col).strip()
+                                 for col in depth_summary.columns.values]
+        depth_summary_path = self.output_dir / f"depth_summary_{timestamp}.csv"
+        depth_summary.to_csv(depth_summary_path)
+        logger.info(f"Saved depth summary to {depth_summary_path}")
+
+        # =====================================================================
+        # Print Console Summary
+        # =====================================================================
+        print("\n" + "=" * 80)
+        print("ISMN VALIDATION RESULTS - STATION SUMMARY")
+        print("=" * 80)
+
+        # Sort by KGE_mean descending
+        if 'KGE_mean' in station_summary_df.columns:
+            station_summary_df = station_summary_df.sort_values(
+                'KGE_mean', ascending=False)
+
+        print(
+            f"\n{'Station':<45} {'Network':<12} {'Depths':<12} {'RMSE':<8} {'KGE':<8} {'Pass':<5}")
+        print("-" * 90)
+
+        for _, row in station_summary_df.iterrows():
+            station_name = row['station_id'][:44]
+            rmse = f"{row.get('RMSE_mean', 0):.4f}" if pd.notna(
+                row.get('RMSE_mean')) else "N/A"
+            kge = f"{row.get('KGE_mean', 0):.3f}" if pd.notna(
+                row.get('KGE_mean')) else "N/A"
+            passed = "✓" if row.get('passes_validation') else "✗"
+            print(
+                f"{station_name:<45} {row['network']:<12} {row['depths_cm']:<12} {rmse:<8} {kge:<8} {passed:<5}")
+
+        print("-" * 90)
+
+        # Overall statistics
+        n_stations = len(station_summary_df)
+        n_passed = station_summary_df['passes_validation'].sum()
+        print(f"\nTotal Stations: {n_stations}")
+        print(
+            f"Stations Passed: {n_passed}/{n_stations} ({100*n_passed/n_stations:.1f}%)")
+        print(f"\nOverall Metrics (mean ± std):")
+        print(f"  RMSE: {df['RMSE'].mean():.4f} ± {df['RMSE'].std():.4f}")
+        print(f"  MAE:  {df['MAE'].mean():.4f} ± {df['MAE'].std():.4f}")
+        print(f"  KGE:  {df['KGE'].mean():.3f} ± {df['KGE'].std():.3f}")
+        print(f"  NSE:  {df['NSE'].mean():.3f} ± {df['NSE'].std():.3f}")
+
+        # By depth
+        print(f"\nBy Depth:")
+        for depth in sorted(df['depth_cm'].unique()):
+            depth_df = df[df['depth_cm'] == depth]
+            print(
+                f"  {int(depth):>3} cm: RMSE={depth_df['RMSE'].mean():.4f}, KGE={depth_df['KGE'].mean():.3f}, n={len(depth_df)}")
+
+        print("=" * 80 + "\n")
+
+        # Legacy network summary (keep for backwards compatibility)
+        summary = df.groupby('network').agg({
+            'RMSE': ['mean', 'std', 'min', 'max'],
+            'NSE': ['mean', 'std', 'min', 'max'],
+            'KGE': ['mean', 'std', 'min', 'max'],
+            'MAE': ['mean', 'std', 'min', 'max'],
+            'R²': ['mean', 'std', 'min', 'max'],
+            'station_id': 'count'
+        })
+        summary_path = self.output_dir / "validation_summary.csv"
+        summary.to_csv(summary_path)
+        logger.info(f"Saved network summary to {summary_path}")
 
 
 def main():
-    """Main validation workflow."""
-    print("=" * 80)
-    print("ISMN VALIDATION: SMPS Water Balance Model vs In-Situ Observations")
-    print("=" * 80)
-    print()
+    parser = argparse.ArgumentParser(
+        description="ISMN validation benchmark for SMPS")
+    parser.add_argument("--data-dir", type=Path, required=True,
+                        help="Path to ISMN data directory")
+    parser.add_argument("--output-dir", type=Path,
+                        default=Path("./results/ismn_validation"), help="Output directory")
+    parser.add_argument("--network", type=str, nargs="+",
+                        help="Network names to process")
+    parser.add_argument("--all-networks", action="store_true",
+                        help="Process all networks")
+    parser.add_argument("--start-date", type=str,
+                        default="2017-01-01", help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--end-date", type=str,
+                        default="2021-12-31", help="End date (YYYY-MM-DD)")
+    parser.add_argument("--max-stations", type=int,
+                        help="Maximum stations to process (for testing)")
+    parser.add_argument("--log-level", type=str, default="INFO",
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"])
 
-    # Configuration
-    START_DATE = date(2020, 1, 1)
-    END_DATE = date(2022, 12, 31)
+    args = parser.parse_args()
 
-    # Depth-based site selection: 4 sites @5cm, 10 @10cm, 6 @20cm, 4 @30cm, 2 @60cm
-    DEPTH_COUNTS = {
-        0.05: 4,   # 5cm - surface
-        0.10: 10,  # 10cm - surface
-        0.20: 6,   # 20cm - surface/root blend
-        0.30: 4,   # 30cm - root zone
-        0.60: 2,   # 60cm - root/deep blend
-    }
-    TOTAL_SITES = sum(DEPTH_COUNTS.values())  # 26 sites
+    # Setup logging
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
 
-    # ISMN data directories
-    DATA_DIRS = [
-        '/home/viv/SMPS/data/ismn/Data_separate_files_header_20170105_20250105_12892_F2PyW_20260105',
-        '/home/viv/SMPS/data/ismn/Data_separate_files_header_20170105_20250105_12892_gdf6E_20260105'
-    ]
+    # Run validation
+    runner = ISMNValidationRunner(
+        ismn_data_dir=args.data_dir,
+        output_dir=args.output_dir,
+        start_date=args.start_date,
+        end_date=args.end_date
+    )
 
-    print(f"Analysis period: {START_DATE} to {END_DATE}")
-    print(f"Target sites by depth:")
-    for depth, count in sorted(DEPTH_COUNTS.items()):
-        print(f"   {depth*100:.0f}cm: {count} sites")
-    print(f"   Total: {TOTAL_SITES} sites")
-    print()
+    networks = args.network if args.network else (
+        None if args.all_networks else [])
 
-    # 1. Discover all sites
-    print("1. DISCOVERING ISMN SITES...")
-    print("-" * 40)
-    sites = discover_ismn_sites(DATA_DIRS)
-    print(f"   Found {len(sites)} sites in total")
-
-    # Show depth distribution
-    depth_dist = {}
-    for site in sites.values():
-        for d in site.depths:
-            depth_dist[d] = depth_dist.get(d, 0) + 1
-    print(f"   Depth distribution:")
-    for d in sorted(depth_dist.keys()):
-        print(f"      {d*100:.0f}cm: {depth_dist[d]} sites")
-    print()
-
-    # 2. Select sites by depth
-    print(f"2. SELECTING SITES BY DEPTH...")
-    print("-" * 40)
-    selected_sites_with_depths = select_sites_by_depth(sites, DEPTH_COUNTS)
-
-    print(
-        f"\n   Selected {len(selected_sites_with_depths)} site-depth combinations:")
-    for site, depth in selected_sites_with_depths:
-        print(f"   - {site.station} @ {depth*100:.0f}cm ({site.country})")
-    print()
-
-    # 3. Run validation
-    print("3. RUNNING MODEL VALIDATION...")
-    print("-" * 40)
-
-    all_results = []
-    site_summaries = []
-
-    for i, (site, target_depth) in enumerate(selected_sites_with_depths, 1):
-        print(
-            f"\n[{i}/{len(selected_sites_with_depths)}] {site.station} @ {target_depth*100:.0f}cm ({site.country})")
-        print(f"   Location: ({site.latitude:.4f}, {site.longitude:.4f})")
-
-        # Load observations at the specific depth
-        obs_df = load_site_observations(
-            site, START_DATE, END_DATE, target_depth=target_depth)
-
-        if obs_df.empty or len(obs_df) < 100:
-            print(f"   ✗ Insufficient observations ({len(obs_df)} days)")
-            continue
-
-        actual_depth = obs_df['depth_m'].iloc[0]
-        print(f"   Observations: {len(obs_df)} days at depth {actual_depth}m")
-
-        # Run model
-        model_df, metadata = run_model_for_site(
-            site, obs_df, START_DATE, END_DATE)
-
-        if model_df is None or model_df.empty:
-            print(f"   ✗ Model failed")
-            continue
-
-        # Merge and calculate metrics
-        obs_df['date'] = pd.to_datetime(obs_df['date'])
-        merged = pd.merge(
-            obs_df[['date', 'soil_moisture']],
-            model_df[['date', 'sm_model', 'sm_surface', 'sm_root',
-                      'sm_deep', 'sm_integrated', 'precip_mm']],
-            on='date',
-            how='inner'
-        )
-
-        if len(merged) < 100:
-            print(f"   ✗ Insufficient overlap ({len(merged)} days)")
-            continue
-
-        metrics = calculate_metrics(
-            merged['soil_moisture'].values,
-            merged['sm_model'].values
-        )
-
-        print(
-            f"   ✓ Results: MAE={metrics['mae']:.4f}, RMSE={metrics['rmse']:.4f}, r={metrics['r']:.3f}")
-
-        # Store results
-        merged['site_id'] = site.site_id
-        merged['depth_m'] = actual_depth
-        all_results.append(merged)
-
-        site_summaries.append({
-            'site_id': site.site_id,
-            'station': site.station,
-            'latitude': site.latitude,
-            'longitude': site.longitude,
-            'country': site.country,
-            'region': site.region,
-            'depth_m': actual_depth,
-            **metadata,
-            **metrics
-        })
-
-        # Rate limit
-        time.sleep(0.5)
-
-    # 4. Summary
-    print("\n" + "=" * 80)
-    print("VALIDATION SUMMARY")
-    print("=" * 80)
-
-    if site_summaries:
-        summary_df = pd.DataFrame(site_summaries)
-
-        print(f"\nSites validated: {len(summary_df)}")
-        print(f"Mean MAE:  {summary_df['mae'].mean():.4f} m³/m³")
-        print(f"Mean RMSE: {summary_df['rmse'].mean():.4f} m³/m³")
-        print(f"Mean Bias: {summary_df['bias'].mean():.4f} m³/m³")
-        print(f"Mean r:    {summary_df['r'].mean():.3f}")
-
-        print("\nBy Depth:")
-        for depth in sorted(summary_df['depth_m'].unique()):
-            depth_df = summary_df[summary_df['depth_m'] == depth]
-            print(
-                f"  {depth*100:.0f}cm: n={len(depth_df)}, MAE={depth_df['mae'].mean():.4f}, RMSE={depth_df['rmse'].mean():.4f}, r={depth_df['r'].mean():.3f}")
-
-        print("\nBy Region:")
-        for region in summary_df['region'].unique():
-            region_df = summary_df[summary_df['region'] == region]
-            print(
-                f"  {region}: n={len(region_df)}, MAE={region_df['mae'].mean():.4f}, r={region_df['r'].mean():.3f}")
-
-        # Save results
-        output_dir = Path('data/ismn')
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        summary_df.to_csv(
-            output_dir / 'ismn_validation_summary_multidepth.csv', index=False)
-        print(
-            f"\nSummary saved to: {output_dir / 'ismn_validation_summary_multidepth.csv'}")
-
-        if all_results:
-            results_df = pd.concat(all_results, ignore_index=True)
-            results_df.to_csv(
-                output_dir / 'ismn_daily_results_multidepth.csv', index=False)
-            print(
-                f"Daily results saved to: {output_dir / 'ismn_daily_results_multidepth.csv'}")
-    else:
-        print("\nNo sites were successfully validated!")
-
-    return site_summaries
+    runner.run_validation(
+        networks=networks,
+        max_stations=args.max_stations
+    )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

@@ -69,19 +69,15 @@ from smps.data.sources.validation_sources import (
     SOIL_MOISTURE_PREDICTION_ATTRIBUTES,
 )
 
-# FLDAS soil moisture reference data (optional - may not be available)
-try:
-    from smps.data.sources.fldas import (
-        FLDASSource,
-        FLDASObservation,
-        load_fldas_observation,
-    )
-    _HAS_FLDAS = True
-except ImportError:
-    _HAS_FLDAS = False
-    FLDASSource = None
-    FLDASObservation = None
-    load_fldas_observation = None
+# ISMN file loader
+from smps.data.sources.ismn_loader import (
+    ISMNStationLoader,
+    ISMNStationData,
+    ISMNSensorMetadata,
+    ISMNSoilProperties,
+    load_ismn_station,
+    get_daily_soil_moisture,
+)
 
 # Base classes
 from smps.data.sources.base import (
@@ -115,10 +111,13 @@ __all__ = [
     "ValidationDataManager",
     "ValidationObservation",
 
-    # FLDAS reference data
-    "FLDASSource",
-    "FLDASObservation",
-    "load_fldas_observation",
+    # ISMN file loader
+    "ISMNStationLoader",
+    "ISMNStationData",
+    "ISMNSensorMetadata",
+    "ISMNSoilProperties",
+    "load_ismn_station",
+    "get_daily_soil_moisture",
 
     # Utilities
     "print_attribute_guide",

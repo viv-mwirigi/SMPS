@@ -95,7 +95,8 @@ class OpenMeteoSource(WeatherSource):
                     end_date=historical_end,
                     parameters=request.parameters
                 )
-                hist_data = self._fetch_historical(hist_request, site_lat, site_lon)
+                hist_data = self._fetch_historical(
+                    hist_request, site_lat, site_lon)
                 weather_data.extend(hist_data)
 
             # Fetch forecast part
@@ -106,7 +107,8 @@ class OpenMeteoSource(WeatherSource):
                     end_date=request.end_date,
                     parameters=request.parameters
                 )
-                forecast_data = self._fetch_forecast(forecast_request, site_lat, site_lon)
+                forecast_data = self._fetch_forecast(
+                    forecast_request, site_lat, site_lon)
                 weather_data.extend(forecast_data)
         else:
             # All historical
@@ -115,7 +117,7 @@ class OpenMeteoSource(WeatherSource):
         return weather_data
 
     def _fetch_historical(self, request: DataFetchRequest,
-                         latitude: float, longitude: float) -> List[DailyWeather]:
+                          latitude: float, longitude: float) -> List[DailyWeather]:
         """Fetch historical weather data"""
         url = self.HISTORICAL_URL
 
@@ -131,7 +133,7 @@ class OpenMeteoSource(WeatherSource):
         # Add hourly variables if requested
         if request.parameters and request.parameters.get("include_hourly", False):
             params["hourly"] = ",".join(request.parameters.get("hourly_variables",
-                                                              self.HOURLY_VARIABLES[:5]))
+                                                               self.HOURLY_VARIABLES[:5]))
 
         self.logger.info(f"Fetching historical weather: {params}")
 
@@ -146,7 +148,7 @@ class OpenMeteoSource(WeatherSource):
             raise DataSourceError(f"Open-Meteo API error: {e}")
 
     def _fetch_forecast(self, request: DataFetchRequest,
-                       latitude: float, longitude: float) -> List[DailyWeather]:
+                        latitude: float, longitude: float) -> List[DailyWeather]:
         """Fetch weather forecast data"""
         url = self.FORECAST_URL
 
@@ -172,7 +174,7 @@ class OpenMeteoSource(WeatherSource):
             raise DataSourceError(f"Open-Meteo forecast API error: {e}")
 
     def _parse_daily_response(self, data: Dict[str, Any],
-                            is_forecast: bool) -> List[DailyWeather]:
+                              is_forecast: bool) -> List[DailyWeather]:
         """Parse Open-Meteo API response into DailyWeather objects"""
         daily_data = data.get("daily", {})
 
@@ -224,7 +226,7 @@ class OpenMeteoSource(WeatherSource):
 
                 # Calculate VPD if we have temperature and humidity
                 if (record_data.get("temperature_mean_c") is not None and
-                    record_data.get("relative_humidity_mean") is not None):
+                        record_data.get("relative_humidity_mean") is not None):
                     vpd = self._calculate_vpd(
                         record_data["temperature_mean_c"],
                         record_data["relative_humidity_mean"]
@@ -236,13 +238,14 @@ class OpenMeteoSource(WeatherSource):
                 weather_records.append(weather_record)
 
             except Exception as e:
-                self.logger.warning(f"Failed to parse record for {date_str}: {e}")
+                self.logger.warning(
+                    f"Failed to parse record for {date_str}: {e}")
                 continue
 
         return weather_records
 
     def _calculate_vpd(self, temperature_c: float,
-                      relative_humidity: float) -> float:
+                       relative_humidity: float) -> float:
         """Calculate Vapor Pressure Deficit (kPa)"""
         # Tetens formula for saturation vapor pressure
         svp = 0.6108 * np.exp(17.27 * temperature_c / (temperature_c + 237.3))
@@ -258,8 +261,12 @@ class OpenMeteoSource(WeatherSource):
     def _get_site_coordinates(self, site_id: SiteID) -> Tuple[float, float]:
         """
         Get coordinates for a site.
-        In a real system, this would query a site database.
+        Checks _site_coordinates attribute first, then falls back to known sites.
         """
+        # First check if coordinates were set externally via _site_coordinates
+        if hasattr(self, '_site_coordinates') and site_id in self._site_coordinates:
+            return self._site_coordinates[site_id]
+
         # Mock implementation - would come from site configuration
         site_coords = {
             "test_site_001": (35.222866, 9.090245),
@@ -276,6 +283,8 @@ class OpenMeteoSource(WeatherSource):
             return site_coords[site_id]
         else:
             # Default coordinates (center of Tunisia)
+            self.logger.warning(
+                f"No coordinates found for site {site_id}, using default (34.0, 9.0)")
             return (34.0, 9.0)
 
     def _get_max_date_range_days(self) -> int:
@@ -320,7 +329,8 @@ class MockWeatherSource(WeatherSource):
 
             # Base values with seasonal variation
             base_temp = 15 + 10 * season_factor  # 5-25°C range
-            base_precip = max(0, 2 + 3 * np.sin(2 * np.pi * day_of_year / 30))  # Monthly cycle
+            base_precip = max(0, 2 + 3 * np.sin(2 * np.pi *
+                              day_of_year / 30))  # Monthly cycle
 
             # Add randomness
             temp_mean = base_temp + np.random.normal(0, 3)
@@ -342,7 +352,8 @@ class MockWeatherSource(WeatherSource):
             solar = max(5, 15 + 5 * season_factor + np.random.normal(0, 3))
 
             # Humidity inversely related to temperature
-            humidity = max(30, min(90, 70 - 0.5 * (temp_mean - 15) + np.random.normal(0, 10)))
+            humidity = max(
+                30, min(90, 70 - 0.5 * (temp_mean - 15) + np.random.normal(0, 10)))
 
             # Wind speed
             wind = max(0.5, 2 + np.random.exponential(1))

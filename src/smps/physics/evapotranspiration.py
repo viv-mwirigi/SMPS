@@ -124,7 +124,12 @@ class CropCoefficientCurve:
         )
 
 
-def ndvi_to_lai(ndvi: float) -> float:
+def ndvi_to_lai(
+    ndvi: float,
+    ndvi_min: float = 0.15,
+    ndvi_max: float = 0.90,
+    extinction_coeff: float = 0.5
+) -> float:
     """
     Estimate Leaf Area Index (LAI) from NDVI.
 
@@ -138,24 +143,21 @@ def ndvi_to_lai(ndvi: float) -> float:
 
     Args:
         ndvi: NDVI value (0-1)
+        ndvi_min: NDVI value for bare soil (default: 0.15)
+        ndvi_max: NDVI value for full vegetation (default: 0.90)
+        extinction_coeff: Light extinction coefficient (default: 0.5)
 
     Returns:
         Estimated LAI (m²/m²)
     """
     ndvi = np.clip(ndvi, 0.0, 1.0)
 
-    # NDVI bounds (bare soil to full vegetation)
-    ndvi_min = 0.15  # Bare soil
-    ndvi_max = 0.90  # Dense vegetation
-
     # Fractional cover
     fc = (ndvi - ndvi_min) / (ndvi_max - ndvi_min)
     fc = np.clip(fc, 0.01, 0.99)
 
     # LAI estimation using Beer-Lambert law inversion
-    # k = light extinction coefficient (~0.5 for most crops)
-    k = 0.5
-    lai = -np.log(1 - fc) / k
+    lai = -np.log(1 - fc) / extinction_coeff
 
     # Clamp to realistic range
     return np.clip(lai, 0.0, 8.0)

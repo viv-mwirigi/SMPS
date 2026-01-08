@@ -10,14 +10,13 @@ Run from the project root with:
     python scripts/validate_multimonth.py
 """
 
-from smps.physics.water_balance import create_three_layer_model
-from smps.data.sources.satellite import MODISNDVISource
-from smps.data.sources.weather import OpenMeteoSource
-from smps.data.sources.soil import MockSoilSource
-from smps.data.sources.isda_authenticated import IsdaAfricaAuthenticatedSource
-from smps.data.sources.fldas import FLDASSource
-from smps.data.sources.base import DataFetchRequest
 from smps.core.types import SoilParameters
+from smps.data.sources.base import DataFetchRequest
+from smps.data.sources.isda_authenticated import IsdaAfricaAuthenticatedSource
+from smps.data.sources.soil import MockSoilSource
+from smps.data.sources.weather import OpenMeteoSource
+from smps.data.sources.satellite import MODISNDVISource
+from smps.physics import create_water_balance_model
 import logging
 from datetime import date, timedelta
 from pathlib import Path
@@ -281,8 +280,26 @@ def run_continuous_simulation(site_id: str, site_info: dict,
         saturated_hydraulic_conductivity_cm_day=soil_profile.saturated_hydraulic_conductivity_cm_day
     )
 
-    # Create 3-layer model
-    model = create_three_layer_model(soil_params)
+    # Determine soil texture
+    sand = soil_params.sand_percent
+    clay = soil_params.clay_percent
+    if sand > 70:
+        soil_texture = "sand"
+    elif clay > 40:
+        soil_texture = "clay"
+    elif sand > 50 and clay < 20:
+        soil_texture = "sandy_loam"
+    elif clay > 25:
+        soil_texture = "clay_loam"
+    else:
+        soil_texture = "loam"
+
+    # Create model using factory
+    model = create_water_balance_model(
+        crop_type="maize",
+        soil_texture=soil_texture,
+        use_full_physics=True
+    )
 
     # Run simulation with dynamic NDVI
     results = []
@@ -303,19 +320,27 @@ def run_continuous_simulation(site_id: str, site_info: dict,
         else:
             ndvi = 0.5  # Fallback
 
-        result = model.run_daily(
+        # EnhancedWaterBalance returns (result, fluxes) tuple
+        # result is a PhysicsPriorResult dataclass with theta_surface, theta_root, theta_deep
+        result, fluxes = model.run_daily(
             precipitation_mm=precip,
             et0_mm=et0,
-            ndvi=ndvi,
-            check_water_balance=True
+            ndvi=ndvi
         )
+
+        # PhysicsPriorResult now has theta_deep attribute for 3-layer models
+        theta_surface = result.theta_surface
+        theta_root = result.theta_root
+        theta_deep = result.theta_deep if result.theta_deep is not None else theta_root * 0.9
+
+        theta_integrated = (theta_surface + theta_root + theta_deep) / 3
 
         results.append({
             'date': idx,
-            'theta_surface': result['theta_surface'],
-            'theta_root': result['theta_root'],
-            'theta_deep': result['theta_deep'],
-            'theta_0_100cm': result['theta_0_100cm'],
+            'theta_surface': theta_surface,
+            'theta_root': theta_root,
+            'theta_deep': theta_deep,
+            'theta_0_100cm': theta_integrated,
             'precipitation_mm': precip,
             'et0_mm': et0,
             'ndvi': ndvi

@@ -102,13 +102,15 @@ logger = logging.getLogger(__name__)
 class EnhancedModelParameters:
     """
     Parameters for the physics-enhanced water balance model.
+
+    All physics parameters can be configured directly or use crop-specific defaults.
     """
     # Layer configuration
     n_layers: int = 3
     layer_depths_m: List[float] = field(
         default_factory=lambda: [0.10, 0.30, 0.60])
 
-    # Crop type for coefficients
+    # Crop type for default coefficients (used if specific params not provided)
     crop_type: str = "maize"
 
     # Van Genuchten parameters per layer
@@ -121,25 +123,43 @@ class EnhancedModelParameters:
     # FAO-56 ET
     use_fao56_dual: bool = True
 
+    # Crop coefficient overrides (if None, uses crop_type defaults from FAO-56)
+    crop_coefficients: Optional['CropCoefficientCurve'] = None
+
     # Feddes root uptake
     use_feddes_uptake: bool = True
     enable_compensation: bool = True
     enable_hydraulic_lift: bool = True
 
+    # Feddes parameter overrides (if None, uses crop_type defaults)
+    feddes_params: Optional['FeddesParameters'] = None
+
     # Darcy fluxes
     use_darcy_flux: bool = True
     enable_macropore: bool = True
+    macropore_threshold_saturation: float = 0.90  # Activate above this saturation
+    macropore_conductivity_factor: float = 10.0   # K_macro = factor × K_sat
 
     # Capillary rise
     enable_capillary_rise: bool = True
     water_table_depth_m: Optional[float] = None
+    max_capillary_rise_m_day: float = 0.005  # 5 mm/day maximum
+    capillary_fringe_m: float = 0.15  # Height above water table with capillary effects
 
     # Canopy interception
     enable_interception: bool = True
+    # Custom interception settings
+    interception_params: Optional['InterceptionParameters'] = None
 
     # Climate parameters (defaults)
     wind_speed_m_s: float = 2.0
     rh_min_percent: float = 45.0
+
+    # NDVI to LAI conversion parameters
+    ndvi_bare_soil: float = 0.15  # NDVI value for bare soil
+    ndvi_full_vegetation: float = 0.90  # NDVI value for full vegetation cover
+    # Light extinction coefficient for LAI calculation
+    ndvi_extinction_coeff: float = 0.5
 
     # Numerical parameters (Gap 8 & 9)
     tolerance_mm: float = 0.001  # Tighter tolerance for mass balance
@@ -409,11 +429,19 @@ class EnhancedWaterBalance:
 
     def _init_component_models(self):
         """Initialize component models"""
-        # Crop coefficients
-        self.crop_curve = CropCoefficientCurve.for_crop(self.params.crop_type)
+        # Crop coefficients - use provided or get defaults for crop type
+        if self.params.crop_coefficients is not None:
+            self.crop_curve = self.params.crop_coefficients
+        else:
+            self.crop_curve = CropCoefficientCurve.for_crop(
+                self.params.crop_type)
 
-        # Feddes parameters
-        self.feddes_params = FeddesParameters.for_crop(self.params.crop_type)
+        # Feddes parameters - use provided or get defaults for crop type
+        if self.params.feddes_params is not None:
+            self.feddes_params = self.params.feddes_params
+        else:
+            self.feddes_params = FeddesParameters.for_crop(
+                self.params.crop_type)
 
         # Root uptake model
         root_params = RootDistributionParameters(
@@ -428,16 +456,22 @@ class EnhancedWaterBalance:
             enable_hydraulic_lift=self.params.enable_hydraulic_lift
         )
 
-        # Vertical flux model
+        # Vertical flux model with configurable parameters
         flux_params = VerticalFluxParameters(
             macropore_enabled=self.params.enable_macropore,
+            macropore_threshold_saturation=self.params.macropore_threshold_saturation,
+            macropore_conductivity_factor=self.params.macropore_conductivity_factor,
             capillary_rise_enabled=self.params.enable_capillary_rise,
+            max_capillary_rise_m_day=self.params.max_capillary_rise_m_day,
             water_table_depth_m=self.params.water_table_depth_m
         )
         self.flux_model = VerticalFluxModel(params=flux_params)
 
-        # Interception
-        self.interception_params = InterceptionParameters()
+        # Interception - use provided or default
+        if self.params.interception_params is not None:
+            self.interception_params = self.params.interception_params
+        else:
+            self.interception_params = InterceptionParameters()
 
         # Green-Ampt (initialized per timestep based on current moisture)
         self.ga_params = None
@@ -773,6 +807,8 @@ class EnhancedWaterBalance:
             theta_surface=self.layers[0].theta,
             theta_root=self.layers[1].theta if len(
                 self.layers) > 1 else self.layers[0].theta,
+            theta_deep=self.layers[2].theta if len(
+                self.layers) > 2 else None,
             fluxes=fluxes_dict,
             water_balance_error=water_balance_error,
             converged=abs(water_balance_error) < self.params.tolerance_mm * 10
@@ -1084,6 +1120,8 @@ class EnhancedWaterBalance:
             theta_surface=self.layers[0].theta,
             theta_root=self.layers[1].theta if len(
                 self.layers) > 1 else self.layers[0].theta,
+            theta_deep=self.layers[2].theta if len(
+                self.layers) > 2 else None,
             fluxes=fluxes_dict,
             water_balance_error=water_balance_error,
             converged=abs(water_balance_error) < self.params.tolerance_mm * 10

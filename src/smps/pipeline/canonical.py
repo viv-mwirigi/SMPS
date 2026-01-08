@@ -4,8 +4,8 @@ Orchestrates creation of the unified daily table from all data sources.
 """
 import pandas as pd
 import numpy as np
-from datetime import date, datetime, timedelta
-from typing import List, Dict, Any, Optional, Tuple
+from datetime import date, datetime
+from typing import List, Dict, Any, Optional
 from pathlib import Path
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -13,14 +13,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from smps.core.types import SiteID
 from smps.core.config import get_config, DataConfig
 from smps.core.exceptions import DataSourceError, DataValidationError
-from smps.data.contracts import (
-    CanonicalDailyRow, DailyWeather, SoilProfile,
-    RemoteSensingData, IrrigationRecord
-)
+from smps.data.contracts import CanonicalDailyRow, SoilProfile
 from smps.data.sources.base import DataSourceRegistry, DataFetchRequest
 from smps.data.sources.weather import OpenMeteoSource, MockWeatherSource
 from smps.data.sources.soil import SoilGridsSource, MockSoilSource
-from smps.physics.water_balance import TwoBucketWaterBalance
+from smps.physics import create_water_balance_model
 from smps.physics.pedotransfer import estimate_soil_parameters
 from smps.features.engineering import FeatureEngineer
 from smps.data.quality import QualityControlPipeline
@@ -284,8 +281,26 @@ class CanonicalTableBuilder:
             'saturated_hydraulic_conductivity': soil_profile.saturated_hydraulic_conductivity_cm_day
         }
 
-        # Initialize physics model
-        physics_model = TwoBucketWaterBalance(soil_params)
+        # Determine soil texture for model factory
+        sand = soil_profile.sand_percent
+        clay = soil_profile.clay_percent
+        if sand > 70:
+            soil_texture = "sand"
+        elif clay > 40:
+            soil_texture = "clay"
+        elif sand > 50 and clay < 20:
+            soil_texture = "sandy_loam"
+        elif clay > 25:
+            soil_texture = "clay_loam"
+        else:
+            soil_texture = "loam"
+
+        # Initialize physics model using factory
+        physics_model = create_water_balance_model(
+            crop_type="maize",
+            soil_texture=soil_texture,
+            use_full_physics=True
+        )
 
         # Prepare irrigation data (if available)
         irrigation_df = None
@@ -296,14 +311,24 @@ class CanonicalTableBuilder:
                 irrigation_df['timestamp'])
             irrigation_df.set_index('timestamp', inplace=True)
 
-        # Run model
-        physics_results = physics_model.run_simulation(
-            start_date=start_date,
-            end_date=end_date,
-            precipitation_series=weather_df['precipitation_mm'],
-            et0_series=weather_df['et0_mm'],
-            irrigation_series=irrigation_df['volume_mm'] if irrigation_df is not None else None,
-            ndvi_series=weather_df.get('ndvi')
+        # Build forcings DataFrame for run_period
+        forcings = weather_df[['precipitation_mm', 'et0_mm']].copy()
+        if 'ndvi' in weather_df.columns:
+            forcings['ndvi'] = weather_df['ndvi']
+        else:
+            forcings['ndvi'] = 0.5  # Default NDVI
+
+        if irrigation_df is not None:
+            forcings['irrigation_mm'] = irrigation_df['volume_mm'].reindex(
+                forcings.index).fillna(0)
+        else:
+            forcings['irrigation_mm'] = 0.0
+
+        # Run model using run_period for efficient batch processing
+        physics_results = physics_model.run_period(
+            forcings=forcings,
+            warmup_days=min(30, len(forcings) // 4),
+            return_fluxes=False
         )
 
         return physics_results
@@ -333,6 +358,15 @@ class CanonicalTableBuilder:
 
         # Add physics prior data
         physics_data = physics_data.copy()
+
+        # Rename physics columns to canonical names
+        physics_column_renames = {
+            'theta_phys_surface': 'physics_theta_surface',
+            'theta_phys_root': 'physics_theta_root',
+            'theta_phys_deep': 'physics_theta_deep',
+        }
+        physics_data = physics_data.rename(columns=physics_column_renames)
+
         physics_data.index.name = 'date'
         physics_data = physics_data.reset_index()
         physics_data['site_id'] = site_id

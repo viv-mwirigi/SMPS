@@ -23,3 +23,9 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+[tool.pytest.ini_options]
+markers = [
+    "integration: marks tests as integration tests requiring external services",
+]
+# Skip integration tests by default
+addopts = "-m 'not integration'"

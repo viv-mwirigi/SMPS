@@ -12,10 +12,9 @@ from smps.data.sources.soil import MockSoilSource
 from smps.data.sources.isda_authenticated import IsdaAfricaAuthenticatedSource
 from smps.data.sources.weather import OpenMeteoSource
 from smps.physics.pedotransfer import estimate_soil_parameters_saxton
-from smps.physics.water_balance import (
-    ThreeLayerWaterBalance,
-    ThreeLayerParameters,
-    create_three_layer_model,
+from smps.physics import (
+    EnhancedWaterBalance, EnhancedModelParameters,
+    create_water_balance_model,
 )
 import logging
 import warnings
@@ -170,44 +169,40 @@ def run_model_for_site(site_id: str, lat: float, lon: float,
     if soil_data is None:
         return None
 
-    # Extract soil properties
+    # Determine soil texture for model
     sand = soil_data.get('sand', 40)
     clay = soil_data.get('clay', 30)
-    om = soil_data.get('organic_carbon', 1.5)
-    bulk_density = soil_data.get('bulk_density', 1.3)
+    if sand > 70:
+        soil_texture = "sand"
+    elif clay > 40:
+        soil_texture = "clay"
+    elif sand > 50 and clay < 20:
+        soil_texture = "sandy_loam"
+    elif clay > 25:
+        soil_texture = "clay_loam"
+    else:
+        soil_texture = "loam"
 
-    # Calculate Saxton-Rawls hydraulic properties
+    # Create model using factory (uses EnhancedWaterBalance)
+    model = create_water_balance_model(
+        crop_type="maize",
+        soil_texture=soil_texture,
+        use_full_physics=True
+    )
+
+    # Calculate Saxton-Rawls hydraulic properties for reporting
+    om = soil_data.get('organic_carbon', 1.5)
     sr_params = estimate_soil_parameters_saxton(
         sand_percent=sand,
         clay_percent=clay,
         organic_matter_percent=om
     )
-    # Convert to dictionary for results
     sr_results = {
         'theta_fc': sr_params.field_capacity,
         'theta_sat': sr_params.porosity,
         'theta_wp': sr_params.wilting_point,
         'k_sat': sr_params.saturated_hydraulic_conductivity_cm_day,
     }
-
-    # Build soil parameters (SoilParameters from core.types uses percentages)
-    soil_params = SoilParameters(
-        sand_percent=sand,
-        silt_percent=100 - sand - clay,
-        clay_percent=clay,
-        porosity=sr_params.porosity,
-        field_capacity=sr_params.field_capacity,
-        wilting_point=sr_params.wilting_point,
-        saturated_hydraulic_conductivity_cm_day=sr_params.saturated_hydraulic_conductivity_cm_day,
-        bulk_density_g_cm3=bulk_density,
-        organic_matter_percent=om,
-    )
-
-    # Create model parameters from soil data
-    params = ThreeLayerParameters.from_soil_parameters(soil_params)
-
-    # Initialize model
-    model = ThreeLayerWaterBalance(params)
 
     # Fetch weather data
     weather_df = fetch_weather_data(site_id, lat, lon, start_date, end_date)
@@ -234,30 +229,35 @@ def run_model_for_site(site_id: str, lat: float, lon: float,
         et0 = row.get('et0_fao_evapotranspiration_sum',
                       row.get('et0', 3.5)) or 3.5
 
-        # Run model for one day
-        result = model.run_daily(
+        # Run model for one day (EnhancedWaterBalance returns tuple)
+        result, fluxes = model.run_daily(
             precipitation_mm=precip,
             et0_mm=et0,
             ndvi=ndvi
         )
 
         # Get soil moisture at sensor depth
+        # PhysicsPriorResult has theta_surface, theta_root attributes
+        theta_surface = result.theta_surface
+        theta_root = result.theta_root
+        theta_deep = theta_root * 0.9  # Approximate deep layer
+
         if sensor_depth_m <= 0.10:
-            sm_model = result['theta_surface']
+            sm_model = theta_surface
         elif sensor_depth_m <= 0.20:
             # Weighted average: 50% surface, 50% root zone (upper part)
-            sm_model = 0.5 * result['theta_surface'] + \
-                0.5 * result['theta_root']
+            sm_model = 0.5 * theta_surface + 0.5 * theta_root
         else:
-            sm_model = result['integrated_0_100cm']
+            # Integrated value or deep layer
+            sm_model = theta_deep
 
         results.append({
             'date': day_date,
             'sm_model': sm_model,
-            'sm_surface': result['theta_surface'],
-            'sm_root': result['theta_root'],
-            'sm_deep': result['theta_deep'],
-            'sm_integrated': result['theta_0_100cm'],
+            'sm_surface': theta_surface,
+            'sm_root': theta_root,
+            'sm_deep': theta_deep,
+            'sm_integrated': (theta_surface + theta_root + theta_deep) / 3,
             'precip_mm': precip,
             'et0_mm': et0,
             'ndvi': ndvi,

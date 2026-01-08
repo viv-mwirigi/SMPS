@@ -10,7 +10,6 @@ from typing import List, Dict, Optional, Literal, Union
 from enum import Enum
 
 
-
 class DataSourceType(str, Enum):
     ISDA_SOIL = "isdasoil"
     SOILGRIDS = "soilgrids"
@@ -25,22 +24,25 @@ class DataSourceType(str, Enum):
     WAZIUP = "waziup"
 
 
-
-
 class DataConfig(BaseSettings):
     """Configuration for dynamic data sources (Africa-focused)"""
 
     # REQUIRED CREDENTIALS
-    isdasoil_username: Optional[str] = Field(None, description="iSDAsoil API username")
-    isdasoil_password: Optional[str] = Field(None, description="iSDAsoil API password (from env)")
+    isdasoil_username: Optional[str] = Field(
+        None, description="iSDAsoil API username")
+    isdasoil_password: Optional[str] = Field(
+        None, description="iSDAsoil API password (from env)")
     era5_cds_uid: Optional[str] = Field(None, description="Copernicus CDS UID")
-    era5_cds_key: Optional[str] = Field(None, description="Copernicus CDS API key")
+    era5_cds_key: Optional[str] = Field(
+        None, description="Copernicus CDS API key")
 
     # OPTIONAL: Google Earth Engine (for Sentinel-2, MODIS, GRAFS)
-    gee_project_id: Optional[str] = Field(None, description="GEE project ID (if using GEE)")
-    use_gee: bool = Field(False, description="Enable Google Earth Engine for RS data")
+    gee_project_id: Optional[str] = Field(
+        None, description="GEE project ID (if using GEE)")
+    use_gee: bool = Field(
+        False, description="Enable Google Earth Engine for RS data")
 
-     # DATA SOURCE PRIORITY (dynamic > fallback > constants)
+    # DATA SOURCE PRIORITY (dynamic > fallback > constants)
     soil_data_priority: List[DataSourceType] = Field(
         default=[DataSourceType.ISDA_SOIL, DataSourceType.SOILGRIDS],
         description="Priority order for soil property fetching"
@@ -79,6 +81,12 @@ class DataConfig(BaseSettings):
     )
     cache_dir: Path = Field(default=Path("./data/cache"))
 
+    # Data source enablement
+    enabled_sources: List[str] = Field(
+        default=["open_meteo", "soilgrids"],
+        description="List of enabled data sources (open_meteo, soilgrids, etc.)"
+    )
+
     # FALLBACKS
     fallback_texture_class: str = Field(
         default="loam",
@@ -89,19 +97,22 @@ class DataConfig(BaseSettings):
     timeout_seconds: int = Field(default=30)
 
     # Temporal settings
-    target_frequency: str = Field("1D", description="Target frequency for aggregation")
-    min_data_coverage: float = Field(0.8, ge=0, le=1, description="Minimum data coverage required")
+    target_frequency: str = Field(
+        "1D", description="Target frequency for aggregation")
+    min_data_coverage: float = Field(
+        0.8, ge=0, le=1, description="Minimum data coverage required")
 
     # Quality control
-    outlier_sigma: float = Field(3.0, gt=0, description="Sigma for outlier detection")
-    max_gap_days: int = Field(7, gt=0, description="Maximum gap to interpolate")
+    outlier_sigma: float = Field(
+        3.0, gt=0, description="Sigma for outlier detection")
+    max_gap_days: int = Field(
+        7, gt=0, description="Maximum gap to interpolate")
 
-
-    feature_store_dir: Path = Field(Path("./data/features"), description="Feature store directory")
-
-
+    feature_store_dir: Path = Field(
+        Path("./data/features"), description="Feature store directory")
 
     model_config = ConfigDict(env_prefix="SMPS_DATA_", case_sensitive=False)
+
 
 class ValidationStrategy(str, Enum):
     """Cross-validation strategies"""
@@ -115,34 +126,43 @@ class PhysicsPriorConfig(BaseSettings):
     """Configuration for physics prior model"""
 
     # Layer definitions
-    surface_depth_m: float = Field(0.1, gt=0, description="Surface layer depth in meters")
-    root_zone_depth_m: float = Field(0.3, gt=0, description="Root zone depth in meters")
-
-
+    surface_depth_m: float = Field(
+        0.1, gt=0, description="Surface layer depth in meters")
+    root_zone_depth_m: float = Field(
+        0.3, gt=0, description="Root zone depth in meters")
 
     # ET partitioning
     ndvi_et_partitioning_lambda: float = Field(0.5, ge=0, le=2)
 
     # Numerical stability
-    min_soil_moisture: float = Field(0.01, ge=0, description="Minimum soil moisture (residual)")
-    max_soil_moisture: float = Field(0.5, le=1, description="Maximum soil moisture (porosity)")
+    min_soil_moisture: float = Field(
+        0.01, ge=0, description="Minimum soil moisture (residual)")
+    max_soil_moisture: float = Field(
+        0.5, le=1, description="Maximum soil moisture (porosity)")
 
     # Runtime options
-    enforce_water_balance: bool = Field(True, description="Ensure water balance closure")
-    max_iterations: int = Field(100, gt=0, description="Maximum iterations for numerical solution")
+    enforce_water_balance: bool = Field(
+        True, description="Ensure water balance closure")
+    max_iterations: int = Field(
+        100, gt=0, description="Maximum iterations for numerical solution")
 
 
 class FeatureConfig(BaseSettings):
     """Configuration for feature engineering"""
 
     # Temporal features
-    lag_days: List[int] = Field([1, 3, 7, 14, 30], description="Days to lag soil moisture")
-    rolling_windows: List[int] = Field([3, 7, 14, 30], description="Rolling window sizes")
-    cumulative_windows: List[int] = Field([1, 3, 7, 14, 30], description="Cumulative windows")
+    lag_days: List[int] = Field(
+        [1, 3, 7, 14, 30], description="Days to lag soil moisture")
+    rolling_windows: List[int] = Field(
+        [3, 7, 14, 30], description="Rolling window sizes")
+    cumulative_windows: List[int] = Field(
+        [1, 3, 7, 14, 30], description="Cumulative windows")
 
     # Physics features
-    include_physics_fluxes: bool = Field(True, description="Include flux terms from physics model")
-    include_physics_residuals: bool = Field(True, description="Include physics model residuals")
+    include_physics_fluxes: bool = Field(
+        True, description="Include flux terms from physics model")
+    include_physics_residuals: bool = Field(
+        True, description="Include physics model residuals")
 
     # Remote sensing features
     ndvi_features: List[str] = Field(
@@ -151,8 +171,10 @@ class FeatureConfig(BaseSettings):
     )
 
     # Feature selection
-    max_features: int = Field(50, gt=0, description="Maximum number of features to use")
-    min_feature_importance: float = Field(0.001, ge=0, description="Minimum SHAP importance")
+    max_features: int = Field(
+        50, gt=0, description="Maximum number of features to use")
+    min_feature_importance: float = Field(
+        0.001, ge=0, description="Minimum SHAP importance")
 
 
 class ModelConfig(BaseSettings):
@@ -183,34 +205,43 @@ class ModelConfig(BaseSettings):
     # Training parameters
     validation_strategy: ValidationStrategy = ValidationStrategy.LEAVE_SITE_OUT
     n_folds: int = Field(5, ge=2, description="Number of CV folds")
-    test_size_days: int = Field(90, gt=0, description="Days to hold out for testing")
+    test_size_days: int = Field(
+        90, gt=0, description="Days to hold out for testing")
 
     # Early stopping
     early_stopping_rounds: int = Field(100, gt=0)
     early_stopping_tolerance: float = Field(0.001, ge=0)
 
     # Physics-informed loss
-    physics_loss_weight: float = Field(0.1, ge=0, description="Weight for physics regularization")
-    penalty_depth_violation: float = Field(10.0, ge=0, description="Penalty for depth ordering violations")
-    penalty_unphysical: float = Field(5.0, ge=0, description="Penalty for unphysical predictions")
+    physics_loss_weight: float = Field(
+        0.1, ge=0, description="Weight for physics regularization")
+    penalty_depth_violation: float = Field(
+        10.0, ge=0, description="Penalty for depth ordering violations")
+    penalty_unphysical: float = Field(
+        5.0, ge=0, description="Penalty for unphysical predictions")
 
 
 class UncertaintyConfig(BaseSettings):
     """Configuration for uncertainty quantification"""
 
-    method: Literal["conformal", "quantile", "ensemble", "bayesian"] = "conformal"
-    confidence_level: float = Field(0.9, gt=0, lt=1, description="Prediction interval coverage")
+    method: Literal["conformal", "quantile",
+                    "ensemble", "bayesian"] = "conformal"
+    confidence_level: float = Field(
+        0.9, gt=0, lt=1, description="Prediction interval coverage")
 
     # Conformal prediction
-    calibration_size: float = Field(0.2, gt=0, lt=1, description="Fraction of data for calibration")
+    calibration_size: float = Field(
+        0.2, gt=0, lt=1, description="Fraction of data for calibration")
 
     # Quantile regression
-    quantiles: List[float] = Field([0.1, 0.5, 0.9], description="Quantiles to predict")
+    quantiles: List[float] = Field(
+        [0.1, 0.5, 0.9], description="Quantiles to predict")
 
     # Ensemble settings
-    n_ensemble_members: int = Field(10, ge=1, description="Number of ensemble members")
-    ensemble_diversity_method: Literal["bagging", "random_seeds", "hyperparameter_variation"] = "bagging"
-
+    n_ensemble_members: int = Field(
+        10, ge=1, description="Number of ensemble members")
+    ensemble_diversity_method: Literal["bagging",
+                                       "random_seeds", "hyperparameter_variation"] = "bagging"
 
 
 class MonitoringConfig(BaseSettings):
@@ -238,11 +269,13 @@ class MonitoringConfig(BaseSettings):
     enable_sentry: bool = Field(False)
     sentry_dsn: Optional[str] = None
 
+
 class EdgeConfig(BaseSettings):
     """Configuration for edge deployment"""
 
     device_type: Literal["wazigate", "raspberry_pi", "custom"] = "wazigate"
-    max_memory_mb: int = Field(512, description="Maximum memory for edge model")
+    max_memory_mb: int = Field(
+        512, description="Maximum memory for edge model")
     max_model_size_mb: int = Field(50, description="Maximum model file size")
 
     # Fallback behavior
@@ -256,6 +289,7 @@ class EdgeConfig(BaseSettings):
     # Battery optimization
     inference_interval_hours: int = Field(6)
     sleep_during_night: bool = Field(True)
+
 
 class APIConfig(BaseSettings):
     """Configuration for API endpoints"""
@@ -282,7 +316,8 @@ class SmpsConfig(BaseSettings):
 
     # System
     project_name: str = "smps"
-    environment: Literal["development", "staging", "production"] = "development"
+    environment: Literal["development",
+                         "staging", "production"] = "development"
     debug: bool = True
     random_seed: int = Field(42, description="Random seed for reproducibility")
 
@@ -310,7 +345,6 @@ class SmpsConfig(BaseSettings):
         env_nested_delimiter="__",
         case_sensitive=False,
     )
-
 
     @field_validator("data_dir", "models_dir", "logs_dir", mode="before")
     @classmethod
@@ -366,6 +400,7 @@ class SmpsConfig(BaseSettings):
         if self.site_configs is None:
             return {}
         return self.site_configs.get(site_id, {})
+
 
 # USAGE: Environment variables override defaults
 # export SMPS_DATA__ISDASOIL_USERNAME=...

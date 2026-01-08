@@ -90,9 +90,14 @@ class PhysicsPriorResult:
     date: Date
     theta_surface: SoilMoistureVWC
     theta_root: SoilMoistureVWC
-    fluxes: Dict[str, float]  # evapotranspiration, drainage, etc.
-    water_balance_error: float  # Should be near zero
-    converged: bool
+    theta_deep: Optional[SoilMoistureVWC] = None  # For 3-layer models
+    fluxes: Dict[str, float] = None  # evapotranspiration, drainage, etc.
+    water_balance_error: float = 0.0  # Should be near zero
+    converged: bool = True
+
+    def __post_init__(self):
+        if self.fluxes is None:
+            self.fluxes = {}
 
 
 @dataclass
