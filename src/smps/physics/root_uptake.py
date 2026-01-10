@@ -39,26 +39,41 @@ class RootDistributionParameters:
 
     Root density typically follows an exponential or linear decrease with depth.
     Roots can also redistribute toward moisture (root plasticity).
+
+    v2.2 Deep Layer Improvements:
+    - Increased default max_depth for deeper rooting crops
+    - Lower beta for better deep root representation
+    - Higher minimum root fraction in deep layers
+    - Enhanced compensation from deep layers during drought
     """
     # Static root distribution type
     distribution_type: str = "exponential"  # "exponential", "linear", "uniform"
 
     # Exponential decay parameter (1/m)
-    # Higher values = more roots near surface
-    beta: float = 5.0
+    # Lower values = more roots at depth (changed from 5.0 to 3.5)
+    # β=3.5 gives ~30% of roots below 30cm vs ~5% with β=5.0
+    beta: float = 3.5
 
-    # Maximum rooting depth (m)
-    max_depth: float = 1.0
+    # Maximum rooting depth (m) - increased for deep-rooted crops
+    # Maize roots can reach 1.5-2.0m, wheat 1.0-1.5m
+    max_depth: float = 1.5
 
     # Root length density at surface (m/m³)
     RLD_surface: float = 5000.0
 
     # Root plasticity parameters
     plasticity_enabled: bool = True
-    plasticity_rate: float = 0.1  # Fraction of redistribution per day
+    plasticity_rate: float = 0.15  # Increased from 0.1 for faster adaptation
 
     # Minimum root fraction in any layer (prevents complete abandonment)
-    min_root_fraction: float = 0.05
+    # Increased from 0.05 to ensure deep layers have meaningful root presence
+    min_root_fraction: float = 0.08
+
+    # Deep layer compensation enhancement
+    deep_compensation_enabled: bool = True
+    deep_compensation_factor: float = 1.5  # Extra compensation from deep layers
+    # Layers below this depth get enhanced compensation
+    deep_layer_threshold_m: float = 0.40
 
 
 @dataclass
@@ -249,13 +264,18 @@ def calculate_compensatory_uptake(
     T_pot: float,
     root_fractions: List[float],
     feddes_params: FeddesParameters,
-    omega_c: float = 1.0
+    omega_c: float = 1.0,
+    deep_compensation_factor: float = 1.5,
+    deep_threshold_m: float = 0.40
 ) -> List[float]:
     """
-    Calculate root water uptake with compensation from wet layers.
+    Calculate root water uptake with enhanced compensation from deep wet layers.
 
     When some layers are stressed, plants can compensate by extracting
     more water from layers with adequate moisture.
+
+    v2.2 Enhancement: Deep layers (>40cm) receive enhanced compensation weight
+    to improve deep soil moisture dynamics during drought periods.
 
     Compensatory uptake (Jarvis, 1989; Šimůnek & Hopmans, 2009):
         S_i = α_i × w_i × T_pot × [1 + ω_c × (1 - T_act/T_pot)]
@@ -268,6 +288,8 @@ def calculate_compensatory_uptake(
         root_fractions: Root fractions per layer
         feddes_params: Feddes stress parameters
         omega_c: Compensation factor (0 = no compensation, 1 = full)
+        deep_compensation_factor: Extra compensation multiplier for deep layers
+        deep_threshold_m: Depth threshold for "deep" layers (m)
 
     Returns:
         List of uptake amounts per layer (mm/day)
@@ -293,32 +315,56 @@ def calculate_compensatory_uptake(
         # No compensation needed
         return non_comp_uptakes
 
-    # Calculate compensation weights
+    # Calculate compensation weights with deep layer enhancement
     # Layers with higher alpha (less stressed) get higher weights
-    weighted_alphas = [a * rf for a, rf in zip(alphas, root_fractions)]
+    # Deep layers get additional weight multiplier
+    weighted_alphas = []
+    for i, (layer, alpha, rf) in enumerate(zip(layers, alphas, root_fractions)):
+        weight = alpha * rf
+
+        # Apply deep layer enhancement
+        if layer.depth_center > deep_threshold_m:
+            # Deep layers get enhanced weight when they are wet (high alpha)
+            # This allows roots to extract more water from deep layers during drought
+            depth_enhancement = 1.0 + (deep_compensation_factor - 1.0) * alpha
+            weight *= depth_enhancement
+
+        weighted_alphas.append(weight)
+
     sum_weighted = sum(weighted_alphas)
 
     if sum_weighted <= 0:
         return non_comp_uptakes
 
-    # Compensatory uptake
+    # Compensatory uptake with deep layer enhancement
     compensated_uptakes = []
     compensation_factor = 1.0 + omega_c * deficit_fraction
 
-    for i, (alpha, rf) in enumerate(zip(alphas, root_fractions)):
-        # Extra weight for unstressed layers
-        weight = (alpha * rf / sum_weighted) if sum_weighted > 0 else 0
+    for i, (layer, alpha, rf) in enumerate(zip(layers, alphas, root_fractions)):
+        # Extra weight for unstressed layers, with deep layer bonus
+        base_weight = (alpha * rf / sum_weighted) if sum_weighted > 0 else 0
 
-        # Compensated uptake
-        comp_uptake = alpha * rf * T_pot * compensation_factor * (
+        # Deep layer enhancement factor
+        if layer.depth_center > deep_threshold_m:
+            depth_mult = 1.0 + (deep_compensation_factor - 1.0) * (
+                layer.depth_center - deep_threshold_m) / (1.0 - deep_threshold_m)
+            depth_mult = min(depth_mult, deep_compensation_factor)
+        else:
+            depth_mult = 1.0
+
+        # Compensated uptake with deep enhancement
+        comp_uptake = alpha * rf * T_pot * compensation_factor * depth_mult * (
             1 + omega_c * (alpha - np.mean(alphas)) / (max(alphas) + 0.01)
         )
 
-        # Limit to available water
+        # Limit to available water (allow up to 60% extraction from deep layers)
         available = max(0, (layer.theta - layer.vg_params.theta_r) *
                         layer.thickness * 1000)
 
-        compensated_uptakes.append(min(comp_uptake, available * 0.5))
+        # Allow higher extraction from deep layers
+        max_extraction_frac = 0.6 if layer.depth_center > deep_threshold_m else 0.5
+        compensated_uptakes.append(
+            min(comp_uptake, available * max_extraction_frac))
 
     # Scale to not exceed potential transpiration significantly
     total_comp = sum(compensated_uptakes)

@@ -213,6 +213,173 @@ class VanGenuchtenParameters:
             K_sat=K_sat_cm_day / 100  # cm/day → m/day
         )
 
+    @classmethod
+    def for_depth(
+        cls,
+        surface_params: "VanGenuchtenParameters",
+        depth_m: float,
+        horizon_type: str = "Bt"
+    ) -> "VanGenuchtenParameters":
+        """
+        Calculate depth-dependent Van Genuchten parameters.
+
+        Accounts for pedogenic processes that modify soil properties with depth:
+        - Clay illuviation (Bt horizon) increases clay content
+        - Bulk density increases with depth (compaction)
+        - Organic matter decreases with depth
+        - Macroporosity decreases with depth
+
+        Based on research from Vereecken et al. (2010), Schaap et al. (2001),
+        and field observations from USDA-NRCS soil surveys.
+
+        Args:
+            surface_params: Van Genuchten parameters for surface soil
+            depth_m: Depth from surface (m)
+            horizon_type: Soil horizon type ("A", "E", "Bt", "C")
+                         Bt = clay-enriched B horizon (most common in agricultural soils)
+
+        Returns:
+            Depth-adjusted VanGenuchtenParameters
+        """
+        # Depth adjustment factors based on typical soil profiles
+        # These factors represent changes relative to surface soil
+
+        if depth_m <= 0.10:
+            # Surface layer - use surface params directly
+            return surface_params
+
+        elif depth_m <= 0.30:
+            # Upper root zone (10-30 cm)
+            # Slight changes from surface
+            alpha_factor = 0.90  # Slight reduction in alpha (smaller pores)
+            n_factor = 0.98  # n nearly unchanged
+            theta_s_factor = 0.97  # Slight porosity reduction
+            theta_r_factor = 1.05  # Slight increase in residual water
+            K_sat_factor = 0.70  # K_sat decreases with depth
+
+        elif depth_m <= 0.50:
+            # Lower root zone (30-50 cm) - Bt horizon effects begin
+            if horizon_type == "Bt":
+                # Clay illuviation zone
+                # Significant alpha reduction (finer pores)
+                alpha_factor = 0.70
+                n_factor = 0.92  # n decreases (broader pore distribution)
+                theta_s_factor = 0.92  # Porosity decreases
+                theta_r_factor = 1.20  # Higher residual due to more clay
+                K_sat_factor = 0.30  # Significant K_sat reduction
+            else:
+                alpha_factor = 0.80
+                n_factor = 0.95
+                theta_s_factor = 0.95
+                theta_r_factor = 1.10
+                K_sat_factor = 0.50
+
+        elif depth_m <= 0.75:
+            # Transition zone (50-75 cm) - maximum Bt effect
+            if horizon_type == "Bt":
+                alpha_factor = 0.55  # Strong alpha reduction
+                n_factor = 0.88  # Broader pore distribution
+                theta_s_factor = 0.88  # Lower porosity
+                theta_r_factor = 1.35  # Higher residual (clay)
+                K_sat_factor = 0.15  # Much lower K_sat
+            else:
+                alpha_factor = 0.70
+                n_factor = 0.92
+                theta_s_factor = 0.92
+                theta_r_factor = 1.15
+                K_sat_factor = 0.35
+
+        else:
+            # Deep zone (>75 cm) - approaching C horizon or continued Bt
+            if horizon_type == "Bt":
+                alpha_factor = 0.50  # Very fine pores
+                n_factor = 0.85  # Broadest pore distribution
+                theta_s_factor = 0.85  # Lowest porosity
+                theta_r_factor = 1.40  # Highest residual
+                K_sat_factor = 0.10  # Very low K_sat
+            elif horizon_type == "C":
+                # C horizon - parent material, often sandier
+                alpha_factor = 1.20  # Larger pores possible
+                n_factor = 1.05
+                theta_s_factor = 0.90
+                theta_r_factor = 0.90
+                K_sat_factor = 0.50
+            else:
+                alpha_factor = 0.60
+                n_factor = 0.90
+                theta_s_factor = 0.90
+                theta_r_factor = 1.20
+                K_sat_factor = 0.25
+
+        # Apply factors with bounds checking
+        new_alpha = surface_params.alpha * alpha_factor
+        new_n = max(1.05, surface_params.n * n_factor)  # n must be > 1
+        new_theta_s = np.clip(surface_params.theta_s *
+                              theta_s_factor, 0.25, 0.55)
+        new_theta_r = np.clip(surface_params.theta_r *
+                              theta_r_factor, 0.01, 0.20)
+        new_K_sat = max(0.0001, surface_params.K_sat *
+                        K_sat_factor)  # m/day, minimum value
+
+        # Ensure theta_s > theta_r
+        if new_theta_s <= new_theta_r + 0.05:
+            new_theta_r = new_theta_s - 0.10
+            new_theta_r = max(0.01, new_theta_r)
+
+        return cls(
+            alpha=new_alpha,
+            n=new_n,
+            theta_r=new_theta_r,
+            theta_s=new_theta_s,
+            K_sat=new_K_sat,
+            L=surface_params.L
+        )
+
+    @classmethod
+    def create_depth_profile(
+        cls,
+        sand_percent: float,
+        clay_percent: float,
+        layer_depths_m: List[float],
+        organic_matter_surface: float = 3.0,
+        horizon_type: str = "Bt"
+    ) -> List["VanGenuchtenParameters"]:
+        """
+        Create a complete soil hydraulic profile with depth-dependent parameters.
+
+        This method creates VG parameters for multiple layers, accounting for
+        typical pedogenic changes with depth.
+
+        Args:
+            sand_percent: Sand content at surface (%)
+            clay_percent: Clay content at surface (%)
+            layer_depths_m: List of layer thicknesses (m)
+            organic_matter_surface: OM at surface (%)
+            horizon_type: Dominant subsurface horizon type
+
+        Returns:
+            List of VanGenuchtenParameters, one per layer
+        """
+        # Create surface layer parameters
+        surface_vg = cls.from_texture(
+            sand_percent, clay_percent, organic_matter_surface
+        )
+
+        vg_params_list = []
+        cumulative_depth = 0.0
+
+        for thickness in layer_depths_m:
+            layer_center_depth = cumulative_depth + thickness / 2
+
+            # Get depth-adjusted parameters
+            layer_vg = cls.for_depth(
+                surface_vg, layer_center_depth, horizon_type)
+            vg_params_list.append(layer_vg)
+
+            cumulative_depth += thickness
+
+        return vg_params_list
+
 
 @dataclass
 class BrooksCoreyParameters:

@@ -135,6 +135,30 @@ class ISMNValidationRunner:
 
         logger.info(f"Loaded {len(station_data_list)} stations for validation")
 
+        # Show data sources being used
+        print("\n" + "=" * 80)
+        print("DATA SOURCES")
+        print("=" * 80)
+        print(f"  📍 ISMN Ground Truth: {self.ismn_data_dir}")
+        print(
+            f"  ☀️  Weather: Open-Meteo ERA5 (https://archive-api.open-meteo.com/v1/era5)")
+        print(f"  🌍 Satellite: Google Earth Engine (MODIS NDVI/LAI)")
+        print(f"  🏜️  Soil: iSDA Africa / SoilGrids (250m)")
+        print(
+            f"  📅 Period: {self.start_date.date()} to {self.end_date.date()}")
+        print("=" * 80 + "\n")
+
+        # Show station overview
+        print("STATION DATA QUALITY OVERVIEW")
+        print("-" * 60)
+        for station_data in station_data_list:
+            depths = [int(d) for d in station_data.available_depths_cm]
+            obs = station_data.daily_data
+            n_days = len(obs) if obs is not None else 0
+            print(
+                f"  {station_data.station_id[:45]:<45} | depths: {depths} | {n_days} days")
+        print("-" * 60 + "\n")
+
         # Process each station
         for station_data in tqdm(station_data_list, desc="Validating stations"):
             try:
@@ -155,7 +179,18 @@ class ISMNValidationRunner:
         logger.info(f"Processing station: {station_data.station_id}")
         logger.info(
             f"  Location: ({station_data.latitude:.4f}, {station_data.longitude:.4f})")
-        logger.info(f"  Depths: {station_data.available_depths_cm} cm")
+        logger.info(
+            f"  Sensor depths: {[int(d) for d in station_data.available_depths_cm]} cm")
+
+        # Data quality check
+        obs = self._get_observations(station_data)
+        if obs:
+            for depth, series in obs.items():
+                n_valid = series.notna().sum()
+                date_range = f"{series.index.min().date()} to {series.index.max().date()}" if len(
+                    series) > 0 else "N/A"
+                logger.info(
+                    f"  → {int(depth):3d}cm: {n_valid} valid days ({date_range})")
 
         # 1. Get forcing data (weather + satellite)
         forcings = self._get_forcing_data(
@@ -186,9 +221,10 @@ class ISMNValidationRunner:
             logger.warning(f"Model failed for {station_data.station_id}")
             return
 
-        # 4. Extract model predictions by depth
+        # 4. Extract model predictions by depth (interpolated to sensor depths)
+        target_depths = list(station_data.available_depths_cm)
         model_predictions = self._extract_model_predictions(
-            model, forcings.index)
+            model, forcings.index, target_depths_cm=target_depths)
 
         # 5. Get ISMN observations by depth
         observations = self._get_observations(station_data)
@@ -741,12 +777,14 @@ class ISMNValidationRunner:
             run_forcings = forcings.copy()
 
             # Column mapping from weather data to model inputs
+            # EnhancedWaterBalance.run_period expects: precipitation_mm, et0_mm, ndvi, temperature_max_c
             column_mapping = {
-                'precipitation_mm': 'precipitation',
+                'precipitation': 'precipitation_mm',  # Keep as _mm suffix for run_period
                 'temperature_mean_c': 'temperature',
+                'temperature_max_c': 'temperature_max_c',
                 'relative_humidity_mean': 'humidity',
                 'wind_speed_mean_m_s': 'wind_speed',
-                'et0_mm': 'et0',
+                'et0': 'et0_mm',  # Keep as _mm suffix for run_period
                 'solar_radiation_mj_m2': 'solar_radiation'
             }
 
@@ -755,7 +793,8 @@ class ISMNValidationRunner:
                     run_forcings[new_col] = run_forcings[old_col]
 
             # Check required columns
-            required_cols = ['precipitation', 'temperature', 'ndvi', 'lai']
+            required_cols = ['precipitation_mm',
+                             'temperature', 'ndvi', 'et0_mm']
             missing_cols = [
                 col for col in required_cols if col not in run_forcings.columns]
             if missing_cols:
@@ -783,45 +822,76 @@ class ISMNValidationRunner:
     def _extract_model_predictions(
         self,
         model_results: pd.DataFrame,
-        dates: pd.DatetimeIndex
+        dates: pd.DatetimeIndex,
+        target_depths_cm: Optional[List[float]] = None
     ) -> Dict[float, pd.Series]:
         """
-        Extract model predictions by depth from run results.
+        Extract model predictions by depth from run results with interpolation.
 
-        Maps model layers to measurement depths:
-        - Layer 0 (0-10 cm) → 5 cm, 10 cm measurements
-        - Layer 1 (10-30 cm) → 20 cm measurements
-        - Layer 2 (30-60 cm) → 50, 60, 100 cm measurements
+        Uses linear interpolation to match predictions to actual sensor depths.
+        Model layers (default configuration):
+        - Layer 0: 0-10 cm (center: 5 cm)
+        - Layer 1: 10-30 cm (center: 20 cm)
+        - Layer 2: 30-50 cm (center: 40 cm)
+        - Layer 3: 50-75 cm (center: 62.5 cm)
+        - Layer 4: 75-100 cm (center: 87.5 cm)
         """
-        predictions = {}
+        from scipy import interpolate as scipy_interp
 
-        # Align dates
+        predictions = {}
         n_results = len(model_results)
         valid_dates = dates[:n_results]
 
-        if 'theta_layer_0' in model_results.columns:
-            predictions[5] = pd.Series(
-                model_results['theta_layer_0'].values, index=valid_dates)
-            predictions[10] = pd.Series(
-                model_results['theta_layer_0'].values, index=valid_dates)
-        if 'theta_layer_1' in model_results.columns:
-            predictions[20] = pd.Series(
-                model_results['theta_layer_1'].values, index=valid_dates)
-        if 'theta_layer_2' in model_results.columns:
-            predictions[50] = pd.Series(
-                model_results['theta_layer_2'].values, index=valid_dates)
-            predictions[60] = pd.Series(
-                model_results['theta_layer_2'].values, index=valid_dates)
-            predictions[100] = pd.Series(
-                model_results['theta_layer_2'].values, index=valid_dates)
+        # Model layer configuration (center depths in cm)
+        layer_centers = [5, 20, 40, 62.5, 87.5]  # Default 5-layer config
 
-        # Fallback to surface theta columns if layer columns not found
-        if not predictions and 'theta_phys_surface' in model_results.columns:
-            predictions[10] = pd.Series(
-                model_results['theta_phys_surface'].values, index=valid_dates)
-            predictions[20] = pd.Series(
-                model_results['theta_phys_root'].values, index=valid_dates)
+        # Extract layer values
+        layer_cols = [
+            col for col in model_results.columns if col.startswith('theta_layer_')]
+        if not layer_cols:
+            # Fallback to theta_phys columns
+            if 'theta_phys_surface' in model_results.columns:
+                predictions[10] = pd.Series(
+                    model_results['theta_phys_surface'].values, index=valid_dates)
+            if 'theta_phys_root' in model_results.columns:
+                predictions[20] = pd.Series(
+                    model_results['theta_phys_root'].values, index=valid_dates)
+            return predictions
 
+        # Sort layer columns numerically
+        layer_cols = sorted(layer_cols, key=lambda x: int(x.split('_')[-1]))
+        n_layers = len(layer_cols)
+        layer_centers = layer_centers[:n_layers]
+
+        # Default target depths if not specified
+        if target_depths_cm is None:
+            target_depths_cm = [5, 10, 20, 25, 30,
+                                40, 50, 55, 60, 85, 100, 115, 120]
+
+        # Interpolate to each target depth
+        for target_depth in target_depths_cm:
+            interp_values = []
+
+            for i in range(n_results):
+                layer_values = [model_results[col].iloc[i]
+                                for col in layer_cols]
+
+                # Handle edge cases
+                if target_depth <= layer_centers[0]:
+                    interp_values.append(layer_values[0])
+                elif target_depth >= layer_centers[-1]:
+                    interp_values.append(layer_values[-1])
+                else:
+                    # Linear interpolation
+                    f = scipy_interp.interp1d(
+                        layer_centers, layer_values, kind='linear')
+                    interp_values.append(float(f(target_depth)))
+
+            predictions[target_depth] = pd.Series(
+                interp_values, index=valid_dates)
+
+        logger.info(
+            f"  → Interpolated predictions to depths: {target_depths_cm} cm")
         return predictions
 
     def _get_observations(
@@ -848,7 +918,14 @@ class ISMNValidationRunner:
         predictions: Dict[float, pd.Series],
         forcings: pd.DataFrame
     ):
-        """Compute validation metrics and store results."""
+        """Compute validation metrics and store results, including seasonal and temporal horizon breakdown."""
+
+        # Define forecast horizons (in days)
+        HORIZONS = {
+            '24h': 1,   # 1-day ahead
+            '72h': 3,   # 3-day ahead
+            '168h': 7   # 7-day ahead (weekly)
+        }
 
         # For each depth with both obs and pred
         for depth_cm in observations.keys():
@@ -869,7 +946,7 @@ class ISMNValidationRunner:
                     f"Insufficient overlap for {station_data.station_id} at {depth_cm} cm")
                 continue
 
-            # Compute metrics
+            # Compute overall metrics (instantaneous / same-day)
             metrics_result = run_physics_validation(
                 obs=aligned['obs'].values,
                 pred=aligned['pred'].values
@@ -882,7 +959,97 @@ class ISMNValidationRunner:
             metrics_dict['overall_score'] = metrics_result.overall_score
             metrics_dict['passes_validation'] = metrics_result.passes_validation
 
-            # Store result
+            # =====================================================================
+            # TEMPORAL HORIZON ANALYSIS (24h, 72h, 168h)
+            # =====================================================================
+            # For each horizon, we compare predictions at time t with observations at time t+horizon
+            # This simulates forecast skill at different lead times
+            horizon_metrics = {}
+
+            for horizon_name, horizon_days in HORIZONS.items():
+                # Shift predictions forward (or equivalently, shift obs backward)
+                # pred[t] compared to obs[t + horizon_days]
+                obs_shifted = aligned['obs'].shift(-horizon_days)
+
+                horizon_aligned = pd.DataFrame({
+                    'obs': obs_shifted,
+                    'pred': aligned['pred']
+                }).dropna()
+
+                if len(horizon_aligned) >= 20:
+                    horizon_result = run_physics_validation(
+                        obs=horizon_aligned['obs'].values,
+                        pred=horizon_aligned['pred'].values
+                    )
+                    if horizon_result.standard_metrics is not None:
+                        horizon_metrics[f'RMSE_{horizon_name}'] = horizon_result.standard_metrics.rmse
+                        horizon_metrics[f'KGE_{horizon_name}'] = horizon_result.standard_metrics.kge
+                        horizon_metrics[f'NSE_{horizon_name}'] = horizon_result.standard_metrics.nse
+                        horizon_metrics[f'R2_{horizon_name}'] = horizon_result.standard_metrics.r_squared
+                        horizon_metrics[f'n_days_{horizon_name}'] = len(
+                            horizon_aligned)
+
+            # =====================================================================
+            # SEASONAL ANALYSIS
+            # =====================================================================
+            # Determine hemisphere for season classification
+            lat = station_data.latitude
+            is_northern = lat >= 0
+
+            # Classify seasons based on month
+            # Northern Hemisphere: Wet = May-Oct (JJAS monsoon), Dry = Nov-Apr
+            # Southern Hemisphere: Wet = Nov-Apr, Dry = May-Oct
+            # Tropical Africa (10S-10N): Use rainfall patterns - typically bimodal
+            aligned_with_season = aligned.copy()
+            aligned_with_season['month'] = aligned_with_season.index.month
+
+            if abs(lat) < 10:
+                # Tropical: bimodal rainfall - Mar-May (long rains), Oct-Dec (short rains)
+                def classify_tropical_season(month):
+                    if month in [3, 4, 5, 10, 11]:  # Wet seasons
+                        return 'wet'
+                    elif month in [1, 2, 6, 7, 8, 9, 12]:  # Dry seasons
+                        return 'dry'
+                    return 'transition'
+                aligned_with_season['season'] = aligned_with_season['month'].apply(
+                    classify_tropical_season)
+            elif is_northern:
+                # Northern: June-Sept wet (monsoon), Dec-Feb dry
+                def classify_north_season(month):
+                    if month in [6, 7, 8, 9]:
+                        return 'wet'
+                    elif month in [12, 1, 2, 3]:
+                        return 'dry'
+                    return 'transition'
+                aligned_with_season['season'] = aligned_with_season['month'].apply(
+                    classify_north_season)
+            else:
+                # Southern: Dec-Feb wet, June-Aug dry
+                def classify_south_season(month):
+                    if month in [11, 12, 1, 2, 3]:
+                        return 'wet'
+                    elif month in [5, 6, 7, 8]:
+                        return 'dry'
+                    return 'transition'
+                aligned_with_season['season'] = aligned_with_season['month'].apply(
+                    classify_south_season)
+
+            # Compute seasonal metrics
+            seasonal_metrics = {}
+            for season in ['wet', 'dry', 'transition']:
+                season_data = aligned_with_season[aligned_with_season['season'] == season]
+                if len(season_data) >= 20:  # Minimum samples for reliable metrics
+                    season_result = run_physics_validation(
+                        obs=season_data['obs'].values,
+                        pred=season_data['pred'].values
+                    )
+                    if season_result.standard_metrics is not None:
+                        seasonal_metrics[f'RMSE_{season}'] = season_result.standard_metrics.rmse
+                        seasonal_metrics[f'KGE_{season}'] = season_result.standard_metrics.kge
+                        seasonal_metrics[f'NSE_{season}'] = season_result.standard_metrics.nse
+                        seasonal_metrics[f'n_days_{season}'] = len(season_data)
+
+            # Store result with seasonal and horizon breakdown
             result = {
                 'station_id': station_data.station_id,
                 'network': station_data.network,
@@ -894,13 +1061,20 @@ class ISMNValidationRunner:
                 'n_days': len(aligned),
                 'start_date': aligned.index.min(),
                 'end_date': aligned.index.max(),
-                **metrics_dict
+                **metrics_dict,
+                **horizon_metrics,
+                **seasonal_metrics
             }
 
             self.results.append(result)
 
+            # Log with horizon info
+            h24_kge = horizon_metrics.get('KGE_24h', float('nan'))
+            h72_kge = horizon_metrics.get('KGE_72h', float('nan'))
+            h168_kge = horizon_metrics.get('KGE_168h', float('nan'))
             logger.info(
-                f"  {depth_cm} cm: RMSE={result['RMSE']:.4f}, NSE={result['NSE']:.3f}, KGE={result['KGE']:.3f}")
+                f"  {depth_cm} cm: RMSE={result['RMSE']:.4f}, KGE={result['KGE']:.3f} | "
+                f"24h={h24_kge:.3f}, 72h={h72_kge:.3f}, 168h={h168_kge:.3f}")
 
     def _save_results(self):
         """Save validation results to files with detailed station-by-station reporting."""
@@ -1023,12 +1197,126 @@ class ISMNValidationRunner:
         print(f"  KGE:  {df['KGE'].mean():.3f} ± {df['KGE'].std():.3f}")
         print(f"  NSE:  {df['NSE'].mean():.3f} ± {df['NSE'].std():.3f}")
 
+        # =====================================================================
+        # Temporal Horizon Analysis Summary (24h, 72h, 168h)
+        # =====================================================================
+        print(f"\nBy Forecast Horizon:")
+        print(f"  {'Horizon':<10} {'RMSE':<10} {'KGE':<10} {'NSE':<10} {'R²':<10}")
+        print(f"  {'-'*50}")
+
+        # Same-day (0h) - baseline
+        print(
+            f"  {'0h (now)':<10} {df['RMSE'].mean():.4f}     {df['KGE'].mean():.4f}     {df['NSE'].mean():.4f}     {df['R²'].mean():.4f}")
+
+        for horizon in ['24h', '72h', '168h']:
+            rmse_col = f'RMSE_{horizon}'
+            kge_col = f'KGE_{horizon}'
+            nse_col = f'NSE_{horizon}'
+            r2_col = f'R2_{horizon}'
+
+            if rmse_col in df.columns:
+                horizon_data = df[df[rmse_col].notna()]
+                if len(horizon_data) > 0:
+                    rmse_mean = horizon_data[rmse_col].mean()
+                    kge_mean = horizon_data[kge_col].mean()
+                    nse_mean = horizon_data[nse_col].mean(
+                    ) if nse_col in horizon_data.columns else float('nan')
+                    r2_mean = horizon_data[r2_col].mean(
+                    ) if r2_col in horizon_data.columns else float('nan')
+                    print(
+                        f"  {horizon:<10} {rmse_mean:.4f}     {kge_mean:.4f}     {nse_mean:.4f}     {r2_mean:.4f}")
+
         # By depth
         print(f"\nBy Depth:")
         for depth in sorted(df['depth_cm'].unique()):
             depth_df = df[df['depth_cm'] == depth]
             print(
                 f"  {int(depth):>3} cm: RMSE={depth_df['RMSE'].mean():.4f}, KGE={depth_df['KGE'].mean():.3f}, n={len(depth_df)}")
+
+        # =====================================================================
+        # Seasonal Analysis Summary
+        # =====================================================================
+        print(f"\nBy Season:")
+        for season in ['wet', 'dry', 'transition']:
+            rmse_col = f'RMSE_{season}'
+            kge_col = f'KGE_{season}'
+            n_col = f'n_days_{season}'
+
+            if rmse_col in df.columns:
+                season_data = df[df[rmse_col].notna()]
+                if len(season_data) > 0:
+                    rmse_mean = season_data[rmse_col].mean()
+                    kge_mean = season_data[kge_col].mean()
+                    total_days = season_data[n_col].sum()
+                    print(
+                        f"  {season.capitalize():>12}: RMSE={rmse_mean:.4f}, KGE={kge_mean:.3f}, n_days={int(total_days)}")
+
+        # Save horizon summary
+        horizon_summary = []
+        for horizon in ['0h', '24h', '72h', '168h']:
+            if horizon == '0h':
+                horizon_summary.append({
+                    'horizon': horizon,
+                    'horizon_days': 0,
+                    'RMSE_mean': df['RMSE'].mean(),
+                    'RMSE_std': df['RMSE'].std(),
+                    'KGE_mean': df['KGE'].mean(),
+                    'KGE_std': df['KGE'].std(),
+                    'NSE_mean': df['NSE'].mean(),
+                    'R2_mean': df['R²'].mean(),
+                    'n_observations': len(df)
+                })
+            else:
+                rmse_col = f'RMSE_{horizon}'
+                if rmse_col in df.columns:
+                    horizon_data = df[df[rmse_col].notna()]
+                    if len(horizon_data) > 0:
+                        horizon_summary.append({
+                            'horizon': horizon,
+                            'horizon_days': {'24h': 1, '72h': 3, '168h': 7}[horizon],
+                            'RMSE_mean': horizon_data[rmse_col].mean(),
+                            'RMSE_std': horizon_data[rmse_col].std(),
+                            'KGE_mean': horizon_data[f'KGE_{horizon}'].mean(),
+                            'KGE_std': horizon_data[f'KGE_{horizon}'].std(),
+                            'NSE_mean': horizon_data[f'NSE_{horizon}'].mean() if f'NSE_{horizon}' in horizon_data.columns else None,
+                            'R2_mean': horizon_data[f'R2_{horizon}'].mean() if f'R2_{horizon}' in horizon_data.columns else None,
+                            'n_observations': len(horizon_data)
+                        })
+
+        if horizon_summary:
+            horizon_df = pd.DataFrame(horizon_summary)
+            horizon_path = self.output_dir / f"horizon_summary_{timestamp}.csv"
+            horizon_df.to_csv(horizon_path, index=False)
+            logger.info(f"Saved horizon summary to {horizon_path}")
+
+        # Save seasonal summary
+        seasonal_summary = []
+        for season in ['wet', 'dry', 'transition']:
+            rmse_col = f'RMSE_{season}'
+            kge_col = f'KGE_{season}'
+            nse_col = f'NSE_{season}'
+            n_col = f'n_days_{season}'
+
+            if rmse_col in df.columns:
+                season_data = df[df[rmse_col].notna()]
+                if len(season_data) > 0:
+                    seasonal_summary.append({
+                        'season': season,
+                        'RMSE_mean': season_data[rmse_col].mean(),
+                        'RMSE_std': season_data[rmse_col].std(),
+                        'KGE_mean': season_data[kge_col].mean(),
+                        'KGE_std': season_data[kge_col].std(),
+                        'NSE_mean': season_data[nse_col].mean() if nse_col in season_data.columns else None,
+                        'n_observations': len(season_data),
+                        'total_days': season_data[n_col].sum()
+                    })
+
+        if seasonal_summary:
+            seasonal_df = pd.DataFrame(seasonal_summary)
+            seasonal_path = self.output_dir / \
+                f"seasonal_summary_{timestamp}.csv"
+            seasonal_df.to_csv(seasonal_path, index=False)
+            logger.info(f"Saved seasonal summary to {seasonal_path}")
 
         print("=" * 80 + "\n")
 

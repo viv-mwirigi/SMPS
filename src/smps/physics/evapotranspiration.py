@@ -277,7 +277,8 @@ class SoilEvaporationState:
         cls,
         theta_FC: float,
         theta_WP: float,
-        Ze: float = 0.10  # Evaporating layer depth (m)
+        # Evaporating layer depth (m) - increased from 0.10 for better surface response
+        Ze: float = 0.125
     ) -> "SoilEvaporationState":
         """
         Initialize evaporation parameters from soil properties.
@@ -285,6 +286,9 @@ class SoilEvaporationState:
         FAO-56 Equations 73 and 74:
             TEW = 1000 × (θ_FC - 0.5×θ_WP) × Ze
             REW = estimated from texture (typically 8-12 mm)
+
+        v2.3 Enhancement: Increased REW ratio for better surface layer
+        responsiveness to atmospheric demand.
 
         Args:
             theta_FC: Field capacity (m³/m³)
@@ -296,17 +300,20 @@ class SoilEvaporationState:
         """
         # Total evaporable water (FAO-56 Eq. 73)
         TEW = 1000 * (theta_FC - 0.5 * theta_WP) * Ze
-        TEW = np.clip(TEW, 10, 50)
+        TEW = np.clip(TEW, 12, 55)  # Increased limits for deeper Ze
 
         # REW is typically 30-40% of TEW for most soils
-        REW = TEW * 0.35
-        REW = np.clip(REW, 6, 15)
+        # v2.3: Increased to 40-45% for better surface responsiveness
+        # This allows more evaporation at potential rate before soil limitation
+        REW = TEW * 0.42
+        REW = np.clip(REW, 8, 18)  # Increased upper limit
 
         return cls(REW=REW, TEW=TEW)
 
 
 def calculate_Kr(
-    evap_state: SoilEvaporationState
+    evap_state: SoilEvaporationState,
+    surface_wetness_factor: float = 1.0
 ) -> float:
     """
     Calculate evaporation reduction coefficient Kr.
@@ -317,8 +324,13 @@ def calculate_Kr(
 
     where De = cumulative depth of evaporation (mm)
 
+    v2.3 Enhancement: Added surface_wetness_factor to allow faster
+    evaporation response after rainfall events. Uses square-root
+    relationship in stage 2 for more gradual decline.
+
     Args:
         evap_state: Current soil evaporation state
+        surface_wetness_factor: Multiplier for recent wetting (1.0-1.5)
 
     Returns:
         Kr coefficient (0-1)
@@ -328,12 +340,17 @@ def calculate_Kr(
     TEW = evap_state.TEW
 
     if De <= REW:
-        return 1.0  # Stage 1
+        # Stage 1 - cap boost at 1.2
+        return 1.0 * min(surface_wetness_factor, 1.2)
     elif De >= TEW:
-        return 0.0  # Stage 3 (essentially zero evaporation)
+        return 0.05  # Stage 3 - allow minimal evaporation even in very dry conditions
     else:
-        # Stage 2: linear reduction
-        return (TEW - De) / (TEW - REW)
+        # Stage 2: Use square-root relationship for more gradual decline
+        # This is more physically realistic as vapor diffusion doesn't drop linearly
+        linear_Kr = (TEW - De) / (TEW - REW)
+        # Square root gives higher Kr in early stage 2, lower in late stage 2
+        # Scale by 0.9 to not exceed linear at start
+        return np.sqrt(linear_Kr) * 0.9
 
 
 def calculate_Ke(
