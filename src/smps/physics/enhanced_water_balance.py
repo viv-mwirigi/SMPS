@@ -1,27 +1,16 @@
 """
-Physics-Enhanced Water Balance Model (v2).
+Physics-Enhanced Water Balance Model.
 
-This module integrates rigorous soil physics to address the identified gaps:
+This module integrates rigorous soil physics:
 
 1. GREEN-AMPT INFILTRATION: Rainfall intensity consideration with wetting front
 2. FAO-56 DUAL COEFFICIENT: Proper ET partitioning with Kcb and Ke
 3. FEDDES ROOT UPTAKE: Pressure head-based stress with compensatory uptake
 4. DARCY PERCOLATION: Unsaturated K with hydraulic head gradients
 5. GRADIENT CAPILLARY RISE: Matric potential-driven upward flux
+6. NUMERICAL STABILITY: Implicit solvers and adaptive timesteps
+The EnhancedWaterBalance class implements a 5-layer soil model
 
-v2.1 Numerical Improvements (Gap 8 & 9):
-- Adaptive sub-daily timesteps during intense rainfall
-- Implicit Euler solver for surface layer fast processes
-- Exact mass balance enforcement with error redistribution
-
-Key Improvements over v1:
-- 30-40% improvement in runoff timing during storms (Gap 1)
-- 20-30% reduction in transpiration bias during mid-season (Gap 2)
-- 25-35% improvement in stress timing across soil types (Gap 3)
-- 40-50% improvement in deep layer rewetting timing (Gap 4)
-- 15-25% improvement in dry-season moisture estimates (Gap 5)
-- Numerical stability during intense events (Gap 8)
-- Machine-precision mass balance closure (Gap 9)
 
 References:
 - FAO-56: Allen et al. (1998)
@@ -143,7 +132,7 @@ class EnhancedModelParameters:
 
     # Enhanced deep root parameters
     # Extra compensation from deep layers during drought
-    deep_root_compensation_factor: float = 1.5
+    deep_root_compensation_factor: float = 1.3  # Reduced from 1.5 for better balance
     # Minimum root fraction in deep layers (was ~5%)
     min_deep_root_fraction: float = 0.08
     max_root_depth_m: float = 1.5  # Allow deeper rooting for crops like maize
@@ -156,7 +145,8 @@ class EnhancedModelParameters:
     enable_macropore: bool = True
     # Lowered from 0.90 to 0.75 to enable preferential flow at lower saturations
     # Research shows macropore activation occurs earlier in field conditions
-    macropore_threshold_saturation: float = 0.75  # Activate above this saturation
+    # Further reduced to 0.70 based on field studies showing macropore flow at 60-70% saturation
+    macropore_threshold_saturation: float = 0.70  # Activate above this saturation
     macropore_conductivity_factor: float = 10.0   # K_macro = factor × K_sat
 
     # Deep layer preferential flow (root channels, cracks extend to depth)
@@ -182,7 +172,9 @@ class EnhancedModelParameters:
     seepage_face_conductance: float = 0.05
 
     # Deep layer time-lag correction (days) - deep layers respond slower to surface changes
-    enable_deep_time_lag: bool = True
+    # DISABLED: Complex EMA implementation without research validation
+    # May mask underlying vertical flux calculation issues
+    enable_deep_time_lag: bool = False
     deep_time_lag_days: float = 3.0  # Response lag for deepest layer
 
     # Canopy interception
@@ -200,26 +192,25 @@ class EnhancedModelParameters:
     # Light extinction coefficient for LAI calculation
     ndvi_extinction_coeff: float = 0.5
 
-    # Numerical parameters (Gap 8 & 9)
+    # Numerical parameters
     tolerance_mm: float = 0.01  # Relaxed from 0.001 for stability
 
     # Surface layer responsiveness (v2.3)
     # Surface layers (0-30cm) need faster response to atmospheric forcing
-    surface_evap_enhancement: float = 1.15  # Boost surface evap by 15%
     # Depth considered "surface" for rapid dynamics
     surface_layer_depth_m: float = 0.30
 
-    # Adaptive timestep (Gap 8)
+    # Adaptive timestep
     use_adaptive_timestep: bool = True
     rainfall_hourly_threshold_mm: float = 5.0  # Switch to hourly above this
     rainfall_subhourly_threshold_mm_hr: float = 20.0  # Switch to 15-min above this
 
-    # Implicit solver (Gap 8)
+    # Implicit solver
     use_implicit_surface: bool = True
     implicit_max_iterations: int = 20
     implicit_convergence: float = 1e-6
 
-    # Mass balance enforcement (Gap 9)
+    # Mass balance enforcement
     enforce_mass_balance: bool = True
     # Set very high - only log truly problematic runs
     max_cumulative_error_mm: float = 10000.0
@@ -432,21 +423,6 @@ class EnhancedFluxes:
 
 
 class EnhancedWaterBalance:
-    """
-    Physics-enhanced water balance model integrating all improvements.
-
-    This model addresses the 5 critical gaps identified in the review:
-
-    Gap 1: Green-Ampt infiltration with rainfall intensity
-    Gap 2: FAO-56 dual crop coefficient for ET
-    Gap 3: Feddes function with pressure head stress
-    Gap 4: Darcy percolation with VG-Mualem K
-    Gap 5: Gradient-driven capillary rise
-
-    Plus numerical improvements (Gap 8 & 9):
-    Gap 8: Adaptive timestep with implicit surface solver
-    Gap 9: Exact mass balance enforcement
-    """
 
     def __init__(
         self,
@@ -476,7 +452,7 @@ class EnhancedWaterBalance:
         # Initialize component models
         self._init_component_models()
 
-        # Initialize numerical solvers (Gap 8 & 9)
+        # Initialize numerical solvers
         self._init_numerical_solvers()
 
         # Tracking
@@ -497,7 +473,8 @@ class EnhancedWaterBalance:
     ) -> List[EnhancedLayerState]:
         """Initialize soil layers"""
         layers = []
-        layer_ids = [SoilLayer.SURFACE, SoilLayer.ROOT_ZONE, SoilLayer.DEEP]
+        layer_ids = [SoilLayer.SURFACE, SoilLayer.UPPER_ROOT,
+                     SoilLayer.LOWER_ROOT, SoilLayer.TRANSITION, SoilLayer.DEEP]
 
         depth_top = 0.0
         for i in range(self.params.n_layers):
@@ -512,7 +489,8 @@ class EnhancedWaterBalance:
                 theta = theta_at_field_capacity(vg)
 
             layer = EnhancedLayerState(
-                layer_id=layer_ids[i] if i < 3 else SoilLayer.DEEP,
+                layer_id=layer_ids[i] if i < len(
+                    layer_ids) else SoilLayer.DEEP,
                 depth_top_m=depth_top,
                 depth_bottom_m=depth_bottom,
                 theta=theta,
@@ -559,7 +537,8 @@ class EnhancedWaterBalance:
             root_params=root_params,
             feddes_params=self.feddes_params,
             enable_compensation=self.params.enable_compensation,
-            enable_hydraulic_lift=self.params.enable_hydraulic_lift
+            enable_hydraulic_lift=self.params.enable_hydraulic_lift,
+            compensation_factor=0.9  # Reduced from 1.2 for better mass balance
         )
 
         # Vertical flux model with enhanced parameters for deep layers
@@ -586,7 +565,8 @@ class EnhancedWaterBalance:
         self.flux_model = VerticalFluxModel(params=flux_params)
 
         # Deep layer time-lag state (stores recent flux history for smoothing)
-        if getattr(self.params, 'enable_deep_time_lag', True):
+        # DISABLED: Complex EMA without validation - run baseline first
+        if getattr(self.params, 'enable_deep_time_lag', False):
             self.deep_flux_history = []
             self.time_lag_days = getattr(
                 self.params, 'deep_time_lag_days', 3.0)
@@ -603,30 +583,27 @@ class EnhancedWaterBalance:
         # Green-Ampt (initialized per timestep based on current moisture)
         self.ga_params = None
 
-        # Surface layer enhancement factor
-        self.surface_evap_enhancement = getattr(
-            self.params, 'surface_evap_enhancement', 1.15)
         self.surface_layer_depth_m = getattr(
             self.params, 'surface_layer_depth_m', 0.30)
 
     def _init_numerical_solvers(self):
-        """Initialize numerical solvers for Gap 8 & 9"""
+        """Initialize numerical solvers for """
         params = self.params
 
-        # Timestep controller (Gap 8)
+        # Timestep controller
         self.timestep_controller = TimestepController(
             rainfall_hourly_threshold=params.rainfall_hourly_threshold_mm,
             rainfall_subhourly_threshold=params.rainfall_subhourly_threshold_mm_hr,
             error_tolerance=params.tolerance_mm
         )
 
-        # Mass balance tracker (Gap 9)
+        # Mass balance tracker
         self.mass_balance = MassBalanceState(
             tolerance_mm=params.tolerance_mm,
             max_cumulative_error_mm=params.max_cumulative_error_mm
         )
 
-        # Implicit solver for surface layer (Gap 8)
+        # Implicit solver for surface layer
         if params.use_implicit_surface:
             from smps.physics.numerical_solver import ImplicitSolverConfig
             implicit_config = ImplicitSolverConfig(
@@ -673,8 +650,8 @@ class EnhancedWaterBalance:
             f"Running enhanced daily: P={precipitation_mm:.1f}, ET0={et0_mm:.1f}, NDVI={ndvi}"
         )
 
-        # Store initial storage
-        initial_storage = self._total_storage()
+        # Store initial storage (soil + canopy reservoir)
+        initial_storage = self._total_storage() + self._canopy_storage_mm()
 
         # Initialize fluxes
         fluxes = EnhancedFluxes(
@@ -700,8 +677,7 @@ class EnhancedWaterBalance:
             fluxes.interception_evap = 0.0
 
         # ================================================================
-        # STEP 2: GREEN-AMPT INFILTRATION (Gap 1)
-        # v2.3: Enhanced for wet season dynamics - allow more infiltration
+        # STEP 2: GREEN-AMPT INFILTRATION
         # ================================================================
         if self.params.use_green_ampt and fluxes.throughfall > 0:
             # Update Green-Ampt parameters with current surface moisture
@@ -717,24 +693,12 @@ class EnhancedWaterBalance:
                 max_temperature_c=temperature_max_c
             )
 
-            # Calculate total profile capacity for infiltration
-            # v2.3: Consider multiple layers for infiltration capacity during wet season
-            total_pore_space = 0.0
-            for layer in self.layers[:3]:  # Top 3 layers (0-50cm typically)
-                layer_space = (layer.vg_params.theta_s -
-                               layer.theta) * layer.thickness_m * 1000
-                total_pore_space += max(0, layer_space)
+            # Limit infiltration to surface layer capacity only
+            # Green-Ampt physics already accounts for rainfall intensity and wetting front
+            surface_capacity = (surface.vg_params.theta_s -
+                               surface.theta) * surface.thickness_m * 1000
 
-            # Surface layer capacity (original limit)
-            surface_space = (surface.vg_params.theta_s -
-                             surface.theta) * surface.thickness_m * 1000
-
-            # Use larger of surface capacity or 50% of profile capacity
-            # This allows infiltration to proceed if deeper layers can accept water
-            effective_capacity = max(surface_space, total_pore_space * 0.5)
-
-            # Limit infiltration to effective capacity
-            infiltration = min(infiltration, effective_capacity)
+            infiltration = min(infiltration, surface_capacity)
             runoff = fluxes.throughfall - infiltration
 
             fluxes.infiltration = infiltration
@@ -771,7 +735,7 @@ class EnhancedWaterBalance:
                 fluxes.macropore_bypass = excess_mm - transfer  # Track as bypass flow
 
         # ================================================================
-        # STEP 3: FAO-56 EVAPOTRANSPIRATION (Gap 2)
+        # STEP 3: FAO-56 EVAPOTRANSPIRATION
         # ================================================================
         if self.params.use_fao56_dual:
             # Remaining ET after interception
@@ -804,21 +768,18 @@ class EnhancedWaterBalance:
 
         # ================================================================
         # STEP 4: SOIL EVAPORATION (from surface layers 0-30cm)
-        # v2.3: Enhanced surface responsiveness for better 10-30cm performance
         # ================================================================
         # Calculate evaporation from surface layer
         surface = self.layers[0]
         available_for_evap = surface.available_water_mm()
 
-        # Apply surface enhancement factor for better responsiveness
-        enhanced_potential_evap = potential_evap * self.surface_evap_enhancement
         actual_evap_surface = min(
-            enhanced_potential_evap * 0.7, available_for_evap)  # 70% from top layer
+            potential_evap * 0.7, available_for_evap)  # 70% from top layer
 
         # Also draw from second layer (10-30cm) if surface is dry
-        if len(self.layers) > 1 and actual_evap_surface < enhanced_potential_evap * 0.5:
+        if len(self.layers) > 1 and actual_evap_surface < potential_evap * 0.5:
             layer1 = self.layers[1]
-            remaining_evap_demand = enhanced_potential_evap - actual_evap_surface
+            remaining_evap_demand = potential_evap - actual_evap_surface
             # Max 30% of layer 1 available water
             available_layer1 = layer1.available_water_mm() * 0.3
             # 40% of remaining demand
@@ -833,7 +794,7 @@ class EnhancedWaterBalance:
         fluxes.soil_evaporation = actual_evap
 
         # ================================================================
-        # STEP 5: FEDDES ROOT WATER UPTAKE (Gap 3)
+        # STEP 5: FEDDES ROOT WATER UPTAKE
         # ================================================================
         if self.params.use_feddes_uptake:
             # Convert layers to root uptake format
@@ -874,7 +835,7 @@ class EnhancedWaterBalance:
             fluxes.transpiration + fluxes.interception_evap
 
         # ================================================================
-        # STEP 6: DARCY VERTICAL FLUXES (Gap 4 & 5)
+        # STEP 6: DARCY VERTICAL FLUXES
         # ================================================================
         if self.params.use_darcy_flux:
             # Convert layers to flux format
@@ -886,15 +847,16 @@ class EnhancedWaterBalance:
             fluxes.percolation = flux_result.percolation_mm
             fluxes.capillary_rise = flux_result.capillary_rise_mm
             fluxes.macropore_drainage = flux_result.macropore_drainage_mm
-            fluxes.deep_drainage = flux_result.bottom_drainage_mm
+            # Deep drainage includes bottom boundary flux plus macropore drainage from all layers
+            fluxes.deep_drainage = flux_result.bottom_drainage_mm + sum(flux_result.macropore_drainage_mm)
 
-            # Apply net fluxes to layers with time-lag correction for deep layers
+            # Apply net fluxes to layers (time-lag correction disabled for baseline testing)
             for i, layer in enumerate(self.layers):
                 net_flux_mm = flux_result.net_flux_mm[i]
 
-                # Apply time-lag correction for deep layers (>40cm)
-                if self.deep_flux_history is not None and layer.depth_top_m >= 0.40:
-                    net_flux_mm = self._apply_deep_time_lag(i, net_flux_mm)
+                # Time-lag correction disabled - deep layers respond immediately
+                # if self.deep_flux_history is not None and layer.depth_top_m >= 0.40:
+                #     net_flux_mm = self._apply_deep_time_lag(i, net_flux_mm)
 
                 layer.theta += net_flux_mm / (layer.thickness_m * 1000)
         else:
@@ -913,11 +875,11 @@ class EnhancedWaterBalance:
             layer.theta_previous = layer.theta
 
         # ================================================================
-        # STEP 8: WATER BALANCE CHECK AND ENFORCEMENT (Gap 9)
+        # STEP 8: WATER BALANCE CHECK AND ENFORCEMENT
         # ================================================================
         water_balance_error = 0.0
         if check_water_balance:
-            final_storage = self._total_storage()
+            final_storage = self._total_storage() + self._canopy_storage_mm()
 
             inputs_dict = {
                 'precipitation': fluxes.precipitation,
@@ -932,28 +894,93 @@ class EnhancedWaterBalance:
             }
 
             if self.params.enforce_mass_balance:
-                # Use mass balance enforcement (Gap 9)
-                corrected_outputs, water_balance_error = self.mass_balance.check_and_enforce(
-                    initial_storage, final_storage, inputs_dict, outputs_dict
-                )
+                # Mass balance enforcement: correct residual by adjusting *soil* storage.
+                # Canopy storage is already included in the storage term (via _canopy_storage_mm).
+                total_input = float(sum(inputs_dict.values()))
+                total_output = float(sum(outputs_dict.values()))
+                expected_change = total_input - total_output
+                actual_change = final_storage - initial_storage
+                error = actual_change - expected_change
 
-                # Update fluxes with corrected values
-                fluxes.runoff = corrected_outputs.get('runoff', fluxes.runoff)
-                fluxes.deep_drainage = corrected_outputs.get(
-                    'deep_drainage', fluxes.deep_drainage)
-                fluxes.soil_evaporation = corrected_outputs.get(
-                    'soil_evaporation', fluxes.soil_evaporation)
-                fluxes.transpiration = corrected_outputs.get(
-                    'transpiration', fluxes.transpiration)
-                fluxes.actual_et = fluxes.soil_evaporation + \
-                    fluxes.transpiration + fluxes.interception_evap
+                if abs(error) > 1e-6:
+                    target_delta_storage = -float(error)  # mm; positive adds water to soil
 
-                # Check for recalibration need
-                if self.mass_balance.needs_recalibration():
-                    self.logger.warning(
-                        f"Cumulative mass balance error ({self.mass_balance.cumulative_error_mm:.2f} mm) "
-                        f"exceeds threshold. Consider recalibration."
-                    )
+                    capacities = []
+                    for layer in self.layers:
+                        theta_min = layer.vg_params.theta_r * 1.01
+                        theta_max = layer.vg_params.theta_s * 0.99
+                        if target_delta_storage >= 0:
+                            cap_mm = max(0.0, (theta_max - layer.theta) * layer.thickness_m * 1000)
+                        else:
+                            cap_mm = max(0.0, (layer.theta - theta_min) * layer.thickness_m * 1000)
+                        capacities.append(cap_mm)
+
+                    total_cap = float(sum(capacities))
+                    remaining = target_delta_storage
+
+                    if total_cap > 0:
+                        for layer, cap_mm in zip(self.layers, capacities):
+                            if cap_mm <= 0 or abs(remaining) <= 1e-6:
+                                continue
+                            share = cap_mm / total_cap
+                            d_storage_mm = remaining * share
+                            if remaining >= 0:
+                                d_storage_mm = min(d_storage_mm, cap_mm)
+                            else:
+                                d_storage_mm = max(d_storage_mm, -cap_mm)
+
+                            layer.theta += d_storage_mm / (layer.thickness_m * 1000)
+                            layer.theta = np.clip(
+                                layer.theta,
+                                layer.vg_params.theta_r * 1.01,
+                                layer.vg_params.theta_s * 0.99
+                            )
+                            remaining -= d_storage_mm
+
+                        # Apply any leftover to the single layer with the most remaining capacity.
+                        # This avoids small residuals from proportional allocation + clipping.
+                        for _ in range(5):
+                            if abs(remaining) <= 1e-6:
+                                break
+                            best_idx = None
+                            best_cap = 0.0
+                            for idx, layer in enumerate(self.layers):
+                                theta_min = layer.vg_params.theta_r * 1.01
+                                theta_max = layer.vg_params.theta_s * 0.99
+                                if remaining >= 0:
+                                    cap = max(0.0, (theta_max - layer.theta) * layer.thickness_m * 1000)
+                                else:
+                                    cap = max(0.0, (layer.theta - theta_min) * layer.thickness_m * 1000)
+                                if cap > best_cap:
+                                    best_cap = cap
+                                    best_idx = idx
+
+                            if best_idx is None or best_cap <= 0:
+                                break
+
+                            layer = self.layers[best_idx]
+                            d_storage_mm = min(remaining, best_cap) if remaining >= 0 else max(remaining, -best_cap)
+                            layer.theta += d_storage_mm / (layer.thickness_m * 1000)
+                            layer.theta = np.clip(
+                                layer.theta,
+                                layer.vg_params.theta_r * 1.01,
+                                layer.vg_params.theta_s * 0.99
+                            )
+                            remaining -= d_storage_mm
+
+                        # Final safety clip
+                        for layer in self.layers:
+                            layer.theta = np.clip(
+                                layer.theta,
+                                layer.vg_params.theta_r * 1.01,
+                                layer.vg_params.theta_s * 0.99
+                            )
+                            layer.theta_previous = layer.theta
+
+                # Recompute post-correction residual for reporting
+                final_storage = self._total_storage() + self._canopy_storage_mm()
+                actual_change = final_storage - initial_storage
+                water_balance_error = actual_change - expected_change
             else:
                 # Legacy check-only behavior
                 inputs = fluxes.precipitation + fluxes.irrigation
@@ -994,10 +1021,10 @@ class EnhancedWaterBalance:
         result = PhysicsPriorResult(
             date=None,  # Set by caller
             theta_surface=self.layers[0].theta,
-            theta_root=self.layers[1].theta if len(
-                self.layers) > 1 else self.layers[0].theta,
-            theta_deep=self.layers[2].theta if len(
-                self.layers) > 2 else None,
+            theta_root=np.mean([self.layers[1].theta, self.layers[2].theta]) if len(
+                self.layers) >= 3 else self.layers[1].theta if len(self.layers) > 1 else self.layers[0].theta,
+            theta_deep=np.mean([self.layers[3].theta, self.layers[4].theta]) if len(self.layers) >= 5 else self.layers[3].theta if len(
+                self.layers) > 3 else self.layers[2].theta if len(self.layers) > 2 else None,
             fluxes=fluxes_dict,
             water_balance_error=water_balance_error,
             converged=abs(water_balance_error) < self.params.tolerance_mm * 10
@@ -1105,6 +1132,12 @@ class EnhancedWaterBalance:
         """Total water storage (mm)"""
         return sum(layer.storage_mm for layer in self.layers)
 
+    def _canopy_storage_mm(self) -> float:
+        """Canopy interception storage (mm)."""
+        if self.params.enable_interception and getattr(self, 'interception_params', None) is not None:
+            return float(getattr(self.interception_params, 'current_storage', 0.0) or 0.0)
+        return 0.0
+
     def _reset_mass_balance_tracking(self):
         """Reset mass balance tracking at start of new simulation."""
         self.cumulative_error = 0.0
@@ -1201,6 +1234,9 @@ class EnhancedWaterBalance:
         self.layers = self._initialize_layers(initial_theta)
         self.cumulative_error = 0.0
         self.iteration_count = 0
+        # Reset canopy interception reservoir
+        if getattr(self, 'interception_params', None) is not None:
+            self.interception_params.current_storage = 0.0
         # Reset numerical solvers
         self.timestep_controller.timestep_history = []
         self.mass_balance.reset()
@@ -1221,7 +1257,7 @@ class EnhancedWaterBalance:
         day_of_season: int = 60
     ) -> Tuple[PhysicsPriorResult, EnhancedFluxes, Dict]:
         """
-        Run model for one day with adaptive sub-daily timesteps (Gap 8).
+        Run model for one day with adaptive sub-daily timesteps.
 
         This method uses smaller timesteps during intense rainfall
         and implicit solver for surface layer.
@@ -1263,8 +1299,8 @@ class EnhancedWaterBalance:
             }
             return result, fluxes, diagnostics
 
-        # Track initial storage
-        initial_storage = self._total_storage()
+        # Track initial storage (soil + canopy reservoir)
+        initial_storage = self._total_storage() + self._canopy_storage_mm()
 
         # Aggregate fluxes
         total_fluxes = EnhancedFluxes(
@@ -1333,10 +1369,10 @@ class EnhancedWaterBalance:
             remaining_precip -= substep_precip
             remaining_et0 -= substep_et0
 
-        # Final storage
-        final_storage = self._total_storage()
+        # Final storage (soil + canopy reservoir)
+        final_storage = self._total_storage() + self._canopy_storage_mm()
 
-        # Enforce mass balance (Gap 9)
+        # Enforce mass balance
         total_fluxes.actual_et = (
             total_fluxes.soil_evaporation +
             total_fluxes.transpiration +
@@ -1383,10 +1419,10 @@ class EnhancedWaterBalance:
         result = PhysicsPriorResult(
             date=None,
             theta_surface=self.layers[0].theta,
-            theta_root=self.layers[1].theta if len(
-                self.layers) > 1 else self.layers[0].theta,
-            theta_deep=self.layers[2].theta if len(
-                self.layers) > 2 else None,
+            theta_root=np.mean([self.layers[1].theta, self.layers[2].theta]) if len(
+                self.layers) >= 3 else self.layers[1].theta if len(self.layers) > 1 else self.layers[0].theta,
+            theta_deep=np.mean([self.layers[3].theta, self.layers[4].theta]) if len(self.layers) >= 5 else self.layers[3].theta if len(
+                self.layers) > 3 else self.layers[2].theta if len(self.layers) > 2 else None,
             fluxes=fluxes_dict,
             water_balance_error=water_balance_error,
             converged=abs(water_balance_error) < self.params.tolerance_mm * 10

@@ -13,6 +13,9 @@ dependencies = [
     "scipy",
     "requests",
     "matplotlib",
+    "tqdm",
+    "pydantic",
+    "pydantic-settings",
 ]
 
 [project.optional-dependencies]

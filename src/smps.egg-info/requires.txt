@@ -3,6 +3,9 @@ pandas
 scipy
 requests
 matplotlib
+tqdm
+pydantic
+pydantic-settings
 
 [dev]
 pytest

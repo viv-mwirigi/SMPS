@@ -201,7 +201,7 @@ __all__ = [
 
 def create_water_balance_model(
     crop_type: str = "maize",
-    n_layers: int = 3,
+    n_layers: int = 5,
     soil_texture: str = "loam",
     use_full_physics: bool = True,
     **kwargs

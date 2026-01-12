@@ -51,7 +51,7 @@ class TestEnhancedWaterBalance:
     def test_initialization(self, default_model):
         """Test model initialization"""
         assert default_model is not None
-        assert len(default_model.layers) == 3
+        assert len(default_model.layers) == 5
         for layer in default_model.layers:
             assert layer.theta > 0
             assert layer.theta < 1

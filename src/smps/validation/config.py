@@ -14,8 +14,8 @@ from datetime import date
 class LayerDepthConfig:
     """Configuration for soil layer depths."""
     surface_depth_m: float = 0.10  # 0-10 cm
-    root_zone_depth_m: float = 0.30  # 10-40 cm (30 cm thick)
-    deep_depth_m: float = 0.60  # 40-100 cm (60 cm thick)
+    root_zone_depth_m: float = 0.40  # 10-50 cm (40 cm thick)
+    deep_depth_m: float = 0.50  # 50-100 cm (50 cm thick)
 
     @property
     def total_depth_m(self) -> float:
@@ -37,8 +37,8 @@ class SensorDepthMapping:
     """Configuration for mapping sensor depths to model layers."""
     # Thresholds for assigning sensors to layers
     surface_max_depth_m: float = 0.10
-    root_zone_max_depth_m: float = 0.30
-    deep_max_depth_m: float = 0.60
+    root_zone_max_depth_m: float = 0.50
+    deep_max_depth_m: float = 1.00
 
     def get_model_layer(self, sensor_depth_m: float) -> str:
         """Determine which model layer a sensor depth corresponds to."""

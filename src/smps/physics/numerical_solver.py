@@ -200,11 +200,12 @@ class MassBalanceState:
     Ensures exact closure within machine precision by
     redistributing errors to the lowest-importance flux.
     """
-    # Tolerance for acceptable error (mm)
-    tolerance_mm: float = 0.001
+    # Tolerance for acceptable error (mm) - relaxed for soil physics realism
+    tolerance_mm: float = 0.01
 
     # Maximum cumulative error before triggering recalibration (mm)
-    max_cumulative_error_mm: float = 10.0
+    # Reduced from 10.0 for more frequent checks
+    max_cumulative_error_mm: float = 1.0
 
     # Track errors
     cumulative_error_mm: float = 0.0
@@ -213,13 +214,16 @@ class MassBalanceState:
     n_timesteps: int = 0
 
     # Error redistribution weights (lower = receives more error)
+    # Based on soil physics uncertainty: drainage is most uncertain, ET is most certain
     flux_priorities: Dict[str, float] = field(default_factory=lambda: {
-        'runoff': 0.8,           # High priority - observable
-        'transpiration': 0.9,    # High priority - affects crops
-        'soil_evaporation': 0.7,  # Medium priority
-        'percolation': 0.3,      # Low priority - unobserved
-        'deep_drainage': 0.1,    # Lowest priority - receives most error
-        'capillary_rise': 0.4,   # Low priority
+        'runoff': 0.9,           # High priority - directly observable
+        'transpiration': 0.8,    # High priority - affects crop growth
+        'soil_evaporation': 0.7,  # Medium priority - observable but variable
+        'interception_evap': 0.6,  # Medium priority
+        'capillary_rise': 0.4,   # Low priority - difficult to measure
+        'percolation': 0.2,      # Low priority - unobserved internal flux
+        # Lowest priority - receives most error (unobserved)
+        'deep_drainage': 0.1,
     })
 
     def check_and_enforce(

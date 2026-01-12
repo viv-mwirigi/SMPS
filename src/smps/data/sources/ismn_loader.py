@@ -135,7 +135,17 @@ class ISMNStationLoader:
         """List available ISMN datasets (downloaded data packages)."""
         if not self.base_path.exists():
             return []
-        return [d for d in self.base_path.iterdir() if d.is_dir() and d.name.startswith("Data_")]
+        # Support passing either:
+        # 1) a parent directory containing multiple ISMN datasets (Data_*/...)
+        # 2) a single dataset directory itself (Data_*/...)
+        if self.base_path.is_dir() and self.base_path.name.startswith("Data_"):
+            return [self.base_path]
+
+        return [
+            d
+            for d in self.base_path.iterdir()
+            if d.is_dir() and d.name.startswith("Data_")
+        ]
 
     def list_networks(self, dataset_path: Optional[Path] = None) -> List[str]:
         """List available networks in a dataset."""

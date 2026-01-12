@@ -33,6 +33,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 import argparse
 import json
+import time
 
 import pandas as pd
 import numpy as np
@@ -74,15 +75,22 @@ class ISMNValidationRunner:
         self,
         ismn_data_dir: Path,
         output_dir: Path,
+        run_name: Optional[str] = None,
         start_date: str = "2017-01-01",
-        end_date: str = "2021-12-31"
+        end_date: str = "2021-12-31",
+        export_pairs: bool = False,
     ):
         self.ismn_data_dir = Path(ismn_data_dir)
-        self.output_dir = Path(output_dir)
+        self.output_root = Path(output_dir)
+        self.run_name = (run_name.strip() if isinstance(
+            run_name, str) and run_name.strip() else None)
+        self.output_dir = self.output_root / \
+            self.run_name if self.run_name else self.output_root
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.start_date = pd.to_datetime(start_date)
         self.end_date = pd.to_datetime(end_date)
+        self.export_pairs = bool(export_pairs)
 
         # Weather cache directory
         self.weather_cache_dir = Path("data/cache/weather")
@@ -97,6 +105,7 @@ class ISMNValidationRunner:
 
         # Results storage
         self.results = []
+        self.pairs_records: List[Dict] = []
 
     def run_validation(
         self,
@@ -168,11 +177,149 @@ class ISMNValidationRunner:
                     f"Failed to validate {station_data.station_id}: {e}")
 
             # Rate limiting: wait 2 seconds between stations to avoid API limits
-            import time
             time.sleep(2)
 
         # Save results
         self._save_results()
+
+    def prefetch_weather(
+        self,
+        networks: Optional[List[str]] = None,
+        stations: Optional[List[str]] = None,
+        max_stations: Optional[int] = None,
+        sleep_seconds: float = 0.0,
+    ) -> None:
+        """Fetch and cache weather for stations (weather only).
+
+        Populates the same on-disk cache used by validation:
+        `data/cache/weather/weather_<station>_<YYYYMMDD>_<YYYYMMDD>.json`.
+        Skips any station windows that already exist.
+        """
+        logger.info(
+            "Prefetching weather cache from %s to %s",
+            self.start_date.date(),
+            self.end_date.date(),
+        )
+
+        # Load stations
+        if stations:
+            station_data_list = self._load_specific_stations(stations)
+        elif networks:
+            station_data_list = []
+            for network in networks:
+                stations_dict = self.ismn_loader.load_network(network)
+                station_data_list.extend(stations_dict.values())
+        else:
+            all_stations = self.ismn_loader.load_all_stations()
+            station_data_list = list(all_stations.values())
+
+        if max_stations:
+            station_data_list = station_data_list[:max_stations]
+
+        n_hit = 0
+        n_miss = 0
+        n_ok = 0
+        n_fail = 0
+
+        for station_data in tqdm(station_data_list, desc="Prefetch weather"):
+            obs = self._get_observations(station_data)
+            if not obs:
+                continue
+
+            starts = [s.index.min() for s in obs.values() if len(s) > 0]
+            ends = [s.index.max() for s in obs.values() if len(s) > 0]
+            if not starts or not ends:
+                continue
+
+            obs_start = pd.to_datetime(min(starts))
+            obs_end = pd.to_datetime(max(ends))
+            fetch_start = max(self.start_date, obs_start)
+            fetch_end = min(self.end_date, obs_end)
+            if fetch_end < fetch_start:
+                continue
+
+            site_id = station_data.station_id
+            safe_site_id = site_id.replace(
+                "/", "_").replace(",", "_").replace(" ", "_")
+            cache_file = (
+                self.weather_cache_dir
+                / f"weather_{safe_site_id}_{fetch_start.strftime('%Y%m%d')}_{fetch_end.strftime('%Y%m%d')}.json"
+            )
+
+            if cache_file.exists():
+                n_hit += 1
+                continue
+            n_miss += 1
+
+            try:
+                request = DataFetchRequest(
+                    site_id=site_id,
+                    start_date=fetch_start.date(),
+                    end_date=fetch_end.date(),
+                    parameters={"latitude": station_data.latitude,
+                                "longitude": station_data.longitude},
+                )
+
+                # Provide coordinates mapping for OpenMeteoSource
+                self.weather_source._site_coordinates = {
+                    site_id: (station_data.latitude, station_data.longitude)
+                }
+
+                weather_data = self.weather_source.fetch_daily_weather(request)
+                if not weather_data:
+                    n_fail += 1
+                    continue
+
+                records = []
+                for w in weather_data:
+                    records.append(
+                        {
+                            "date": w.date,
+                            "precipitation_mm": w.precipitation_mm,
+                            "et0_mm": w.et0_mm,
+                            "temperature_mean_c": w.temperature_mean_c,
+                            "temperature_min_c": w.temperature_min_c,
+                            "temperature_max_c": w.temperature_max_c,
+                            "solar_radiation_mj_m2": w.solar_radiation_mj_m2,
+                            "relative_humidity_mean": w.relative_humidity_mean,
+                            "wind_speed_mean_m_s": w.wind_speed_mean_m_s,
+                        }
+                    )
+
+                weather_df = pd.DataFrame(records)
+                weather_df["date"] = pd.to_datetime(weather_df["date"])
+                weather_df = weather_df.set_index("date")
+
+                cache_data = {
+                    "site_id": site_id,
+                    "latitude": station_data.latitude,
+                    "longitude": station_data.longitude,
+                    "start_date": fetch_start.strftime("%Y-%m-%d"),
+                    "end_date": fetch_end.strftime("%Y-%m-%d"),
+                    "data": weather_df.reset_index().to_dict("records"),
+                }
+                for rec in cache_data["data"]:
+                    if "date" in rec:
+                        rec["date"] = str(rec["date"])
+
+                with open(cache_file, "w", encoding="utf-8") as f:
+                    json.dump(cache_data, f, default=str)
+                n_ok += 1
+            except Exception as e:
+                n_fail += 1
+                logger.warning(
+                    "Weather prefetch failed for %s: %s", site_id, e)
+            finally:
+                if sleep_seconds and sleep_seconds > 0:
+                    time.sleep(float(sleep_seconds))
+
+        logger.info(
+            "Prefetch complete. cache_hit=%d cache_miss=%d fetched_ok=%d fetched_fail=%d",
+            n_hit,
+            n_miss,
+            n_ok,
+            n_fail,
+        )
 
     def _validate_station(self, station_data: ISMNStationData):
         """Validate a single station."""
@@ -192,12 +339,41 @@ class ISMNValidationRunner:
                 logger.info(
                     f"  → {int(depth):3d}cm: {n_valid} valid days ({date_range})")
 
+        # Determine the station-specific observation window for correct forcing fetch.
+        # This prevents fetching weather/satellite for years where the station has no observations.
+        obs_start = None
+        obs_end = None
+        if obs:
+            starts = [s.index.min() for s in obs.values() if len(s) > 0]
+            ends = [s.index.max() for s in obs.values() if len(s) > 0]
+            if starts and ends:
+                obs_start = min(starts)
+                obs_end = max(ends)
+
+        # Clamp station window to the runner's configured bounds
+        fetch_start = self.start_date
+        fetch_end = self.end_date
+        if obs_start is not None:
+            fetch_start = max(fetch_start, pd.to_datetime(obs_start))
+        if obs_end is not None:
+            fetch_end = min(fetch_end, pd.to_datetime(obs_end))
+
+        if fetch_end < fetch_start:
+            logger.warning(
+                f"Station {station_data.station_id} has no observations within configured period; skipping"
+            )
+            return
+
+        logger.info(
+            f"  Forcing fetch window: {fetch_start.date()} to {fetch_end.date()} (from observations)"
+        )
+
         # 1. Get forcing data (weather + satellite)
         forcings = self._get_forcing_data(
             station_data.latitude,
             station_data.longitude,
-            self.start_date,
-            self.end_date,
+            fetch_start,
+            fetch_end,
             station_id=station_data.station_id
         )
 
@@ -368,9 +544,9 @@ class ISMNValidationRunner:
 
             except Exception as e:
                 logger.warning(
-                    f"Satellite data unavailable for {station_data.station_id}: {e}")
+                    f"Satellite data unavailable for {site_id}: {e}")
                 logger.info(
-                    f"Skipping station {station_data.station_id} due to missing satellite data")
+                    f"Skipping station {site_id} due to missing satellite data")
                 return  # Skip this station
 
             return forcings
@@ -758,12 +934,14 @@ class ISMNValidationRunner:
                 1000  # Convert mm/day to m/day
             )
 
-            # Configure model with 3 layers
+            # Configure model with 5 layers
             config = EnhancedModelParameters(
-                n_layers=3,
-                layer_depths_m=[0.10, 0.30, 0.60],  # 10, 30, 60 cm
+                n_layers=5,
+                # 10, 20, 20, 25, 25 cm
+                layer_depths_m=[0.10, 0.20, 0.20, 0.25, 0.25],
                 # Same params for all layers
-                vg_params=[vg_params, vg_params, vg_params],
+                vg_params=[vg_params, vg_params,
+                           vg_params, vg_params, vg_params],
                 crop_type="grassland",  # Natural grassland vegetation for ISMN validation
                 use_green_ampt=True,
                 use_fao56_dual=True,
@@ -920,6 +1098,15 @@ class ISMNValidationRunner:
     ):
         """Compute validation metrics and store results, including seasonal and temporal horizon breakdown."""
 
+        lai_mean = float(pd.to_numeric(forcings.get('lai'), errors='coerce').mean(
+        )) if forcings is not None and 'lai' in forcings.columns else float('nan')
+        ndvi_mean = float(pd.to_numeric(forcings.get('ndvi'), errors='coerce').mean(
+        )) if forcings is not None and 'ndvi' in forcings.columns else float('nan')
+
+        # Observation QC: extremely low-variance series can yield pathological NSE/KGE.
+        # This usually indicates a stuck sensor, heavy smoothing, or a depth that is effectively constant.
+        LOW_VARIANCE_STD_THRESHOLD = 1e-3  # m3/m3
+
         # Define forecast horizons (in days)
         HORIZONS = {
             '24h': 1,   # 1-day ahead
@@ -941,10 +1128,51 @@ class ISMNValidationRunner:
                 'pred': pred
             }).dropna()
 
+            obs_mean = float(aligned['obs'].mean())
+            obs_std = float(aligned['obs'].std())
+            pred_mean = float(aligned['pred'].mean())
+            pred_std = float(aligned['pred'].std())
+            obs_min = float(aligned['obs'].min())
+            obs_max = float(aligned['obs'].max())
+            pred_min = float(aligned['pred'].min())
+            pred_max = float(aligned['pred'].max())
+
+            is_low_variance_obs = bool(np.isfinite(
+                obs_std) and obs_std < LOW_VARIANCE_STD_THRESHOLD)
+            if is_low_variance_obs:
+                logger.warning(
+                    f"Low-variance observation series for {station_data.station_id} at {depth_cm} cm: "
+                    f"obs_std={obs_std:.6f} m3/m3 (metrics may be misleading)"
+                )
+
             if len(aligned) < 30:
                 logger.warning(
                     f"Insufficient overlap for {station_data.station_id} at {depth_cm} cm")
                 continue
+
+            # Export paired obs/pred for scatter-fit evaluation (same-day + horizons)
+            if self.export_pairs:
+                # Same-day pairs (0h)
+                base_pairs = aligned[['pred', 'obs']].copy()
+                base_pairs = base_pairs.dropna()
+                for pred_date, row in base_pairs.iterrows():
+                    self.pairs_records.append({
+                        'station_id': station_data.station_id,
+                        'network': station_data.network,
+                        'station': station_data.station,
+                        'latitude': station_data.latitude,
+                        'longitude': station_data.longitude,
+                        'depth_cm': float(depth_cm),
+                        'pred_depth_cm': float(closest_pred_depth),
+                        'horizon_name': '0h',
+                        'horizon_days': 0,
+                        'pred_date': pred_date,
+                        'obs_date': pred_date,
+                        'pred': float(row['pred']),
+                        'obs': float(row['obs']),
+                        'lai_mean': lai_mean,
+                        'ndvi_mean': ndvi_mean,
+                    })
 
             # Compute overall metrics (instantaneous / same-day)
             metrics_result = run_physics_validation(
@@ -957,7 +1185,10 @@ class ISMNValidationRunner:
             if metrics_result.standard_metrics is not None:
                 metrics_dict = metrics_result.standard_metrics.to_dict()
             metrics_dict['overall_score'] = metrics_result.overall_score
-            metrics_dict['passes_validation'] = metrics_result.passes_validation
+            # Treat low-variance observations as a data-quality failure (avoid declaring "pass" on junk series)
+            metrics_dict['passes_validation'] = (
+                metrics_result.passes_validation and not is_low_variance_obs
+            )
 
             # =====================================================================
             # TEMPORAL HORIZON ANALYSIS (24h, 72h, 168h)
@@ -975,6 +1206,28 @@ class ISMNValidationRunner:
                     'obs': obs_shifted,
                     'pred': aligned['pred']
                 }).dropna()
+
+                if self.export_pairs and len(horizon_aligned) > 0:
+                    for pred_date, row in horizon_aligned.iterrows():
+                        obs_date = pred_date + \
+                            pd.Timedelta(days=int(horizon_days))
+                        self.pairs_records.append({
+                            'station_id': station_data.station_id,
+                            'network': station_data.network,
+                            'station': station_data.station,
+                            'latitude': station_data.latitude,
+                            'longitude': station_data.longitude,
+                            'depth_cm': float(depth_cm),
+                            'pred_depth_cm': float(closest_pred_depth),
+                            'horizon_name': horizon_name,
+                            'horizon_days': int(horizon_days),
+                            'pred_date': pred_date,
+                            'obs_date': obs_date,
+                            'pred': float(row['pred']),
+                            'obs': float(row['obs']),
+                            'lai_mean': lai_mean,
+                            'ndvi_mean': ndvi_mean,
+                        })
 
                 if len(horizon_aligned) >= 20:
                     horizon_result = run_physics_validation(
@@ -1061,6 +1314,15 @@ class ISMNValidationRunner:
                 'n_days': len(aligned),
                 'start_date': aligned.index.min(),
                 'end_date': aligned.index.max(),
+                'obs_mean': obs_mean,
+                'obs_std': obs_std,
+                'obs_min': obs_min,
+                'obs_max': obs_max,
+                'pred_mean': pred_mean,
+                'pred_std': pred_std,
+                'pred_min': pred_min,
+                'pred_max': pred_max,
+                'obs_low_variance_flag': is_low_variance_obs,
                 **metrics_dict,
                 **horizon_metrics,
                 **seasonal_metrics
@@ -1083,17 +1345,39 @@ class ISMNValidationRunner:
             return
 
         df = pd.DataFrame(self.results)
+
+        # If run_name is provided, write a single consistent set of files (no timestamps)
+        # into output_dir/<run_name>/ to avoid accumulating many confusing CSVs.
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        use_fixed_filenames = bool(self.run_name)
 
         # Save detailed results as CSV
-        csv_path = self.output_dir / f"ismn_validation_results_{timestamp}.csv"
+        csv_path = (
+            self.output_dir / "ismn_validation_results.csv"
+            if use_fixed_filenames
+            else self.output_dir / f"ismn_validation_results_{timestamp}.csv"
+        )
         df.to_csv(csv_path, index=False)
         logger.info(f"Saved results to {csv_path}")
 
+        # Save paired obs/sim records for scatter-fit plots
+        if self.export_pairs and self.pairs_records:
+            pairs_df = pd.DataFrame(self.pairs_records)
+            pairs_path = (
+                self.output_dir / "paired_obs_sim.csv"
+                if use_fixed_filenames
+                else self.output_dir / f"paired_obs_sim_{timestamp}.csv"
+            )
+            pairs_df.to_csv(pairs_path, index=False)
+            logger.info(f"Saved paired obs/sim series to {pairs_path}")
+
         # Save as Parquet if available (better for large datasets)
         try:
-            parquet_path = self.output_dir / \
-                f"ismn_validation_results_{timestamp}.parquet"
+            parquet_path = (
+                self.output_dir / "ismn_validation_results.parquet"
+                if use_fixed_filenames
+                else self.output_dir / f"ismn_validation_results_{timestamp}.parquet"
+            )
             df.to_parquet(parquet_path, index=False)
             logger.info(f"Saved results to {parquet_path}")
         except ImportError:
@@ -1107,12 +1391,23 @@ class ISMNValidationRunner:
             station_df = df[df['station_id'] == station_id]
             row = station_df.iloc[0]
 
+            n_depths_total = len(station_df)
+            n_depths_passed = int(station_df['passes_validation'].sum(
+            )) if 'passes_validation' in station_df.columns else 0
+            depth_pass_rate = (n_depths_passed /
+                               n_depths_total) if n_depths_total else 0.0
+            n_low_variance = int(station_df.get('obs_low_variance_flag', False).sum(
+            )) if 'obs_low_variance_flag' in station_df.columns else 0
+
             station_row = {
                 'station_id': station_id,
                 'network': row['network'],
                 'latitude': row['latitude'],
                 'longitude': row['longitude'],
                 'n_depths': len(station_df),
+                'n_depths_passed': n_depths_passed,
+                'depth_pass_rate': round(depth_pass_rate, 3),
+                'n_low_variance_depths': n_low_variance,
                 'depths_cm': ','.join([str(int(d)) for d in sorted(station_df['depth_cm'].unique())]),
                 'total_obs_days': station_df['n_days'].sum(),
                 'date_range': f"{station_df['start_date'].min()} to {station_df['end_date'].max()}",
@@ -1132,12 +1427,21 @@ class ISMNValidationRunner:
                 station_row[f'KGE_{depth}cm'] = depth_row.get('KGE')
                 station_row[f'NSE_{depth}cm'] = depth_row.get('NSE')
 
-            station_row['passes_validation'] = station_df['passes_validation'].any()
+            # For stations with multiple depths, keep these separate so it's clear when only some depths are good.
+            station_row['passes_any_depth'] = bool(
+                station_df['passes_validation'].any())
+            station_row['passes_all_depths'] = bool(
+                station_df['passes_validation'].all())
+            # Back-compat: keep the original column name, but make it explicit and stricter than "any".
+            station_row['passes_validation'] = bool(depth_pass_rate >= 0.5)
             station_summary.append(station_row)
 
         station_summary_df = pd.DataFrame(station_summary)
-        station_summary_path = self.output_dir / \
-            f"station_summary_{timestamp}.csv"
+        station_summary_path = (
+            self.output_dir / "station_summary.csv"
+            if use_fixed_filenames
+            else self.output_dir / f"station_summary_{timestamp}.csv"
+        )
         station_summary_df.to_csv(station_summary_path, index=False)
         logger.info(f"Saved station summary to {station_summary_path}")
 
@@ -1153,7 +1457,11 @@ class ISMNValidationRunner:
         }).round(4)
         depth_summary.columns = ['_'.join(col).strip()
                                  for col in depth_summary.columns.values]
-        depth_summary_path = self.output_dir / f"depth_summary_{timestamp}.csv"
+        depth_summary_path = (
+            self.output_dir / "depth_summary.csv"
+            if use_fixed_filenames
+            else self.output_dir / f"depth_summary_{timestamp}.csv"
+        )
         depth_summary.to_csv(depth_summary_path)
         logger.info(f"Saved depth summary to {depth_summary_path}")
 
@@ -1285,7 +1593,11 @@ class ISMNValidationRunner:
 
         if horizon_summary:
             horizon_df = pd.DataFrame(horizon_summary)
-            horizon_path = self.output_dir / f"horizon_summary_{timestamp}.csv"
+            horizon_path = (
+                self.output_dir / "horizon_summary.csv"
+                if use_fixed_filenames
+                else self.output_dir / f"horizon_summary_{timestamp}.csv"
+            )
             horizon_df.to_csv(horizon_path, index=False)
             logger.info(f"Saved horizon summary to {horizon_path}")
 
@@ -1313,8 +1625,11 @@ class ISMNValidationRunner:
 
         if seasonal_summary:
             seasonal_df = pd.DataFrame(seasonal_summary)
-            seasonal_path = self.output_dir / \
-                f"seasonal_summary_{timestamp}.csv"
+            seasonal_path = (
+                self.output_dir / "seasonal_summary.csv"
+                if use_fixed_filenames
+                else self.output_dir / f"seasonal_summary_{timestamp}.csv"
+            )
             seasonal_df.to_csv(seasonal_path, index=False)
             logger.info(f"Saved seasonal summary to {seasonal_path}")
 
@@ -1341,6 +1656,12 @@ def main():
                         help="Path to ISMN data directory")
     parser.add_argument("--output-dir", type=Path,
                         default=Path("./results/ismn_validation"), help="Output directory")
+    parser.add_argument(
+        "--run-name",
+        type=str,
+        default=None,
+        help="Optional subfolder name inside output-dir (e.g., 'latest') to keep outputs consolidated",
+    )
     parser.add_argument("--network", type=str, nargs="+",
                         help="Network names to process")
     parser.add_argument("--all-networks", action="store_true",
@@ -1351,6 +1672,22 @@ def main():
                         default="2021-12-31", help="End date (YYYY-MM-DD)")
     parser.add_argument("--max-stations", type=int,
                         help="Maximum stations to process (for testing)")
+    parser.add_argument(
+        "--prefetch-weather",
+        action="store_true",
+        help="Only fetch and cache weather for stations (skips validation)",
+    )
+    parser.add_argument(
+        "--prefetch-sleep-seconds",
+        type=float,
+        default=0.0,
+        help="Optional sleep between uncached weather fetches (helps avoid 429)",
+    )
+    parser.add_argument(
+        "--export-pairs",
+        action="store_true",
+        help="Export paired obs/sim records (per depth and horizon) for scatter-fit plots",
+    )
     parser.add_argument("--log-level", type=str, default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
 
@@ -1366,17 +1703,24 @@ def main():
     runner = ISMNValidationRunner(
         ismn_data_dir=args.data_dir,
         output_dir=args.output_dir,
+        run_name=args.run_name,
         start_date=args.start_date,
-        end_date=args.end_date
+        end_date=args.end_date,
+        export_pairs=args.export_pairs,
     )
 
     networks = args.network if args.network else (
         None if args.all_networks else [])
 
-    runner.run_validation(
-        networks=networks,
-        max_stations=args.max_stations
-    )
+    if args.prefetch_weather:
+        runner.prefetch_weather(
+            networks=networks,
+            max_stations=args.max_stations,
+            sleep_seconds=args.prefetch_sleep_seconds,
+        )
+        return
+
+    runner.run_validation(networks=networks, max_stations=args.max_stations)
 
 
 if __name__ == "__main__":

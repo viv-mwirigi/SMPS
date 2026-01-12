@@ -8,6 +8,9 @@ Requires-Dist: pandas
 Requires-Dist: scipy
 Requires-Dist: requests
 Requires-Dist: matplotlib
+Requires-Dist: tqdm
+Requires-Dist: pydantic
+Requires-Dist: pydantic-settings
 Provides-Extra: dev
 Requires-Dist: pytest; extra == "dev"
 Requires-Dist: pytest-cov; extra == "dev"

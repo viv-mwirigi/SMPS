@@ -71,15 +71,19 @@ class SoilParameters:
 class SoilLayer(str, Enum):
     """Soil layer identifiers"""
     SURFACE = "surface"  # 0-10cm
-    ROOT_ZONE = "root_zone"  # 10-40cm
-    DEEP = "deep"  # 40-100cm
+    UPPER_ROOT = "upper_root"  # 10-30cm
+    LOWER_ROOT = "lower_root"  # 30-50cm
+    TRANSITION = "transition"  # 50-75cm
+    DEEP = "deep"  # 75-100cm
 
     @property
     def depth_range_cm(self) -> Tuple[int, int]:
         ranges = {
             SoilLayer.SURFACE: (0, 10),
-            SoilLayer.ROOT_ZONE: (10, 40),
-            SoilLayer.DEEP: (40, 100)
+            SoilLayer.UPPER_ROOT: (10, 30),
+            SoilLayer.LOWER_ROOT: (30, 50),
+            SoilLayer.TRANSITION: (50, 75),
+            SoilLayer.DEEP: (75, 100)
         }
         return ranges[self]
 

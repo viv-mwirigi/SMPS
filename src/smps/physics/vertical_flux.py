@@ -567,14 +567,39 @@ class VerticalFluxModel:
             # Macropore drainage from upper layer
             if self.params.macropore_enabled:
                 macro = calculate_macropore_drainage(upper, self.params)
-                macropore_drainage[i] = macro * 1000  # mm/day
+                # Limit macropore drainage by available water
+                max_macro = upper.available_water_mm() * self.params.max_flux_fraction / dt_days
+                macro_limited = min(macro * 1000, max_macro) / \
+                    1000  # Convert to m/day
+                macropore_drainage[i] = macro_limited * 1000  # mm/day
 
             # Add deep preferential flow for deeper layers
             deep_pref = calculate_deep_preferential_flow(
                 upper, i, n, self.params)
             if deep_pref > 0:
-                # Add to percolation
-                percolation[-1] += deep_pref * 1000
+                # Deep preferential flow is an additional *downward* pathway.
+                # It must be limited by (a) remaining extractable water in the source layer
+                # and (b) remaining pore space in the receiving layer, otherwise it can
+                # generate non-physical theta values and catastrophic mass-balance errors.
+                deep_pref_mm_day = deep_pref * 1000
+
+                # Remaining drainable water fraction for this timestep
+                max_total_out_mm_day = upper.available_water_mm(
+                ) * self.params.max_flux_fraction / dt_days
+                current_out_mm_day = percolation[-1] + macropore_drainage[i]
+                remaining_out_capacity = max(
+                    0.0, max_total_out_mm_day - current_out_mm_day)
+
+                # Remaining space in the receiving layer (after matrix percolation)
+                max_in_mm_day = lower.space_available_mm() / dt_days
+                remaining_in_capacity = max(
+                    0.0, max_in_mm_day - percolation[-1])
+
+                deep_pref_mm_day = min(
+                    deep_pref_mm_day, remaining_out_capacity, remaining_in_capacity)
+
+                # Add to percolation for mass-conservative bookkeeping
+                percolation[-1] += deep_pref_mm_day
 
         # Bottom boundary flux
         bottom_drainage = calculate_water_table_flux(layers[-1], self.params)
@@ -594,13 +619,30 @@ class VerticalFluxModel:
         if self.params.macropore_enabled:
             macro_bottom = calculate_macropore_drainage(
                 layers[-1], self.params)
-            macropore_drainage[-1] = macro_bottom * 1000
+            # Limit by available water
+            max_macro_bottom = layers[-1].available_water_mm() * \
+                self.params.max_flux_fraction / dt_days
+            macro_bottom_limited = min(
+                macro_bottom * 1000, max_macro_bottom) / 1000
+            macropore_drainage[-1] = macro_bottom_limited * 1000
 
         # Add deep preferential flow from bottom layer
         deep_pref_bottom = calculate_deep_preferential_flow(
             layers[-1], n-1, n, self.params)
         if deep_pref_bottom > 0:
-            bottom_drainage_mm += deep_pref_bottom * 1000
+            # Limit bottom preferential drainage to remaining drainable water.
+            # Note: bottom_drainage_mm can be negative (capillary rise), in which case
+            # deep preferential drainage should not add extra upward flux.
+            deep_pref_bottom_mm_day = deep_pref_bottom * 1000
+            max_total_out_mm_day = layers[-1].available_water_mm() * \
+                self.params.max_flux_fraction / dt_days
+            current_out_mm_day = (
+                bottom_drainage_mm if bottom_drainage_mm > 0 else 0.0) + macropore_drainage[-1]
+            remaining_out_capacity = max(
+                0.0, max_total_out_mm_day - current_out_mm_day)
+            deep_pref_bottom_mm_day = min(
+                deep_pref_bottom_mm_day, remaining_out_capacity)
+            bottom_drainage_mm += deep_pref_bottom_mm_day
 
         # Calculate net flux for each layer
         # Layer 0: -percolation[0] - macro[0] + capillary[0]

@@ -9,6 +9,7 @@ from typing import List, Dict, Any, Optional, Tuple
 import requests
 import json
 from pathlib import Path
+import time
 
 from smps.data.sources.base import WeatherSource, DataFetchRequest
 from smps.data.contracts import DailyWeather
@@ -59,6 +60,11 @@ class OpenMeteoSource(WeatherSource):
         "wind_speed_10m_max",
         "wind_direction_10m_dominant"
     ]
+
+    # Request retry behavior (helps with Open-Meteo 429 rate limiting)
+    MAX_RETRIES = 6
+    BACKOFF_BASE_SECONDS = 2.0
+    BACKOFF_MAX_SECONDS = 60.0
 
     def __init__(self, cache_dir: Optional[Path] = None):
         super().__init__("open_meteo", cache_dir)
@@ -116,6 +122,57 @@ class OpenMeteoSource(WeatherSource):
 
         return weather_data
 
+    def _get_json_with_retries(self, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """GET JSON with retries for transient errors and 429 rate limiting."""
+        last_exc: Optional[Exception] = None
+
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                response = self.session.get(url, params=params, timeout=30)
+
+                # Handle rate limiting explicitly
+                if response.status_code == 429:
+                    retry_after = response.headers.get("Retry-After")
+                    if retry_after and str(retry_after).strip().isdigit():
+                        sleep_s = float(retry_after)
+                    else:
+                        sleep_s = min(self.BACKOFF_MAX_SECONDS,
+                                      self.BACKOFF_BASE_SECONDS * (2 ** attempt))
+
+                    self.logger.warning(
+                        f"Open-Meteo rate limited (429). Retrying in {sleep_s:.1f}s (attempt {attempt + 1}/{self.MAX_RETRIES})."
+                    )
+                    time.sleep(sleep_s)
+                    continue
+
+                # Retry on common transient upstream errors
+                if response.status_code in {500, 502, 503, 504}:
+                    sleep_s = min(self.BACKOFF_MAX_SECONDS,
+                                  self.BACKOFF_BASE_SECONDS * (2 ** attempt))
+                    self.logger.warning(
+                        f"Open-Meteo transient HTTP {response.status_code}. Retrying in {sleep_s:.1f}s (attempt {attempt + 1}/{self.MAX_RETRIES})."
+                    )
+                    time.sleep(sleep_s)
+                    continue
+
+                response.raise_for_status()
+                return response.json()
+
+            except (requests.exceptions.RequestException, ValueError) as e:
+                last_exc = e
+                if attempt >= self.MAX_RETRIES - 1:
+                    break
+
+                sleep_s = min(self.BACKOFF_MAX_SECONDS,
+                              self.BACKOFF_BASE_SECONDS * (2 ** attempt))
+                self.logger.warning(
+                    f"Open-Meteo request failed: {e}. Retrying in {sleep_s:.1f}s (attempt {attempt + 1}/{self.MAX_RETRIES})."
+                )
+                time.sleep(sleep_s)
+
+        raise DataSourceError(
+            f"Open-Meteo API error after {self.MAX_RETRIES} attempts: {last_exc}")
+
     def _fetch_historical(self, request: DataFetchRequest,
                           latitude: float, longitude: float) -> List[DailyWeather]:
         """Fetch historical weather data"""
@@ -137,15 +194,8 @@ class OpenMeteoSource(WeatherSource):
 
         self.logger.info(f"Fetching historical weather: {params}")
 
-        try:
-            response = self.session.get(url, params=params, timeout=30)
-            response.raise_for_status()
-            data = response.json()
-
-            return self._parse_daily_response(data, is_forecast=False)
-
-        except requests.exceptions.RequestException as e:
-            raise DataSourceError(f"Open-Meteo API error: {e}")
+        data = self._get_json_with_retries(url, params)
+        return self._parse_daily_response(data, is_forecast=False)
 
     def _fetch_forecast(self, request: DataFetchRequest,
                         latitude: float, longitude: float) -> List[DailyWeather]:
@@ -163,15 +213,8 @@ class OpenMeteoSource(WeatherSource):
 
         self.logger.info(f"Fetching forecast weather: {params}")
 
-        try:
-            response = self.session.get(url, params=params, timeout=30)
-            response.raise_for_status()
-            data = response.json()
-
-            return self._parse_daily_response(data, is_forecast=True)
-
-        except requests.exceptions.RequestException as e:
-            raise DataSourceError(f"Open-Meteo forecast API error: {e}")
+        data = self._get_json_with_retries(url, params)
+        return self._parse_daily_response(data, is_forecast=True)
 
     def _parse_daily_response(self, data: Dict[str, Any],
                               is_forecast: bool) -> List[DailyWeather]:

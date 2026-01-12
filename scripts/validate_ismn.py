@@ -237,18 +237,21 @@ def run_model_for_site(site_id: str, lat: float, lon: float,
         )
 
         # Get soil moisture at sensor depth
-        # PhysicsPriorResult has theta_surface, theta_root attributes
+        # PhysicsPriorResult has theta_surface, theta_root, theta_deep attributes
         theta_surface = result.theta_surface
         theta_root = result.theta_root
-        theta_deep = theta_root * 0.9  # Approximate deep layer
+        theta_deep = result.theta_deep
 
         if sensor_depth_m <= 0.10:
             sm_model = theta_surface
-        elif sensor_depth_m <= 0.20:
-            # Weighted average: 50% surface, 50% root zone (upper part)
-            sm_model = 0.5 * theta_surface + 0.5 * theta_root
+        elif sensor_depth_m <= 0.30:
+            # Sensor in upper root zone (10-30cm), use root zone value
+            sm_model = theta_root
+        elif sensor_depth_m <= 0.50:
+            # Sensor in lower root zone (30-50cm), still use root zone average
+            sm_model = theta_root
         else:
-            # Integrated value or deep layer
+            # Deep layer
             sm_model = theta_deep
 
         results.append({
