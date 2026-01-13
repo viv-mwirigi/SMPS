@@ -204,6 +204,11 @@ def create_water_balance_model(
     n_layers: int = 5,
     soil_texture: str = "loam",
     use_full_physics: bool = True,
+    soil_params=None,
+    soil_param_method: str = "texture_class",
+    theta_s_adj: float = 1.0,
+    Ks_adj: float = 1.0,
+    alpha_adj: float = 1.0,
     **kwargs
 ):
     """
@@ -237,31 +242,123 @@ def create_water_balance_model(
         # Production model with full physics
         from smps.physics.soil_hydraulics import VanGenuchtenParameters
 
-        vg_params = [
-            VanGenuchtenParameters.from_texture_class(soil_texture)
-            for _ in range(n_layers)
-        ]
+        # Honor explicit user-provided VG parameters.
+        explicit_vg_params = kwargs.pop("vg_params", None)
 
-        params = EnhancedModelParameters(
-            n_layers=n_layers,
-            crop_type=crop_type,
-            vg_params=vg_params,
-            use_green_ampt=True,
-            use_fao56_dual=True,
-            use_feddes_uptake=True,
-            use_darcy_flux=True,
-            enable_capillary_rise=True,
-            **kwargs
-        )
+        if soil_params is not None:
+            params = EnhancedModelParameters.from_soil_parameters(
+                soil_params,
+                crop_type=crop_type,
+                **kwargs,
+            )
+
+        elif explicit_vg_params is not None:
+            params = EnhancedModelParameters(
+                n_layers=n_layers,
+                crop_type=crop_type,
+                vg_params=list(explicit_vg_params),
+                use_green_ampt=True,
+                use_fao56_dual=True,
+                use_feddes_uptake=True,
+                use_darcy_flux=True,
+                enable_capillary_rise=True,
+                **kwargs,
+            )
+
+        else:
+            # If requested, build VG params using pedotransfer functions.
+            if soil_param_method.lower() in {"saxton", "rosetta", "tropical"}:
+                from smps.physics.pedotransfer import (
+                    estimate_soil_parameters_saxton,
+                    estimate_soil_parameters_rosetta,
+                    estimate_soil_parameters_tropical,
+                )
+
+                sand_percent = kwargs.pop("sand_percent", None)
+                clay_percent = kwargs.pop("clay_percent", None)
+                organic_matter_percent = kwargs.pop(
+                    "organic_matter_percent", 2.0)
+
+                if sand_percent is None or clay_percent is None:
+                    raise ValueError(
+                        "sand_percent and clay_percent are required when soil_param_method is saxton/rosetta/tropical"
+                    )
+
+                method = soil_param_method.lower()
+                if method == "saxton":
+                    sp = estimate_soil_parameters_saxton(
+                        sand_percent=sand_percent,
+                        clay_percent=clay_percent,
+                        organic_matter_percent=organic_matter_percent,
+                    )
+                elif method == "rosetta":
+                    sp = estimate_soil_parameters_rosetta(
+                        sand_percent=sand_percent,
+                        clay_percent=clay_percent,
+                        organic_matter_percent=organic_matter_percent,
+                    )
+                else:
+                    sp = estimate_soil_parameters_tropical(
+                        sand_percent=sand_percent,
+                        clay_percent=clay_percent,
+                        organic_matter_percent=organic_matter_percent,
+                    )
+
+                params = EnhancedModelParameters.from_soil_parameters(
+                    sp,
+                    crop_type=crop_type,
+                    **kwargs,
+                )
+            else:
+                vg_params = [
+                    VanGenuchtenParameters.from_texture_class(soil_texture)
+                    for _ in range(n_layers)
+                ]
+
+                params = EnhancedModelParameters(
+                    n_layers=n_layers,
+                    crop_type=crop_type,
+                    vg_params=vg_params,
+                    use_green_ampt=True,
+                    use_fao56_dual=True,
+                    use_feddes_uptake=True,
+                    use_darcy_flux=True,
+                    enable_capillary_rise=True,
+                    **kwargs
+                )
+
+        # Optional per-profile calibration multipliers
+        if (theta_s_adj != 1.0) or (Ks_adj != 1.0) or (alpha_adj != 1.0):
+            params.vg_params = [
+                vg.with_multipliers(
+                    theta_s_adj=theta_s_adj,
+                    Ks_adj=Ks_adj,
+                    alpha_adj=alpha_adj,
+                )
+                for vg in params.vg_params
+            ]
+
         return EnhancedWaterBalance(params)
     else:
         # Simplified model uses same EnhancedWaterBalance but with simpler settings
         from smps.physics.soil_hydraulics import VanGenuchtenParameters
 
-        vg_params = [
+        explicit_vg_params = kwargs.pop("vg_params", None)
+
+        vg_params = list(explicit_vg_params) if explicit_vg_params is not None else [
             VanGenuchtenParameters.from_texture_class(soil_texture)
             for _ in range(n_layers)
         ]
+
+        if (theta_s_adj != 1.0) or (Ks_adj != 1.0) or (alpha_adj != 1.0):
+            vg_params = [
+                vg.with_multipliers(
+                    theta_s_adj=theta_s_adj,
+                    Ks_adj=Ks_adj,
+                    alpha_adj=alpha_adj,
+                )
+                for vg in vg_params
+            ]
 
         params = EnhancedModelParameters(
             n_layers=n_layers,

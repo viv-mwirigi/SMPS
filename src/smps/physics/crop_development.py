@@ -1,7 +1,7 @@
 """
 Dynamic Crop Development Model with Phenology-Driven Parameters.
 
-This module addresses Gap 7: Static Crop Parameters by implementing:
+
 1. Time-varying Kcb curves with phenological stages
 2. GDD-based root depth growth
 3. Dynamic root distribution based on soil moisture

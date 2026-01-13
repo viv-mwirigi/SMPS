@@ -5,6 +5,12 @@ src/smps.egg-info/SOURCES.txt
 src/smps.egg-info/dependency_links.txt
 src/smps.egg-info/requires.txt
 src/smps.egg-info/top_level.txt
+src/smps/calibration/__init__.py
+src/smps/calibration/calibrate.py
+src/smps/calibration/metrics.py
+src/smps/calibration/objective.py
+src/smps/calibration/parameterization.py
+src/smps/calibration/problem.py
 src/smps/core/config.py
 src/smps/core/constants.py
 src/smps/core/exceptions.py
@@ -42,4 +48,5 @@ src/smps/validation/__init__.py
 src/smps/validation/config.py
 src/smps/validation/physics_metrics.py
 src/smps/validation/sensitivity_analysis.py
+tests/test_calibration_smoke.py
 tests/test_canonical_pipeline.py

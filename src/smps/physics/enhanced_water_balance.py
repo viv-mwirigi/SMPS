@@ -87,6 +87,10 @@ from smps.physics.numerical_solver import (
 logger = logging.getLogger(__name__)
 
 
+class FluxStabilityError(PhysicsModelError):
+    """Raised when a flux magnitude indicates an unstable timestep."""
+
+
 @dataclass
 class EnhancedModelParameters:
     """
@@ -132,7 +136,8 @@ class EnhancedModelParameters:
 
     # Enhanced deep root parameters
     # Extra compensation from deep layers during drought
-    deep_root_compensation_factor: float = 1.3  # Reduced from 1.5 for better balance
+    # Reduced from 1.5 for better balance
+    deep_root_compensation_factor: float = 1.3
     # Minimum root fraction in deep layers (was ~5%)
     min_deep_root_fraction: float = 0.08
     max_root_depth_m: float = 1.5  # Allow deeper rooting for crops like maize
@@ -148,6 +153,13 @@ class EnhancedModelParameters:
     # Further reduced to 0.70 based on field studies showing macropore flow at 60-70% saturation
     macropore_threshold_saturation: float = 0.70  # Activate above this saturation
     macropore_conductivity_factor: float = 10.0   # K_macro = factor × K_sat
+
+    # Infiltration-stage preferential flow (macropores bypass upper layers)
+    # When enabled and the surface layer saturation exceeds the threshold,
+    # a fraction of infiltrating water is routed directly to deeper layers.
+    enable_infiltration_preferential_flow: bool = True
+    infiltration_macropore_target_layer: int = 2
+    infiltration_macropore_max_fraction: float = 0.5
 
     # Deep layer preferential flow (root channels, cracks extend to depth)
     enable_deep_preferential_flow: bool = True
@@ -200,6 +212,15 @@ class EnhancedModelParameters:
     # Depth considered "surface" for rapid dynamics
     surface_layer_depth_m: float = 0.30
 
+    # Soil evaporation extraction
+    # "heuristic": legacy 70% layer0 + conditional layer1
+    # "ze": distribute extraction over evaporating layer depth Ze with depth-decay weights
+    soil_evaporation_extraction: str = "ze"
+    # Default FAO-56 evaporating layer depth (m). If set, used as an upper bound.
+    soil_evaporation_ze_m: float = 0.125
+    # Exponential depth-decay scale as a fraction of Ze (dimensionless)
+    soil_evaporation_decay_scale_fraction: float = 0.5
+
     # Adaptive timestep
     use_adaptive_timestep: bool = True
     rainfall_hourly_threshold_mm: float = 5.0  # Switch to hourly above this
@@ -216,6 +237,21 @@ class EnhancedModelParameters:
     max_cumulative_error_mm: float = 10000.0
     # Reset cumulative error at start of each run
     reset_mass_balance_per_run: bool = True
+
+    # Flux sanity/clipping
+    flux_clipping_enabled: bool = True
+    # Reject/flag fluxes that are unrealistically large relative to K_sat (dimensionless multiplier)
+    flux_reject_multiplier: float = 100.0
+    # Clip fluxes to K_sat-limited magnitude (mm/day) when exceeded
+    flux_clip_to_ksat: bool = True
+
+    # Mass-balance correction diagnostics
+    warn_mass_balance_correction_mm_day: float = 0.5
+
+    # Numerical safety: bounds on volumetric water content.
+    # Use a tiny epsilon rather than a large (1%) padding; large paddings
+    # can create artificial storage loss/gain and trigger big corrections.
+    theta_bounds_epsilon: float = 1e-6
 
     @classmethod
     def from_soil_parameters(
@@ -387,11 +423,18 @@ class EnhancedFluxes:
     infiltration: float = 0.0
     runoff: float = 0.0
     macropore_bypass: float = 0.0
+    # Diagnostics: macropore routing (mm/day)
+    # `macropore_routed_to_layers[i]` is the macropore-routed water *entering* layer i.
+    # `macropore_routed_from_layers[i]` is the macropore-routed water *leaving* layer i.
+    macropore_routed_to_layers: List[float] = field(default_factory=list)
+    macropore_routed_from_layers: List[float] = field(default_factory=list)
 
     # ET components
     interception_evap: float = 0.0
     soil_evaporation: float = 0.0
     transpiration: float = 0.0
+    # Diagnostics
+    mass_balance_correction: float = 0.0
     transpiration_per_layer: List[float] = field(default_factory=list)
 
     # Vertical fluxes (between layers)
@@ -423,6 +466,276 @@ class EnhancedFluxes:
 
 
 class EnhancedWaterBalance:
+
+    def _apply_soil_evaporation_ze(
+        self,
+        potential_evap_mm: float,
+        dt_days: float,
+    ) -> float:
+        """Apply soil evaporation by distributing extraction over an evaporating depth Ze.
+
+        The intent is to be closer to FAO-56's concept of an evaporating surface layer,
+        while remaining stable in a layered bucket model.
+
+        - Uses overlap of each layer with [0, Ze]
+        - Applies an exponential depth-decay weight within Ze
+        - Limits extraction by a physically motivated minimum theta
+
+        Returns the actual evaporation applied (mm).
+        """
+        potential_evap_mm = float(max(0.0, potential_evap_mm))
+        if potential_evap_mm <= 0.0 or len(self.layers) == 0:
+            return 0.0
+
+        dt_days = float(max(dt_days, 1e-12))
+
+        # Infer Ze from FAO-56 TEW if possible; otherwise fall back to parameter.
+        surface = self.layers[0]
+        ze_param = float(
+            max(0.01, getattr(self.params, 'soil_evaporation_ze_m', 0.125)))
+        ze_inferred = None
+        if surface.evap_state is not None:
+            theta_fc = float(surface.field_capacity)
+            theta_wp = float(surface.wilting_point)
+            denom = 1000.0 * (theta_fc - 0.5 * theta_wp)
+            if denom > 1e-12:
+                ze_inferred = float(surface.evap_state.TEW) / denom
+
+        if ze_inferred is None or not np.isfinite(ze_inferred) or ze_inferred <= 0.0:
+            Ze = ze_param
+        else:
+            # Keep within a safe/typical envelope and cap by configured default.
+            Ze = float(np.clip(ze_inferred, 0.05, max(0.05, ze_param)))
+
+        decay_frac = float(
+            getattr(self.params, 'soil_evaporation_decay_scale_fraction', 0.5))
+        decay_scale = float(max(1e-6, decay_frac * Ze))
+
+        # Build weights for layers that intersect the evaporating depth.
+        weights = []
+        layer_indices = []
+        for i, layer in enumerate(self.layers):
+            overlap_m = max(
+                0.0, min(layer.depth_bottom_m, Ze) - layer.depth_top_m)
+            if overlap_m <= 0.0:
+                continue
+            z_mid = layer.depth_top_m + 0.5 * overlap_m
+            w = overlap_m * float(np.exp(-z_mid / decay_scale))
+            if w <= 0.0:
+                continue
+            weights.append(w)
+            layer_indices.append(i)
+
+        if not weights:
+            # No overlap means Ze is above top? Shouldn't happen, but be safe.
+            return 0.0
+
+        # Compute per-layer max extractable water using a minimum theta.
+        # FAO-56 TEW uses (theta_FC - 0.5*theta_WP), so allow drying below WP but
+        # not below ~0.5*WP and never below residual.
+        max_extract_mm = []
+        for idx in layer_indices:
+            layer = self.layers[idx]
+            theta_min = max(float(layer.vg_params.theta_r) *
+                            1.01, 0.5 * float(layer.wilting_point))
+            mm = max(0.0, (float(layer.theta) - theta_min)
+                     * float(layer.thickness_m) * 1000.0)
+            max_extract_mm.append(mm)
+
+        remaining = float(potential_evap_mm)
+        applied_total = 0.0
+
+        # Iterative weighted allocation with caps (waterfilling).
+        active = [True] * len(layer_indices)
+        for _ in range(20):
+            if remaining <= 1e-12:
+                break
+            w_sum = 0.0
+            for j, is_active in enumerate(active):
+                if is_active and max_extract_mm[j] > 0.0:
+                    w_sum += weights[j]
+            if w_sum <= 0.0:
+                break
+
+            moved = 0.0
+            for j, idx in enumerate(layer_indices):
+                if not active[j] or max_extract_mm[j] <= 0.0:
+                    active[j] = False
+                    continue
+                share = weights[j] / w_sum
+                req = remaining * share
+                take = min(req, max_extract_mm[j])
+                if take <= 0.0:
+                    active[j] = False
+                    continue
+
+                layer = self.layers[idx]
+                layer.theta -= take / (layer.thickness_m * 1000.0)
+                max_extract_mm[j] -= take
+                remaining -= take
+                moved += take
+                applied_total += take
+
+            if moved <= 1e-12:
+                break
+
+        return float(applied_total)
+
+    def _layer_free_capacity_mm(self, layer: EnhancedLayerState) -> float:
+        """Free storage capacity to saturation for a layer (mm)."""
+        theta_max = self._theta_max(layer)
+        free_theta = max(0.0, theta_max - layer.theta)
+        return free_theta * layer.thickness_m * 1000.0
+
+    def _theta_min(self, layer: EnhancedLayerState) -> float:
+        eps = float(
+            max(0.0, getattr(self.params, 'theta_bounds_epsilon', 1e-6)))
+        return float(layer.vg_params.theta_r + eps)
+
+    def _theta_max(self, layer: EnhancedLayerState) -> float:
+        eps = float(
+            max(0.0, getattr(self.params, 'theta_bounds_epsilon', 1e-6)))
+        return float(layer.vg_params.theta_s - eps)
+
+    def _allocate_infiltration_sequential(
+        self,
+        water_mm: float,
+        start_layer: int = 0,
+    ) -> Tuple[List[float], float]:
+        """Sequentially fill layers to saturation starting at `start_layer`.
+
+        Returns a tuple of (applied_mm_per_layer, remaining_mm).
+        This mutates `self.layers[i].theta`.
+        """
+        n = len(self.layers)
+        applied = [0.0] * n
+        remaining = float(max(0.0, water_mm))
+
+        if remaining <= 0.0 or n == 0:
+            return applied, remaining
+
+        start = int(max(0, min(start_layer, n - 1)))
+
+        for i in range(start, n):
+            if remaining <= 0.0:
+                break
+            layer = self.layers[i]
+            cap_mm = self._layer_free_capacity_mm(layer)
+            if cap_mm <= 0.0:
+                continue
+
+            add_mm = min(remaining, cap_mm)
+            layer.theta += add_mm / (layer.thickness_m * 1000.0)
+            # Numerical safety
+            theta_max = self._theta_max(layer)
+            if layer.theta > theta_max:
+                layer.theta = theta_max
+
+            applied[i] = add_mm
+            remaining -= add_mm
+
+        return applied, remaining
+
+    def _enforce_storage_mass_balance(
+        self,
+        initial_storage_mm: float,
+        expected_change_mm: float,
+        dt_days: float,
+    ) -> float:
+        """Adjust soil storage to close mass balance by redistributing to layers.
+
+        Redistributes:
+        - Add water proportional to pore space (to theta_s)
+        - Remove water proportional to mobile water (above theta_r)
+
+        Returns the final residual error (mm) after correction.
+        """
+        final_storage_mm = self._total_storage() + self._canopy_storage_mm()
+        actual_change_mm = final_storage_mm - initial_storage_mm
+        error_mm = float(actual_change_mm - expected_change_mm)
+
+        if abs(error_mm) <= 1e-12:
+            return 0.0
+
+        target_delta_mm = -error_mm
+        remaining = float(target_delta_mm)
+
+        applied_mm = 0.0
+        max_iter = 50
+        for _ in range(max_iter):
+            if abs(remaining) <= 1e-12:
+                break
+
+            if remaining > 0:
+                weights = [
+                    max(0.0, (self._theta_max(layer) - layer.theta)
+                        * layer.thickness_m * 1000.0)
+                    for layer in self.layers
+                ]
+            else:
+                weights = [
+                    max(0.0, (layer.theta - self._theta_min(layer))
+                        * layer.thickness_m * 1000.0)
+                    for layer in self.layers
+                ]
+
+            total_w = float(sum(weights))
+            if total_w <= 0:
+                break
+
+            # One proportional redistribution pass
+            delta_this_pass = 0.0
+            for i, layer in enumerate(self.layers):
+                w = float(weights[i])
+                if w <= 0:
+                    continue
+
+                share = w / total_w
+                d_mm = remaining * share
+                # Clip by this layer's capacity in the direction of change
+                if remaining > 0:
+                    cap_mm = w
+                    d_mm = min(d_mm, cap_mm)
+                else:
+                    cap_mm = w
+                    d_mm = max(d_mm, -cap_mm)
+
+                if abs(d_mm) <= 1e-18:
+                    continue
+
+                layer.theta += d_mm / (layer.thickness_m * 1000.0)
+                layer.theta = float(np.clip(
+                    layer.theta,
+                    self._theta_min(layer),
+                    self._theta_max(layer),
+                ))
+
+                remaining -= d_mm
+                delta_this_pass += d_mm
+
+            applied_mm += delta_this_pass
+
+            # If this pass barely moved anything, stop.
+            if abs(delta_this_pass) <= 1e-12:
+                break
+
+        # Warn if correction is large (convert to mm/day)
+        dt_days = float(max(dt_days, 1e-12))
+        if abs(applied_mm) / dt_days > float(getattr(self.params, 'warn_mass_balance_correction_mm_day', 0.5)):
+            self.logger.warning(
+                "Large mass-balance storage correction: %.3f mm over dt=%.3f d (%.3f mm/day)",
+                abs(applied_mm),
+                dt_days,
+                abs(applied_mm) / dt_days,
+            )
+
+            # Store last correction for diagnostics (pseudo-flux)
+            self._last_mass_balance_correction_mm = float(applied_mm)
+
+        # Return residual after correction
+        final_storage_mm = self._total_storage() + self._canopy_storage_mm()
+        actual_change_mm = final_storage_mm - initial_storage_mm
+        return float(actual_change_mm - expected_change_mm)
 
     def __init__(
         self,
@@ -629,7 +942,9 @@ class EnhancedWaterBalance:
         irrigation_mm: float = 0.0,
         temperature_max_c: Optional[float] = None,
         day_of_season: int = 60,
-        check_water_balance: bool = True
+        check_water_balance: bool = True,
+        dt_days: float = 1.0,
+        allow_subdivision: bool = False,
     ) -> Tuple[PhysicsPriorResult, EnhancedFluxes]:
         """
         Run enhanced model for one day.
@@ -652,6 +967,7 @@ class EnhancedWaterBalance:
 
         # Store initial storage (soil + canopy reservoir)
         initial_storage = self._total_storage() + self._canopy_storage_mm()
+        dt_days = float(max(dt_days, 1e-12))
 
         # Initialize fluxes
         fluxes = EnhancedFluxes(
@@ -686,63 +1002,100 @@ class EnhancedWaterBalance:
                 surface.vg_params, surface.theta
             )
 
-            infiltration, runoff = daily_infiltration_green_ampt(
+            infiltration_potential, runoff_model = daily_infiltration_green_ampt(
                 fluxes.throughfall,
                 self.ga_params,
                 distribution=self.params.rainfall_distribution,
                 max_temperature_c=temperature_max_c
             )
-
-            # Limit infiltration to surface layer capacity only
-            # Green-Ampt physics already accounts for rainfall intensity and wetting front
-            surface_capacity = (surface.vg_params.theta_s -
-                               surface.theta) * surface.thickness_m * 1000
-
-            infiltration = min(infiltration, surface_capacity)
-            runoff = fluxes.throughfall - infiltration
-
-            fluxes.infiltration = infiltration
-            fluxes.runoff = runoff
         else:
-            # Simple capacity approach fallback
-            fluxes.infiltration = min(
-                fluxes.throughfall,
-                (self.layers[0].vg_params.theta_s - self.layers[0].theta) *
-                self.layers[0].thickness_m * 1000
+
+            # Fallback: treat all throughfall as potential infiltration.
+            # Any excess beyond profile storage becomes runoff.
+            infiltration_potential = float(fluxes.throughfall)
+            runoff_model = 0.0
+
+        # Allocate infiltration through the whole profile (sequential filling).
+        # Any remaining water after all layers are filled is treated as runoff.
+        # Optional preferential/macropore bypass can route a fraction directly to deeper layers.
+        infiltration_potential = float(max(0.0, infiltration_potential))
+        runoff_model = float(max(0.0, runoff_model))
+
+        bypass_applied_mm = 0.0
+        bypass_remaining_mm = 0.0
+        bypass_applied_by_layer_mm = [0.0] * len(self.layers)
+
+        bypass_enabled = bool(
+            getattr(self.params, 'enable_macropore', False) and
+            getattr(self.params, 'enable_infiltration_preferential_flow', True)
+        )
+        bypass_target_layer = int(
+            getattr(self.params, 'infiltration_macropore_target_layer', 2))
+        bypass_max_fraction = float(
+            getattr(self.params, 'infiltration_macropore_max_fraction', 0.5))
+
+        bypass_fraction = 0.0
+        if bypass_enabled and len(self.layers) > max(1, bypass_target_layer):
+            surface = self.layers[0]
+            theta_s = float(surface.vg_params.theta_s)
+            if theta_s > 0:
+                saturation = float(surface.theta / theta_s)
+            else:
+                saturation = 0.0
+
+            threshold = float(
+                getattr(self.params, 'macropore_threshold_saturation', 1.0))
+            if saturation > threshold and threshold < 1.0:
+                activation = min(
+                    1.0, max(0.0, (saturation - threshold) / (1.0 - threshold)))
+                k_factor = float(
+                    max(0.0, getattr(self.params, 'macropore_conductivity_factor', 0.0)))
+                conductivity_term = (
+                    k_factor / (1.0 + k_factor)) if k_factor > 0 else 0.0
+                bypass_fraction = activation * conductivity_term
+                bypass_fraction = min(
+                    max(0.0, bypass_fraction), max(0.0, bypass_max_fraction))
+
+        bypass_request_mm = infiltration_potential * bypass_fraction
+        matrix_request_mm = infiltration_potential - bypass_request_mm
+
+        # Apply bypass first so a fraction reaches depth even if upper layers have storage.
+        if bypass_request_mm > 0:
+            bypass_applied_by_layer_mm, bypass_remaining_mm = self._allocate_infiltration_sequential(
+                bypass_request_mm,
+                start_layer=bypass_target_layer,
             )
-            fluxes.runoff = fluxes.throughfall - fluxes.infiltration
+            bypass_applied_mm = bypass_request_mm - bypass_remaining_mm
 
-        # Apply infiltration to surface layer
-        self.layers[0].theta += fluxes.infiltration / \
-            (self.layers[0].thickness_m * 1000)
+        # Apply remaining infiltration sequentially from the surface.
+        _, matrix_remaining_mm = self._allocate_infiltration_sequential(
+            matrix_request_mm,
+            start_layer=0,
+        )
 
-        # If surface becomes saturated, redistribute excess to next layer
-        if self.layers[0].theta > self.layers[0].vg_params.theta_s:
-            excess_theta = self.layers[0].theta - \
-                self.layers[0].vg_params.theta_s
-            excess_mm = excess_theta * self.layers[0].thickness_m * 1000
-            self.layers[0].theta = self.layers[0].vg_params.theta_s
+        excess_mm = max(0.0, matrix_remaining_mm + bypass_remaining_mm)
+        fluxes.infiltration = max(0.0, infiltration_potential - excess_mm)
+        fluxes.runoff = max(0.0, runoff_model + excess_mm)
+        fluxes.macropore_bypass = max(0.0, bypass_applied_mm)
 
-            # Push excess to layer 1 if available
-            if len(self.layers) > 1:
-                space_layer1 = (self.layers[1].vg_params.theta_s -
-                                self.layers[1].theta) * self.layers[1].thickness_m * 1000
-                transfer = min(excess_mm, space_layer1)
-                self.layers[1].theta += transfer / \
-                    (self.layers[1].thickness_m * 1000)
-                # Remaining excess becomes additional runoff
-                fluxes.runoff += (excess_mm - transfer)
-                fluxes.macropore_bypass = excess_mm - transfer  # Track as bypass flow
+        # Initialize macropore routing diagnostics (will be augmented by vertical fluxes below).
+        fluxes.macropore_routed_to_layers = list(bypass_applied_by_layer_mm)
+        fluxes.macropore_routed_from_layers = [0.0] * len(self.layers)
 
         # ================================================================
         # STEP 3: FAO-56 EVAPOTRANSPIRATION
         # ================================================================
         if self.params.use_fao56_dual:
-            # Remaining ET after interception
-            remaining_et0 = max(0, et0_mm - fluxes.interception_evap)
+            # FAO-56 expects ET0 as a *rate* (mm/day). In adaptive substepping,
+            # `et0_mm` is the integrated ET0 over `dt_days`, so convert to a rate.
+            et0_rate_mm_day = float(et0_mm) / float(dt_days)
+            interception_evap_rate_mm_day = float(
+                fluxes.interception_evap) / float(dt_days)
+            remaining_et0_rate_mm_day = max(
+                0.0, et0_rate_mm_day - interception_evap_rate_mm_day)
 
             et_result = calculate_et_fao56_dual(
-                ET0=remaining_et0,
+                ET0=remaining_et0_rate_mm_day,
                 ndvi=ndvi,
                 theta_surface=self.layers[0].theta,
                 theta_FC=self.layers[0].field_capacity,
@@ -751,12 +1104,15 @@ class EnhancedWaterBalance:
                 crop_params=self.crop_curve,
                 day_of_season=day_of_season,
                 precipitation_mm=fluxes.throughfall,
+                dt_days=dt_days,
                 u2=self.params.wind_speed_m_s,
-                RH_min=self.params.rh_min_percent
+                RH_min=self.params.rh_min_percent,
+                update_evap_state=False,
             )
 
-            potential_evap = et_result.E_s
-            potential_transp = et_result.T_c
+            # Convert FAO-56 rates (mm/day) to depths over this dt.
+            potential_evap = float(et_result.E_s) * float(dt_days)
+            potential_transp = float(et_result.T_c) * float(dt_days)
         else:
             # Simple partitioning fallback
             if ndvi is not None:
@@ -769,29 +1125,45 @@ class EnhancedWaterBalance:
         # ================================================================
         # STEP 4: SOIL EVAPORATION (from surface layers 0-30cm)
         # ================================================================
-        # Calculate evaporation from surface layer
         surface = self.layers[0]
-        available_for_evap = surface.available_water_mm()
-
-        actual_evap_surface = min(
-            potential_evap * 0.7, available_for_evap)  # 70% from top layer
-
-        # Also draw from second layer (10-30cm) if surface is dry
-        if len(self.layers) > 1 and actual_evap_surface < potential_evap * 0.5:
-            layer1 = self.layers[1]
-            remaining_evap_demand = potential_evap - actual_evap_surface
-            # Max 30% of layer 1 available water
-            available_layer1 = layer1.available_water_mm() * 0.3
-            # 40% of remaining demand
-            actual_evap_layer1 = min(
-                remaining_evap_demand * 0.4, available_layer1)
-            layer1.theta -= actual_evap_layer1 / (layer1.thickness_m * 1000)
+        extraction_mode = str(
+            getattr(self.params, 'soil_evaporation_extraction', 'ze')).lower().strip()
+        if extraction_mode == 'ze':
+            actual_evap = self._apply_soil_evaporation_ze(
+                potential_evap_mm=potential_evap, dt_days=dt_days)
         else:
-            actual_evap_layer1 = 0.0
+            # Legacy heuristic for backwards-compatibility
+            available_for_evap = surface.available_water_mm()
+            actual_evap_surface = min(
+                potential_evap * 0.7, available_for_evap)  # 70% from top layer
 
-        actual_evap = actual_evap_surface + actual_evap_layer1
-        surface.theta -= actual_evap_surface / (surface.thickness_m * 1000)
-        fluxes.soil_evaporation = actual_evap
+            # Also draw from second layer (10-30cm) if surface is dry
+            if len(self.layers) > 1 and actual_evap_surface < potential_evap * 0.5:
+                layer1 = self.layers[1]
+                remaining_evap_demand = potential_evap - actual_evap_surface
+                # Max 30% of layer 1 available water
+                available_layer1 = layer1.available_water_mm() * 0.3
+                # 40% of remaining demand
+                actual_evap_layer1 = min(
+                    remaining_evap_demand * 0.4, available_layer1)
+                layer1.theta -= actual_evap_layer1 / \
+                    (layer1.thickness_m * 1000)
+            else:
+                actual_evap_layer1 = 0.0
+
+            actual_evap = actual_evap_surface + actual_evap_layer1
+            surface.theta -= actual_evap_surface / (surface.thickness_m * 1000)
+
+        fluxes.soil_evaporation = float(actual_evap)
+
+        # Update FAO-56 surface evaporation state using *actual* evaporation.
+        # (We intentionally computed FAO-56 partitioning without mutating state.)
+        if self.params.use_fao56_dual and surface.evap_state is not None:
+            if fluxes.throughfall > 0:
+                surface.evap_state.reset_after_wetting(
+                    float(fluxes.throughfall))
+            surface.evap_state.cumulative_evaporation += float(actual_evap)
+            surface.evap_state.days_since_wetting += float(dt_days)
 
         # ================================================================
         # STEP 5: FEDDES ROOT WATER UPTAKE
@@ -842,23 +1214,213 @@ class EnhancedWaterBalance:
             flux_layers = [layer.to_flux_layer_state()
                            for layer in self.layers]
 
-            flux_result = self.flux_model.calculate_fluxes(flux_layers)
+            flux_result = self.flux_model.calculate_fluxes(
+                flux_layers, dt_days=dt_days)
 
-            fluxes.percolation = flux_result.percolation_mm
-            fluxes.capillary_rise = flux_result.capillary_rise_mm
-            fluxes.macropore_drainage = flux_result.macropore_drainage_mm
-            # Deep drainage includes bottom boundary flux plus macropore drainage from all layers
-            fluxes.deep_drainage = flux_result.bottom_drainage_mm + sum(flux_result.macropore_drainage_mm)
+            # Convert mm/day rates to mm over this timestep
+            fluxes.percolation = [
+                float(v) * dt_days for v in flux_result.percolation_mm]
+            fluxes.capillary_rise = [
+                float(v) * dt_days for v in flux_result.capillary_rise_mm]
+            fluxes.macropore_drainage = [
+                float(v) * dt_days for v in flux_result.macropore_drainage_mm]
 
-            # Apply net fluxes to layers (time-lag correction disabled for baseline testing)
-            for i, layer in enumerate(self.layers):
-                net_flux_mm = flux_result.net_flux_mm[i]
+            # Preferential/macropore routing:
+            # Treat macropore drainage from upper layers as an internal bypass to the next layer
+            # (rather than an immediate system loss). Only bottom boundary drainage and bottom
+            # layer macropore losses are counted as deep drainage.
+            n = len(self.layers)
+            macro_mm = [
+                float(v) * dt_days for v in flux_result.macropore_drainage_mm]
+            macro_transfer_mm = [0.0] * n
+            macro_bottom_loss_mm = 0.0
+            if n > 0:
+                if n == 1:
+                    macro_bottom_loss_mm = float(macro_mm[0])
+                else:
+                    for i in range(n - 1):
+                        macro_transfer_mm[i] = float(macro_mm[i])
+                    macro_bottom_loss_mm = float(macro_mm[-1])
 
-                # Time-lag correction disabled - deep layers respond immediately
-                # if self.deep_flux_history is not None and layer.depth_top_m >= 0.40:
-                #     net_flux_mm = self._apply_deep_time_lag(i, net_flux_mm)
+            bottom_mm = float(flux_result.bottom_drainage_mm) * dt_days
+            fluxes.deep_drainage = (
+                bottom_mm if bottom_mm > 0 else 0.0) + max(0.0, macro_bottom_loss_mm)
 
-                layer.theta += net_flux_mm / (layer.thickness_m * 1000)
+            # Macropore routing diagnostics:
+            # - transfer from layer i -> i+1 (internal)
+            # - bottom layer loss to boundary
+            if not fluxes.macropore_routed_to_layers:
+                fluxes.macropore_routed_to_layers = [0.0] * n
+            if not fluxes.macropore_routed_from_layers:
+                fluxes.macropore_routed_from_layers = [0.0] * n
+
+            for i in range(n):
+                # Out of this layer
+                if i < n - 1:
+                    fluxes.macropore_routed_from_layers[i] += float(
+                        macro_transfer_mm[i])
+                else:
+                    fluxes.macropore_routed_from_layers[i] += max(
+                        0.0, float(macro_bottom_loss_mm))
+
+                # Into this layer (from above)
+                if i > 0:
+                    fluxes.macropore_routed_to_layers[i] += float(
+                        macro_transfer_mm[i - 1])
+
+            # Apply fluxes as transfers between layers
+            percol = list(fluxes.percolation)
+            cap = list(fluxes.capillary_rise)
+
+            # Sanity checks / clipping: prevent unrealistic mm-per-timestep magnitudes.
+            if getattr(self.params, 'flux_clipping_enabled', True):
+                reject_mult = float(
+                    getattr(self.params, 'flux_reject_multiplier', 100.0))
+                for i in range(n - 1):
+                    upper = self.layers[i]
+                    lower = self.layers[i + 1]
+                    ksat_mm_day = min(float(upper.vg_params.K_sat), float(
+                        lower.vg_params.K_sat)) * 1000.0
+                    ksat_mm = ksat_mm_day * dt_days
+                    # Percolation i->i+1 (downward, positive)
+                    if percol[i] > 0 and ksat_mm > 0 and percol[i] > reject_mult * ksat_mm:
+                        msg = (
+                            f"Unrealistic percolation magnitude at interface {i}->{i+1}: "
+                            f"{percol[i]:.3f} mm (Ksat*dt={ksat_mm:.3f} mm)."
+                        )
+                        if allow_subdivision:
+                            raise FluxStabilityError(msg)
+                        self.logger.warning("%s Clipping.", msg)
+                        if getattr(self.params, 'flux_clip_to_ksat', True):
+                            percol[i] = ksat_mm
+                    # Capillary rise i+1->i (upward, positive)
+                    if cap[i] > 0 and ksat_mm > 0 and cap[i] > reject_mult * ksat_mm:
+                        msg = (
+                            f"Unrealistic capillary rise magnitude at interface {i}<-{i+1}: "
+                            f"{cap[i]:.3f} mm (Ksat*dt={ksat_mm:.3f} mm)."
+                        )
+                        if allow_subdivision:
+                            raise FluxStabilityError(msg)
+                        self.logger.warning("%s Clipping.", msg)
+                        if getattr(self.params, 'flux_clip_to_ksat', True):
+                            cap[i] = ksat_mm
+
+            # Apply bounded transfers so we don't rely on post-hoc theta clipping
+            # (which breaks water accounting and triggers large storage corrections).
+            theta_min = [self._theta_min(layer) for layer in self.layers]
+            theta_max = [self._theta_max(layer) for layer in self.layers]
+
+            def mobile_mm(i: int) -> float:
+                layer = self.layers[i]
+                return max(0.0, (layer.theta - theta_min[i]) * layer.thickness_m * 1000.0)
+
+            def capacity_mm(i: int) -> float:
+                layer = self.layers[i]
+                return max(0.0, (theta_max[i] - layer.theta) * layer.thickness_m * 1000.0)
+
+            applied_perc = [0.0] * max(0, n - 1)
+            applied_cap = [0.0] * max(0, n - 1)
+            applied_macro_transfer = [0.0] * n
+
+            # Interface-by-interface: (1) capillary rise up, then (2) downward transfer.
+            for i in range(n - 1):
+                # 1) Upward (i+1 -> i)
+                cap_req = max(0.0, float(cap[i]))
+                cap_applied = min(cap_req, mobile_mm(i + 1), capacity_mm(i))
+                if cap_applied > 0:
+                    self.layers[i + 1].theta -= cap_applied / \
+                        (self.layers[i + 1].thickness_m * 1000.0)
+                    self.layers[i].theta += cap_applied / \
+                        (self.layers[i].thickness_m * 1000.0)
+                applied_cap[i] = float(cap_applied)
+
+                # 2) Downward (i -> i+1) including macropore transfer
+                down_perc_req = max(0.0, float(percol[i]))
+                down_macro_req = max(0.0, float(macro_transfer_mm[i]))
+                down_req = down_perc_req + down_macro_req
+                down_applied = min(down_req, mobile_mm(i), capacity_mm(i + 1))
+                if down_applied > 0:
+                    # Split between matrix percolation and macropore transfer proportionally
+                    if down_req > 0:
+                        perc_applied = down_applied * \
+                            (down_perc_req / down_req)
+                        macro_applied = down_applied * \
+                            (down_macro_req / down_req)
+                    else:
+                        perc_applied = 0.0
+                        macro_applied = 0.0
+
+                    self.layers[i].theta -= down_applied / \
+                        (self.layers[i].thickness_m * 1000.0)
+                    self.layers[i + 1].theta += down_applied / \
+                        (self.layers[i + 1].thickness_m * 1000.0)
+                    applied_perc[i] = float(perc_applied)
+                    applied_macro_transfer[i] = float(macro_applied)
+                else:
+                    applied_perc[i] = 0.0
+                    applied_macro_transfer[i] = 0.0
+
+            # Bottom boundary flux (drainage or inflow). Treat as exchange with an external reservoir.
+            applied_bottom_out = 0.0
+            applied_bottom_in = 0.0
+            bottom_out_req = max(0.0, float(bottom_mm))
+            macro_bottom_req = max(0.0, float(macro_bottom_loss_mm))
+            bottom_total_out_req = bottom_out_req + macro_bottom_req
+
+            if bottom_total_out_req > 0 and n > 0:
+                out_applied = min(bottom_total_out_req, mobile_mm(n - 1))
+                if out_applied > 0:
+                    self.layers[n - 1].theta -= out_applied / \
+                        (self.layers[n - 1].thickness_m * 1000.0)
+                applied_bottom_out = float(out_applied)
+
+                # Split into matrix drainage vs macropore loss for diagnostics
+                if bottom_total_out_req > 0:
+                    applied_bottom_matrix = applied_bottom_out * \
+                        (bottom_out_req / bottom_total_out_req)
+                    applied_bottom_macro = applied_bottom_out * \
+                        (macro_bottom_req / bottom_total_out_req)
+                else:
+                    applied_bottom_matrix = 0.0
+                    applied_bottom_macro = 0.0
+            else:
+                applied_bottom_matrix = 0.0
+                applied_bottom_macro = 0.0
+
+            # Optional inflow from below (if model returns negative bottom_mm)
+            if bottom_mm < 0 and n > 0:
+                inflow_req = abs(float(bottom_mm))
+                inflow_applied = min(inflow_req, capacity_mm(n - 1))
+                if inflow_applied > 0:
+                    self.layers[n - 1].theta += inflow_applied / \
+                        (self.layers[n - 1].thickness_m * 1000.0)
+                applied_bottom_in = float(inflow_applied)
+
+            # Update diagnostics/flux outputs to reflect what was actually applied to state.
+            fluxes.percolation = list(applied_perc)
+            fluxes.capillary_rise = list(applied_cap)
+
+            # Applied internal macropore transfer is length n-1; keep an n-length array for downstream diagnostics.
+            applied_macro_mm = [0.0] * n
+            for i in range(n - 1):
+                applied_macro_mm[i] = float(applied_macro_transfer[i])
+            applied_macro_mm[-1] = float(applied_bottom_macro)
+            fluxes.macropore_drainage = list(applied_macro_mm)
+
+            # Deep drainage counts only external outflow (matrix drainage + macropore loss at the bottom).
+            fluxes.deep_drainage = max(0.0, float(
+                applied_bottom_matrix)) + max(0.0, float(applied_bottom_macro))
+
+            # Update macropore routing diagnostics to match applied transfers.
+            for i in range(n):
+                if i < n - 1:
+                    fluxes.macropore_routed_from_layers[i] = float(
+                        applied_macro_mm[i])
+                    fluxes.macropore_routed_to_layers[i +
+                                                      1] = float(applied_macro_mm[i])
+                else:
+                    fluxes.macropore_routed_from_layers[i] = float(
+                        applied_macro_mm[i])
         else:
             # Simple percolation fallback
             self._simple_percolation(fluxes)
@@ -867,11 +1429,8 @@ class EnhancedWaterBalance:
         # STEP 7: ENFORCE PHYSICAL BOUNDS
         # ================================================================
         for layer in self.layers:
-            layer.theta = np.clip(
-                layer.theta,
-                layer.vg_params.theta_r * 1.01,
-                layer.vg_params.theta_s * 0.99
-            )
+            layer.theta = float(
+                np.clip(layer.theta, self._theta_min(layer), self._theta_max(layer)))
             layer.theta_previous = layer.theta
 
         # ================================================================
@@ -895,92 +1454,17 @@ class EnhancedWaterBalance:
 
             if self.params.enforce_mass_balance:
                 # Mass balance enforcement: correct residual by adjusting *soil* storage.
-                # Canopy storage is already included in the storage term (via _canopy_storage_mm).
+                # Canopy storage is already included in storage (via _canopy_storage_mm).
                 total_input = float(sum(inputs_dict.values()))
                 total_output = float(sum(outputs_dict.values()))
                 expected_change = total_input - total_output
-                actual_change = final_storage - initial_storage
-                error = actual_change - expected_change
-
-                if abs(error) > 1e-6:
-                    target_delta_storage = -float(error)  # mm; positive adds water to soil
-
-                    capacities = []
-                    for layer in self.layers:
-                        theta_min = layer.vg_params.theta_r * 1.01
-                        theta_max = layer.vg_params.theta_s * 0.99
-                        if target_delta_storage >= 0:
-                            cap_mm = max(0.0, (theta_max - layer.theta) * layer.thickness_m * 1000)
-                        else:
-                            cap_mm = max(0.0, (layer.theta - theta_min) * layer.thickness_m * 1000)
-                        capacities.append(cap_mm)
-
-                    total_cap = float(sum(capacities))
-                    remaining = target_delta_storage
-
-                    if total_cap > 0:
-                        for layer, cap_mm in zip(self.layers, capacities):
-                            if cap_mm <= 0 or abs(remaining) <= 1e-6:
-                                continue
-                            share = cap_mm / total_cap
-                            d_storage_mm = remaining * share
-                            if remaining >= 0:
-                                d_storage_mm = min(d_storage_mm, cap_mm)
-                            else:
-                                d_storage_mm = max(d_storage_mm, -cap_mm)
-
-                            layer.theta += d_storage_mm / (layer.thickness_m * 1000)
-                            layer.theta = np.clip(
-                                layer.theta,
-                                layer.vg_params.theta_r * 1.01,
-                                layer.vg_params.theta_s * 0.99
-                            )
-                            remaining -= d_storage_mm
-
-                        # Apply any leftover to the single layer with the most remaining capacity.
-                        # This avoids small residuals from proportional allocation + clipping.
-                        for _ in range(5):
-                            if abs(remaining) <= 1e-6:
-                                break
-                            best_idx = None
-                            best_cap = 0.0
-                            for idx, layer in enumerate(self.layers):
-                                theta_min = layer.vg_params.theta_r * 1.01
-                                theta_max = layer.vg_params.theta_s * 0.99
-                                if remaining >= 0:
-                                    cap = max(0.0, (theta_max - layer.theta) * layer.thickness_m * 1000)
-                                else:
-                                    cap = max(0.0, (layer.theta - theta_min) * layer.thickness_m * 1000)
-                                if cap > best_cap:
-                                    best_cap = cap
-                                    best_idx = idx
-
-                            if best_idx is None or best_cap <= 0:
-                                break
-
-                            layer = self.layers[best_idx]
-                            d_storage_mm = min(remaining, best_cap) if remaining >= 0 else max(remaining, -best_cap)
-                            layer.theta += d_storage_mm / (layer.thickness_m * 1000)
-                            layer.theta = np.clip(
-                                layer.theta,
-                                layer.vg_params.theta_r * 1.01,
-                                layer.vg_params.theta_s * 0.99
-                            )
-                            remaining -= d_storage_mm
-
-                        # Final safety clip
-                        for layer in self.layers:
-                            layer.theta = np.clip(
-                                layer.theta,
-                                layer.vg_params.theta_r * 1.01,
-                                layer.vg_params.theta_s * 0.99
-                            )
-                            layer.theta_previous = layer.theta
-
-                # Recompute post-correction residual for reporting
-                final_storage = self._total_storage() + self._canopy_storage_mm()
-                actual_change = final_storage - initial_storage
-                water_balance_error = actual_change - expected_change
+                water_balance_error = self._enforce_storage_mass_balance(
+                    initial_storage_mm=initial_storage,
+                    expected_change_mm=expected_change,
+                    dt_days=dt_days,
+                )
+                fluxes.mass_balance_correction = float(
+                    getattr(self, '_last_mass_balance_correction_mm', 0.0))
             else:
                 # Legacy check-only behavior
                 inputs = fluxes.precipitation + fluxes.irrigation
@@ -995,7 +1479,8 @@ class EnhancedWaterBalance:
 
             if abs(water_balance_error) > self.params.tolerance_mm * 10:
                 self.logger.warning(
-                    f"Large water balance error: {water_balance_error:.3f} mm"
+                    "Large water balance error: %.3f mm",
+                    water_balance_error,
                 )
 
         # Build result
@@ -1009,8 +1494,17 @@ class EnhancedWaterBalance:
             "interception_evap": fluxes.interception_evap,
             "evapotranspiration": fluxes.actual_et,
             "deep_drainage": fluxes.deep_drainage,
+            "mass_balance_correction": fluxes.mass_balance_correction,
             "et0": et0_mm
         }
+
+        # Add macropore routing diagnostics (layer-wise mm/day)
+        if fluxes.macropore_routed_to_layers and fluxes.macropore_routed_from_layers:
+            for i in range(len(self.layers)):
+                fluxes_dict[f"macropore_routed_to_layer_{i}"] = float(
+                    fluxes.macropore_routed_to_layers[i])
+                fluxes_dict[f"macropore_routed_from_layer_{i}"] = float(
+                    fluxes.macropore_routed_from_layers[i])
 
         # Add per-layer fluxes
         for i, perc in enumerate(fluxes.percolation):
@@ -1175,19 +1669,31 @@ class EnhancedWaterBalance:
         results = []
 
         for i, (idx, row) in enumerate(forcings.iterrows()):
-            result, fluxes = self.run_daily(
-                precipitation_mm=row['precipitation_mm'],
-                et0_mm=row['et0_mm'],
-                ndvi=row.get('ndvi'),
-                irrigation_mm=row.get('irrigation_mm', 0.0),
-                temperature_max_c=row.get('temperature_max_c'),
-                day_of_season=row.get('day_of_season', 60)
-            )
+            if getattr(self.params, 'use_adaptive_timestep', False):
+                result, fluxes, _diagnostics = self.run_daily_adaptive(
+                    precipitation_mm=row['precipitation_mm'],
+                    et0_mm=row['et0_mm'],
+                    ndvi=row.get('ndvi'),
+                    irrigation_mm=row.get('irrigation_mm', 0.0),
+                    temperature_max_c=row.get('temperature_max_c'),
+                    day_of_season=row.get('day_of_season', 60),
+                )
+            else:
+                result, fluxes = self.run_daily(
+                    precipitation_mm=row['precipitation_mm'],
+                    et0_mm=row['et0_mm'],
+                    ndvi=row.get('ndvi'),
+                    irrigation_mm=row.get('irrigation_mm', 0.0),
+                    temperature_max_c=row.get('temperature_max_c'),
+                    day_of_season=row.get('day_of_season', 60),
+                    dt_days=1.0,
+                )
 
             if i >= warmup_days:
                 result_dict = {
                     'theta_phys_surface': result.theta_surface,
                     'theta_phys_root': result.theta_root,
+                    'theta_phys_deep': (result.theta_deep if result.theta_deep is not None else 0.0),
                     'water_balance_error_mm': result.water_balance_error,
                     'converged': result.converged
                 }
@@ -1247,6 +1753,38 @@ class EnhancedWaterBalance:
             self.deep_flux_history = []
         self.logger.info("Model reset")
 
+    def spin_up(
+        self,
+        forcings: pd.DataFrame,
+        n_cycles: int = 3,
+        initial_theta: Optional[List[float]] = None,
+    ) -> None:
+        """Spin up the soil profile by looping the forcings multiple times.
+
+        This is useful when initial soil moisture is uncertain: repeating a
+        representative climatology can bring the profile closer to a dynamic
+        equilibrium before evaluation/validation.
+
+        Notes:
+        - This mutates the model state (layer thetas, canopy storage, etc.).
+        - No outputs are returned; call get_layer_states() after to inspect.
+        """
+        if n_cycles <= 0:
+            return
+
+        if initial_theta is not None:
+            self.reset(initial_theta=initial_theta)
+
+        n_days = len(forcings)
+        if n_days <= 0:
+            return
+
+        self.logger.info("Spin-up: %d cycles over %d days", n_cycles, n_days)
+        for _ in range(int(n_cycles)):
+            # Run full length as warmup so nothing is recorded.
+            _ = self.run_period(forcings=forcings,
+                                warmup_days=n_days, return_fluxes=False)
+
     def run_daily_adaptive(
         self,
         precipitation_mm: float,
@@ -1259,8 +1797,9 @@ class EnhancedWaterBalance:
         """
         Run model for one day with adaptive sub-daily timesteps.
 
-        This method uses smaller timesteps during intense rainfall
-        and implicit solver for surface layer.
+        This method substeps the *bucket-style* multilayer water balance to
+        improve stability during intense rainfall. It does not run a separate
+        Richards-style vertical PDE solver.
 
         Args:
             precipitation_mm: Daily precipitation (mm)
@@ -1287,7 +1826,7 @@ class EnhancedWaterBalance:
             f"Day with P={precipitation_mm:.1f}mm requires {n_substeps} substeps")
 
         # If only 1 substep (daily), use standard method
-        if n_substeps == 1 and not self.params.use_implicit_surface:
+        if n_substeps == 1:
             result, fluxes = self.run_daily(
                 precipitation_mm, et0_mm, ndvi, irrigation_mm,
                 temperature_max_c, day_of_season
@@ -1314,65 +1853,62 @@ class EnhancedWaterBalance:
             hydraulic_lift=[0.0] * len(self.layers)
         )
 
-        # Partition forcing across substeps
-        remaining_precip = precipitation_mm
-        remaining_et0 = et0_mm
+        # Partition forcing across substeps.
+        # `dt` values are fractions of a day; apply them to the *total* daily
+        # forcing (not the remaining amount), otherwise you under-apply inputs.
+        # NOTE: `use_implicit_surface` is intentionally ignored here.
+        # The daily bucket update already applies infiltration/ET/percolation;
+        # running an additional implicit Richards surface solve would double-count.
         total_implicit_iters = 0
 
         for t_start, dt in substeps:
             # Partition forcing for this substep
-            substep_precip = remaining_precip * dt
-            substep_et0 = remaining_et0 * dt
+            substep_precip = precipitation_mm * dt
+            substep_et0 = et0_mm * dt
 
-            # Run substep
-            result, fluxes = self.run_daily(
-                precipitation_mm=substep_precip / dt,  # Rate for full day
-                et0_mm=substep_et0 / dt,
-                ndvi=ndvi,
-                irrigation_mm=irrigation_mm * dt,
-                temperature_max_c=temperature_max_c,
-                day_of_season=day_of_season,
-                check_water_balance=False  # Check at end
-            )
+            # Run substep using substep-integrated forcings (mm over this dt)
+            # NOTE: `run_daily` applies fluxes to state immediately.
+            # If a substep becomes unstable, subdivide dt and retry.
+            pending = [dt]
+            while pending:
+                dt_seg = pending.pop(0)
+                try:
+                    result, fluxes = self.run_daily(
+                        precipitation_mm=substep_precip * (dt_seg / dt),
+                        et0_mm=substep_et0 * (dt_seg / dt),
+                        ndvi=ndvi,
+                        irrigation_mm=irrigation_mm * dt_seg,
+                        temperature_max_c=temperature_max_c,
+                        day_of_season=day_of_season,
+                        check_water_balance=False,  # Check at end
+                        dt_days=dt_seg,
+                        allow_subdivision=True,
+                    )
+                except Exception as e:
+                    # Conservative fallback: split timestep until minimum.
+                    dt_min = float(
+                        getattr(self.timestep_controller, 'dt_min_day', 1/96))
+                    if dt_seg / 2 >= dt_min:
+                        pending = [dt_seg / 2, dt_seg / 2] + pending
+                        continue
+                    raise e
 
-            # Scale fluxes by timestep fraction
-            total_fluxes.infiltration += fluxes.infiltration * dt
-            total_fluxes.runoff += fluxes.runoff * dt
-            total_fluxes.throughfall += fluxes.throughfall * dt
-            total_fluxes.interception_evap += fluxes.interception_evap * dt
-            total_fluxes.soil_evaporation += fluxes.soil_evaporation * dt
-            total_fluxes.transpiration += fluxes.transpiration * dt
-            total_fluxes.deep_drainage += fluxes.deep_drainage * dt
+                # Aggregate substep fluxes (already in mm for this dt_seg)
+                total_fluxes.infiltration += fluxes.infiltration
+                total_fluxes.runoff += fluxes.runoff
+                total_fluxes.throughfall += fluxes.throughfall
+                total_fluxes.interception_evap += fluxes.interception_evap
+                total_fluxes.soil_evaporation += fluxes.soil_evaporation
+                total_fluxes.transpiration += fluxes.transpiration
+                total_fluxes.deep_drainage += fluxes.deep_drainage
 
-            # Use implicit solver for surface if intense rain
-            if self.params.use_implicit_surface and substep_precip > 0.5:
-                surface = self.layers[0]
-                theta_new, n_iter, converged = self.implicit_solver.solve_surface_layer(
-                    theta_current=surface.theta,
-                    theta_s=surface.vg_params.theta_s,
-                    theta_r=surface.vg_params.theta_r,
-                    thickness_m=surface.thickness_m,
-                    dt_day=dt,
-                    infiltration_rate_mm_day=fluxes.infiltration / dt,
-                    evap_rate_mm_day=fluxes.soil_evaporation / dt,
-                    percolation_rate_mm_day=fluxes.percolation[0] /
-                    dt if fluxes.percolation else 0,
-                    K_func=lambda theta: van_genuchten_mualem_K(
-                        theta, surface.vg_params),
-                    psi_func=lambda theta: van_genuchten_psi_from_theta(
-                        theta, surface.vg_params)
-                )
-                # Apply implicit solution
-                surface.theta = theta_new
-                total_implicit_iters += n_iter
-
-            remaining_precip -= substep_precip
-            remaining_et0 -= substep_et0
+                # Continue until this dt chunk is consumed
+                continue
 
         # Final storage (soil + canopy reservoir)
         final_storage = self._total_storage() + self._canopy_storage_mm()
 
-        # Enforce mass balance
+        # Enforce mass balance (storage-based)
         total_fluxes.actual_et = (
             total_fluxes.soil_evaporation +
             total_fluxes.transpiration +
@@ -1389,15 +1925,16 @@ class EnhancedWaterBalance:
             'deep_drainage': total_fluxes.deep_drainage
         }
 
-        corrected_outputs, water_balance_error = self.mass_balance.check_and_enforce(
-            initial_storage, final_storage, inputs_dict, outputs_dict
+        expected_change = float(
+            sum(inputs_dict.values()) - sum(outputs_dict.values()))
+        water_balance_error = self._enforce_storage_mass_balance(
+            initial_storage_mm=initial_storage,
+            expected_change_mm=expected_change,
+            dt_days=1.0,
         )
 
-        # Update fluxes
-        total_fluxes.runoff = corrected_outputs.get(
-            'runoff', total_fluxes.runoff)
-        total_fluxes.deep_drainage = corrected_outputs.get(
-            'deep_drainage', total_fluxes.deep_drainage)
+        total_fluxes.mass_balance_correction = float(
+            getattr(self, '_last_mass_balance_correction_mm', 0.0))
 
         self.cumulative_error += abs(water_balance_error)
         self.iteration_count += 1
@@ -1413,6 +1950,7 @@ class EnhancedWaterBalance:
             "interception_evap": total_fluxes.interception_evap,
             "evapotranspiration": total_fluxes.actual_et,
             "deep_drainage": total_fluxes.deep_drainage,
+            "mass_balance_correction": total_fluxes.mass_balance_correction,
             "et0": et0_mm
         }
 

@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "defaults": {
+    "metrics": {
+      "kge_min": 0.40,
+      "nse_min": 0.30,
+      "ubrmse_max_by_depth": {
+        "surface": 0.06,
+        "root": 0.05,
+        "deep": 0.04
+      },
+      "bias_frac_max": 0.10
+    },
+    "physics": {
+      "mass_balance_input_frac_max": 0.01,
+      "runoff_within_input": true,
+      "no_theta_outside_porosity": true,
+      "no_negative_theta": true,
+      "no_impossible_flux_spikes": true
+    }
+  },
+  "cases": [
+    {
+      "id": "synthetic_loam_120d",
+      "type": "synthetic",
+      "soil_texture": "loam",
+      "crop_type": "maize",
+      "n_layers": 5,
+      "n_days": 150,
+      "warmup_days": 30,
+      "depth_targets_m": [0.10, 0.30, 0.60],
+      "forcing": {
+        "seed": 123,
+        "mean_et0_mm_day": 4.0,
+        "precip_event_prob": 0.12,
+        "precip_event_mean_mm": 12.0,
+        "precip_event_max_mm": 60.0,
+        "ndvi": 0.6
+      },
+      "observation_noise": {
+        "seed": 456,
+        "sigma": {
+          "surface": 0.01,
+          "root": 0.008,
+          "deep": 0.006
+        }
+      }
+    }
+  ]
+}

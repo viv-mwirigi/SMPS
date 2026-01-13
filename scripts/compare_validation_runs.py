@@ -23,6 +23,13 @@ def _latest_csv(run_dir: Path, pattern: str) -> Path:
     return files[-1]
 
 
+def _pick_csv(run_dir: Path, fixed_name: str, pattern: str) -> Path:
+    fixed = run_dir / fixed_name
+    if fixed.exists():
+        return fixed
+    return _latest_csv(run_dir, pattern)
+
+
 def _norm_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [c.strip().lower() for c in df.columns]
@@ -37,9 +44,11 @@ def _pick_col(cols: list[str], *candidates: str) -> str:
 
 
 def summarize_run(name: str, run_dir: Path) -> None:
-    station_path = _latest_csv(run_dir, "station_summary_*.csv")
-    depth_path = _latest_csv(run_dir, "depth_summary_*.csv")
-    horizon_path = _latest_csv(run_dir, "horizon_summary_*.csv")
+    station_path = _pick_csv(
+        run_dir, "station_summary.csv", "station_summary_*.csv")
+    depth_path = _pick_csv(run_dir, "depth_summary.csv", "depth_summary_*.csv")
+    horizon_path = _pick_csv(
+        run_dir, "horizon_summary.csv", "horizon_summary_*.csv")
 
     st = _norm_cols(pd.read_csv(station_path))
     station_col = next(c for c in st.columns if c.startswith("station"))

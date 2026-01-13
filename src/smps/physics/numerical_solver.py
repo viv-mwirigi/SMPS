@@ -162,6 +162,13 @@ class TimestepController:
 
         dt, _ = self.determine_timestep(precipitation_mm_day, K_max, dz_min)
 
+        # Extra refinement when unsaturated conductivity varies sharply across the profile.
+        # This is a simple nonlinearity proxy: large K contrast tends to produce stiff dynamics.
+        k_pos = [max(1e-12, float(k)) for k in K_profile_m_day]
+        k_contrast = max(k_pos) / max(1e-12, min(k_pos))
+        if k_contrast >= 1e4:
+            dt = max(self.dt_min_day, min(dt, 1/24))
+
         substeps = []
         t = 0.0
 

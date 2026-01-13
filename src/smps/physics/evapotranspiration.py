@@ -17,6 +17,7 @@ References:
 """
 
 import numpy as np
+import copy
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Dict, List
 from enum import Enum
@@ -253,7 +254,7 @@ class SoilEvaporationState:
     We extend this with Stage 3 for very dry conditions.
     """
     cumulative_evaporation: float = 0.0  # Since last wetting (mm)
-    days_since_wetting: int = 0
+    days_since_wetting: float = 0.0
     current_stage: SoilEvaporationStage = SoilEvaporationStage.STAGE1
 
     # FAO-56 parameters
@@ -579,33 +580,6 @@ def calculate_Ks(
         return (theta - theta_WP) / RAW
 
 
-def calculate_Ks_from_pressure_head(
-    psi: float,
-    psi_3: float = -100.0,  # -1000 kPa ≈ -100 m
-    psi_4: float = -150.0   # -1500 kPa ≈ -150 m
-) -> float:
-    """
-    Calculate Ks using pressure head (matric potential).
-
-    This is more physically accurate than water content-based
-    because wilting point is actually defined by pressure, not θ.
-
-    Args:
-        psi: Current pressure head (m, negative)
-        psi_3: Pressure head at stress onset (m)
-        psi_4: Pressure head at wilting point (m)
-
-    Returns:
-        Ks coefficient (0-1)
-    """
-    if psi >= psi_3:
-        return 1.0  # No stress
-    elif psi <= psi_4:
-        return 0.0  # Complete stress
-    else:
-        return (psi - psi_4) / (psi_3 - psi_4)
-
-
 # =============================================================================
 # MAIN ET CALCULATION FUNCTIONS
 # =============================================================================
@@ -634,8 +608,10 @@ def calculate_et_fao56_dual(
     crop_params: Optional[CropCoefficientCurve] = None,
     day_of_season: int = 60,
     precipitation_mm: float = 0.0,
+    dt_days: float = 1.0,
     u2: float = 2.0,
-    RH_min: float = 45.0
+    RH_min: float = 45.0,
+    update_evap_state: bool = True,
 ) -> ETResult:
     """
     Calculate ET using FAO-56 dual crop coefficient method.
@@ -661,6 +637,8 @@ def calculate_et_fao56_dual(
     Returns:
         ETResult with partitioned ET components
     """
+    dt_days = float(max(dt_days, 1e-12))
+
     if ET0 <= 0:
         return ETResult(0, 0, 0, 0, 0, 0, 1.0, 1.0)
 
@@ -672,6 +650,9 @@ def calculate_et_fao56_dual(
     if evap_state is None:
         evap_state = SoilEvaporationState.from_soil_properties(
             theta_FC, theta_WP)
+
+    # Avoid mutating caller state unless requested (useful for substepping + actual ET enforcement).
+    state = evap_state if update_evap_state else copy.deepcopy(evap_state)
 
     # Estimate LAI from NDVI if not provided
     if lai is None:
@@ -705,10 +686,10 @@ def calculate_et_fao56_dual(
 
     # Update evaporation state for wetting
     if precipitation_mm > 0:
-        evap_state.reset_after_wetting(precipitation_mm)
+        state.reset_after_wetting(precipitation_mm)
 
     # Calculate Kr and Ke
-    Kr = calculate_Kr(evap_state)
+    Kr = calculate_Kr(state)
     Kc_max = calculate_Kc_max(u2, RH_min, crop_params.crop_height_m)
     Ke = calculate_Ke(Kcb_adj, Kr, fc, Kc_max)
 
@@ -717,8 +698,11 @@ def calculate_et_fao56_dual(
     E_s = Ke * ET0  # Soil evaporation
 
     # Update cumulative evaporation for next timestep
-    evap_state.cumulative_evaporation += E_s
-    evap_state.days_since_wetting += 1
+    if update_evap_state:
+        # Track *cumulative* evaporation depth since wetting.
+        # E_s is an instantaneous/day-rate (mm/day); convert to depth over dt.
+        state.cumulative_evaporation += E_s * dt_days
+        state.days_since_wetting += dt_days
 
     # Total ET
     ET_c = T_c + E_s

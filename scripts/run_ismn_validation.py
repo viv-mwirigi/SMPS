@@ -924,9 +924,32 @@ class ISMNValidationRunner:
         try:
             from smps.physics.soil_hydraulics import VanGenuchtenParameters
 
+            # Compute texture-dependent theta_r (residual water content)
+            # For high-clay oxide soils, theta_r should be very low (they drain completely)
+            # For sandy soils, theta_r is also low
+            # For silty/loamy soils, theta_r is moderate
+            clay_pct = soil_params.get('clay_pct', 20)
+            sand_pct = soil_params.get('sand_pct', 40)
+
+            # Base theta_r from texture (Rawls et al. 1982 approximation)
+            # Higher clay normally means higher theta_r, but oxide clays are different
+            if clay_pct > 30:
+                # Oxide clay correction: high-clay tropical soils drain very well
+                # Reduce theta_r progressively from 30% to 60% clay
+                clay_effect = min((clay_pct - 30) / 30.0, 1.0)
+                theta_r = 0.04 - 0.03 * clay_effect  # 0.04 at 30% clay, 0.01 at 60%
+            elif sand_pct > 70:
+                # Sandy soils have low theta_r
+                theta_r = 0.02
+            else:
+                # Standard soils
+                theta_r = 0.03 + 0.001 * clay_pct  # 0.03-0.05 for 0-20% clay
+
+            theta_r = max(0.01, min(0.10, theta_r))  # Bound between 1-10%
+
             # Create VG parameters from soil properties
             vg_params = VanGenuchtenParameters(
-                theta_r=0.05,  # Residual water content
+                theta_r=theta_r,
                 theta_s=soil_params['theta_sat'],
                 alpha=soil_params['alpha'],
                 n=soil_params['n'],
@@ -980,9 +1003,11 @@ class ISMNValidationRunner:
                     f"Missing required forcing columns: {missing_cols}")
 
             # Run simulation using run_period method
+            # Use warmup to let the model equilibrate from initial conditions
+            warmup_days = min(30, len(run_forcings) // 4)
             results = model.run_period(
                 forcings=run_forcings,
-                warmup_days=0,  # Use all data
+                warmup_days=warmup_days,
                 return_fluxes=False
             )
 
@@ -1071,6 +1096,20 @@ class ISMNValidationRunner:
         logger.info(
             f"  → Interpolated predictions to depths: {target_depths_cm} cm")
         return predictions
+
+    def _load_specific_stations(self, station_names: List[str]) -> List[ISMNStationData]:
+        """Load specific stations by name from ISMN data."""
+        station_data_list = []
+        all_stations = self.ismn_loader.load_all_stations()
+
+        for station_name in station_names:
+            if station_name in all_stations:
+                station_data_list.append(all_stations[station_name])
+            else:
+                logger.warning(
+                    f"Station '{station_name}' not found in ISMN data")
+
+        return station_data_list
 
     def _get_observations(
         self,
@@ -1499,11 +1538,27 @@ class ISMNValidationRunner:
         print(f"\nTotal Stations: {n_stations}")
         print(
             f"Stations Passed: {n_passed}/{n_stations} ({100*n_passed/n_stations:.1f}%)")
+
+        # Filter out low-variance flagged observations for aggregate statistics
+        # These have pathological metrics that contaminate the mean
+        if 'obs_low_variance_flag' in df.columns:
+            df_clean = df[~df['obs_low_variance_flag']].copy()
+            n_excluded = len(df) - len(df_clean)
+            if n_excluded > 0:
+                print(
+                    f"\n  (Excluding {n_excluded} low-variance observation series from aggregate statistics)")
+        else:
+            df_clean = df
+
         print(f"\nOverall Metrics (mean ± std):")
-        print(f"  RMSE: {df['RMSE'].mean():.4f} ± {df['RMSE'].std():.4f}")
-        print(f"  MAE:  {df['MAE'].mean():.4f} ± {df['MAE'].std():.4f}")
-        print(f"  KGE:  {df['KGE'].mean():.3f} ± {df['KGE'].std():.3f}")
-        print(f"  NSE:  {df['NSE'].mean():.3f} ± {df['NSE'].std():.3f}")
+        print(
+            f"  RMSE: {df_clean['RMSE'].mean():.4f} ± {df_clean['RMSE'].std():.4f}")
+        print(
+            f"  MAE:  {df_clean['MAE'].mean():.4f} ± {df_clean['MAE'].std():.4f}")
+        print(
+            f"  KGE:  {df_clean['KGE'].mean():.3f} ± {df_clean['KGE'].std():.3f}")
+        print(
+            f"  NSE:  {df_clean['NSE'].mean():.3f} ± {df_clean['NSE'].std():.3f}")
 
         # =====================================================================
         # Temporal Horizon Analysis Summary (24h, 72h, 168h)
@@ -1512,9 +1567,9 @@ class ISMNValidationRunner:
         print(f"  {'Horizon':<10} {'RMSE':<10} {'KGE':<10} {'NSE':<10} {'R²':<10}")
         print(f"  {'-'*50}")
 
-        # Same-day (0h) - baseline
+        # Same-day (0h) - baseline (using clean data)
         print(
-            f"  {'0h (now)':<10} {df['RMSE'].mean():.4f}     {df['KGE'].mean():.4f}     {df['NSE'].mean():.4f}     {df['R²'].mean():.4f}")
+            f"  {'0h (now)':<10} {df_clean['RMSE'].mean():.4f}     {df_clean['KGE'].mean():.4f}     {df_clean['NSE'].mean():.4f}     {df_clean['R²'].mean():.4f}")
 
         for horizon in ['24h', '72h', '168h']:
             rmse_col = f'RMSE_{horizon}'
@@ -1522,8 +1577,8 @@ class ISMNValidationRunner:
             nse_col = f'NSE_{horizon}'
             r2_col = f'R2_{horizon}'
 
-            if rmse_col in df.columns:
-                horizon_data = df[df[rmse_col].notna()]
+            if rmse_col in df_clean.columns:
+                horizon_data = df_clean[df_clean[rmse_col].notna()]
                 if len(horizon_data) > 0:
                     rmse_mean = horizon_data[rmse_col].mean()
                     kge_mean = horizon_data[kge_col].mean()
@@ -1534,10 +1589,10 @@ class ISMNValidationRunner:
                     print(
                         f"  {horizon:<10} {rmse_mean:.4f}     {kge_mean:.4f}     {nse_mean:.4f}     {r2_mean:.4f}")
 
-        # By depth
+        # By depth (using clean data)
         print(f"\nBy Depth:")
-        for depth in sorted(df['depth_cm'].unique()):
-            depth_df = df[df['depth_cm'] == depth]
+        for depth in sorted(df_clean['depth_cm'].unique()):
+            depth_df = df_clean[df_clean['depth_cm'] == depth]
             print(
                 f"  {int(depth):>3} cm: RMSE={depth_df['RMSE'].mean():.4f}, KGE={depth_df['KGE'].mean():.3f}, n={len(depth_df)}")
 
@@ -1550,8 +1605,8 @@ class ISMNValidationRunner:
             kge_col = f'KGE_{season}'
             n_col = f'n_days_{season}'
 
-            if rmse_col in df.columns:
-                season_data = df[df[rmse_col].notna()]
+            if rmse_col in df_clean.columns:
+                season_data = df_clean[df_clean[rmse_col].notna()]
                 if len(season_data) > 0:
                     rmse_mean = season_data[rmse_col].mean()
                     kge_mean = season_data[kge_col].mean()
@@ -1566,18 +1621,18 @@ class ISMNValidationRunner:
                 horizon_summary.append({
                     'horizon': horizon,
                     'horizon_days': 0,
-                    'RMSE_mean': df['RMSE'].mean(),
-                    'RMSE_std': df['RMSE'].std(),
-                    'KGE_mean': df['KGE'].mean(),
-                    'KGE_std': df['KGE'].std(),
-                    'NSE_mean': df['NSE'].mean(),
-                    'R2_mean': df['R²'].mean(),
-                    'n_observations': len(df)
+                    'RMSE_mean': df_clean['RMSE'].mean(),
+                    'RMSE_std': df_clean['RMSE'].std(),
+                    'KGE_mean': df_clean['KGE'].mean(),
+                    'KGE_std': df_clean['KGE'].std(),
+                    'NSE_mean': df_clean['NSE'].mean(),
+                    'R2_mean': df_clean['R²'].mean(),
+                    'n_observations': len(df_clean)
                 })
             else:
                 rmse_col = f'RMSE_{horizon}'
-                if rmse_col in df.columns:
-                    horizon_data = df[df[rmse_col].notna()]
+                if rmse_col in df_clean.columns:
+                    horizon_data = df_clean[df_clean[rmse_col].notna()]
                     if len(horizon_data) > 0:
                         horizon_summary.append({
                             'horizon': horizon,
@@ -1601,7 +1656,7 @@ class ISMNValidationRunner:
             horizon_df.to_csv(horizon_path, index=False)
             logger.info(f"Saved horizon summary to {horizon_path}")
 
-        # Save seasonal summary
+        # Save seasonal summary (using clean data)
         seasonal_summary = []
         for season in ['wet', 'dry', 'transition']:
             rmse_col = f'RMSE_{season}'
@@ -1609,8 +1664,8 @@ class ISMNValidationRunner:
             nse_col = f'NSE_{season}'
             n_col = f'n_days_{season}'
 
-            if rmse_col in df.columns:
-                season_data = df[df[rmse_col].notna()]
+            if rmse_col in df_clean.columns:
+                season_data = df_clean[df_clean[rmse_col].notna()]
                 if len(season_data) > 0:
                     seasonal_summary.append({
                         'season': season,

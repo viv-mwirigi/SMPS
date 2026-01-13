@@ -785,13 +785,16 @@ def compare_simple_vs_darcy_percolation(
 
     params = VerticalFluxParameters()
     q = darcy_flux_vertical(upper_layer, lower_layer, params)
-    darcy_perc = max(0, q * 1000)  # mm/day, positive = downward
+    # Keep both directions (upward capillary rise is physically valid)
+    darcy_perc = max(0.0, q) * 1000  # mm/day
+    darcy_rise = max(0.0, -q) * 1000  # mm/day
 
     return {
         'theta_upper': theta_upper,
         'theta_lower': theta_lower,
         'simple_percolation_mm_day': simple_perc,
         'darcy_percolation_mm_day': darcy_perc,
+        'darcy_capillary_rise_mm_day': darcy_rise,
         'difference_mm_day': darcy_perc - simple_perc,
         'ratio': darcy_perc / (simple_perc + 0.01),
         'K_upper_m_day': upper_layer.K_m_day,

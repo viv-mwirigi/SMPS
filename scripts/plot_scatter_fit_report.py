@@ -62,11 +62,23 @@ def _rmse(x: np.ndarray, y: np.ndarray) -> float:
     return float(np.sqrt(np.mean((x - y) ** 2)))
 
 
-def _r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    denom = np.sum((y_true - np.mean(y_true)) ** 2)
+def _nse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    denom = float(np.sum((y_true - np.mean(y_true)) ** 2))
     if denom <= 0:
         return float("nan")
-    return float(1.0 - np.sum((y_true - y_pred) ** 2) / denom)
+    return float(1.0 - float(np.sum((y_true - y_pred) ** 2)) / denom)
+
+
+def _r2_corr(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    # Squared Pearson correlation, bounded to [0, 1].
+    if len(y_true) < 2:
+        return float("nan")
+    if float(np.std(y_true)) <= 1e-12 or float(np.std(y_pred)) <= 1e-12:
+        return float("nan")
+    r = float(np.corrcoef(y_true, y_pred)[0, 1])
+    if not np.isfinite(r):
+        return float("nan")
+    return float(np.clip(r * r, 0.0, 1.0))
 
 
 def _fit_line(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
@@ -107,35 +119,41 @@ def _quantile_bins(values: pd.Series) -> pd.Series:
     return v.apply(lambda x: _bin(float(x)) if np.isfinite(x) else "unknown")
 
 
-def pick_stations(pairs: pd.DataFrame, n_sites: int, seed: int) -> list[str]:
-    # Prefer LAI mean, fallback to NDVI mean.
-    station = pairs.groupby("station_id").agg(
-        {"lai_mean": "mean", "ndvi_mean": "mean"}).reset_index()
-    station["veg_proxy"] = station["lai_mean"].where(
-        np.isfinite(station["lai_mean"]), station["ndvi_mean"])
-    station["veg_bin"] = _quantile_bins(station["veg_proxy"])
+def pick_stations(pairs: pd.DataFrame, station_summary: pd.DataFrame, n_sites: int, seed: int) -> list[str]:
+    # If station_summary has KGE_mean, sort by it descending
+    if "KGE_mean" in station_summary.columns:
+        top_stations = station_summary.sort_values("KGE_mean", ascending=False)[
+            "station_id"].head(n_sites).tolist()
+        return top_stations
+    else:
+        # Fallback to original logic
+        station = pairs.groupby("station_id").agg(
+            {"lai_mean": "mean", "ndvi_mean": "mean"}).reset_index()
+        station["veg_proxy"] = station["lai_mean"].where(
+            np.isfinite(station["lai_mean"]), station["ndvi_mean"])
+        station["veg_bin"] = _quantile_bins(station["veg_proxy"])
 
-    rng = np.random.default_rng(seed)
+        rng = np.random.default_rng(seed)
 
-    selected: list[str] = []
-    # Aim for diversity across veg bins.
-    for b in ["low", "mid", "high"]:
-        cand = station[station["veg_bin"] == b]["station_id"].tolist()
-        if not cand:
-            continue
-        k = min(max(1, n_sites // 3), len(cand))
-        chosen = rng.choice(cand, size=k, replace=False).tolist()
-        selected.extend(chosen)
+        selected: list[str] = []
+        # Aim for diversity across veg bins.
+        for b in ["low", "mid", "high"]:
+            cand = station[station["veg_bin"] == b]["station_id"].tolist()
+            if not cand:
+                continue
+            k = min(max(1, n_sites // 3), len(cand))
+            chosen = rng.choice(cand, size=k, replace=False).tolist()
+            selected.extend(chosen)
 
-    if len(selected) < n_sites:
-        remaining = [s for s in station["station_id"].tolist()
-                     if s not in selected]
-        if remaining:
-            k = min(n_sites - len(selected), len(remaining))
-            selected.extend(rng.choice(
-                remaining, size=k, replace=False).tolist())
+        if len(selected) < n_sites:
+            remaining = [s for s in station["station_id"].tolist()
+                         if s not in selected]
+            if remaining:
+                k = min(n_sites - len(selected), len(remaining))
+                selected.extend(rng.choice(
+                    remaining, size=k, replace=False).tolist())
 
-    return selected[:n_sites]
+        return selected[:n_sites]
 
 
 @dataclass(frozen=True)
@@ -143,6 +161,7 @@ class RunInputs:
     name: str
     run_dir: Path
     pairs_csv: Path
+    station_summary_csv: Path
 
 
 def load_run(name: str, run_dir: Path) -> RunInputs:
@@ -151,6 +170,8 @@ def load_run(name: str, run_dir: Path) -> RunInputs:
         run_dir=run_dir,
         pairs_csv=_pick_csv(run_dir, "paired_obs_sim.csv",
                             "paired_obs_sim_*.csv"),
+        station_summary_csv=_pick_csv(run_dir, "station_summary.csv",
+                                      "station_summary_*.csv"),
     )
 
 
@@ -222,7 +243,7 @@ def plot_station_scatter(
                 f"slope={a:.3f} (ideal 1)\n"
                 f"intercept={b:.3f} (ideal 0)\n"
                 f"RMSE={_rmse(x, y):.3f}\n"
-                f"R²={_r2(y, x):.3f}\n"
+                f"NSE={_nse(y, x):.3f}\n"
                 f"n={len(x)}"
             )
         else:
@@ -305,7 +326,8 @@ def plot_multisite_scatter(
                 f"slope={a:.3f} (ideal 1)\n"
                 f"intercept={b:.3f} (ideal 0)\n"
                 f"RMSE={_rmse(x, y):.3f}\n"
-                f"R²={_r2(y, x):.3f}\n"
+                f"NSE={_nse(y, x):.3f}\n"
+
                 f"n={len(x)}"
             )
         else:
@@ -361,6 +383,11 @@ def main() -> None:
                         help="Random seed for sampling")
     parser.add_argument("--max-points", type=int, default=3000,
                         help="Max scatter points per subplot")
+    parser.add_argument(
+        "--station-list",
+        nargs="*",
+        help="List of specific station IDs to plot (overrides automatic selection)",
+    )
 
     args = parser.parse_args()
 
@@ -390,8 +417,12 @@ def main() -> None:
 
         pairs = pairs[pairs["horizon_name"].isin(horizons)].copy()
 
+        # Load station summary for KGE-based selection
+        station_summary = pd.read_csv(run.station_summary_csv)
+
         # Select stations
-        stations = pick_stations(pairs, n_sites=args.n_sites, seed=args.seed)
+        stations = pick_stations(
+            pairs, station_summary, n_sites=args.n_sites, seed=args.seed)
 
         # Per-station plots
         for station_id in stations:

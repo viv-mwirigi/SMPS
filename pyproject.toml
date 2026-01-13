@@ -29,6 +29,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 markers = [
     "integration: marks tests as integration tests requiring external services",
+    "physics_pass: reproducible physics pass/fail suite (spec-driven)",
 ]
 # Skip integration tests by default
 addopts = "-m 'not integration'"

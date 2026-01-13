@@ -1102,16 +1102,27 @@ def run_physics_validation(
     if len(obs_v) >= 10:
         kge, r, alpha, beta = compute_kge_decomposition(obs_v, pred_v)
 
+        # R²: use squared Pearson correlation (common in hydro/RS validation).
+        # NSE: use 1 - SSE/SST.
+        # These are not generally the same and should not be duplicated.
+        r2_corr = np.nan
+        if np.std(obs_v) > 1e-12 and np.std(pred_v) > 1e-12:
+            rr = float(np.corrcoef(obs_v, pred_v)[0, 1])
+            if np.isfinite(rr):
+                r2_corr = float(np.clip(rr * rr, 0.0, 1.0))
+
+        ss_res = float(np.sum((obs_v - pred_v) ** 2))
+        ss_tot = float(np.sum((obs_v - np.mean(obs_v)) ** 2))
+        nse = 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else np.nan
+
         report.standard_metrics = ExtendedMetrics(
             rmse=np.sqrt(np.mean((pred_v - obs_v)**2)),
             ubrmse=compute_ubrmse(obs_v, pred_v),
             mae=np.mean(np.abs(pred_v - obs_v)),
             mape=compute_mape(obs_v, pred_v),
             bias=np.mean(pred_v - obs_v),
-            r_squared=1 - np.sum((obs_v - pred_v)**2) /
-            np.sum((obs_v - np.mean(obs_v))**2),
-            nse=1 - np.sum((obs_v - pred_v)**2) /
-            np.sum((obs_v - np.mean(obs_v))**2),
+            r_squared=r2_corr,
+            nse=nse,
             kge=kge,
             kge_r=r,
             kge_alpha=alpha,

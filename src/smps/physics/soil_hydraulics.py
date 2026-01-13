@@ -29,6 +29,23 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
+# =============================================================================
+# Numerical safety / sanity bounds
+# =============================================================================
+
+# Recommended Van Genuchten parameter ranges (units: alpha in 1/m)
+VG_ALPHA_RECOMMENDED_RANGE_M_INV = (0.1, 10.0)  # ~0.001–0.1 cm^-1
+VG_ALPHA_HARD_RANGE_M_INV = (1e-6, 1e4)
+VG_N_MIN = 1.1
+VG_N_HARD_RANGE = (1.01, 10.0)
+
+# Prevent K(psi) underflowing to zero
+K_MIN_RELATIVE_TO_KSAT = 1e-6
+
+# Avoid exp/log overflow in float64
+_LOG_MAX_FLOAT64 = 709.0
+
 # Physical constants
 WATER_DENSITY = 1000.0  # kg/m³
 GRAVITY = 9.81  # m/s²
@@ -76,6 +93,67 @@ class VanGenuchtenParameters:
     theta_s: float  # Saturated water content (m³/m³)
     K_sat: float  # Saturated hydraulic conductivity (m/day)
     L: float = 0.5  # Pore connectivity parameter (Mualem default)
+
+    def __post_init__(self) -> None:
+        # Basic finite/positive checks
+        for name in ("alpha", "n", "theta_r", "theta_s", "K_sat", "L"):
+            value = getattr(self, name)
+            if value is None or not np.isfinite(value):
+                raise ValueError(
+                    f"VanGenuchtenParameters.{name} must be finite")
+
+        # Clamp hard ranges first
+        self.alpha = float(np.clip(self.alpha, *VG_ALPHA_HARD_RANGE_M_INV))
+        self.n = float(np.clip(self.n, *VG_N_HARD_RANGE))
+        self.K_sat = float(max(self.K_sat, 1e-12))
+        self.L = float(np.clip(self.L, -5.0, 5.0))
+
+        # Recommended-range warnings + enforcement
+        if self.alpha < VG_ALPHA_RECOMMENDED_RANGE_M_INV[0] or self.alpha > VG_ALPHA_RECOMMENDED_RANGE_M_INV[1]:
+            logger.warning(
+                "VG alpha=%.4g 1/m outside recommended range [%.3g, %.3g] 1/m",
+                self.alpha,
+                VG_ALPHA_RECOMMENDED_RANGE_M_INV[0],
+                VG_ALPHA_RECOMMENDED_RANGE_M_INV[1],
+            )
+
+        if self.n < VG_N_MIN:
+            logger.warning(
+                "VG n=%.4g < %.3g; clamping to %.3g for stability",
+                self.n,
+                VG_N_MIN,
+                VG_N_MIN,
+            )
+            self.n = float(VG_N_MIN)
+
+        # Water content sanity
+        self.theta_s = float(np.clip(self.theta_s, 0.05, 0.80))
+        self.theta_r = float(np.clip(self.theta_r, 0.0, self.theta_s - 1e-6))
+
+        # Ensure usable storage
+        if self.theta_s - self.theta_r < 1e-6:
+            raise ValueError(
+                f"Invalid VG parameters: theta_s ({self.theta_s}) must exceed theta_r ({self.theta_r})"
+            )
+
+    def with_multipliers(
+        self,
+        *,
+        theta_s_adj: float = 1.0,
+        Ks_adj: float = 1.0,
+        alpha_adj: float = 1.0,
+        n_adj: float = 1.0,
+        theta_r_adj: float = 1.0,
+    ) -> "VanGenuchtenParameters":
+        """Return a copy with simple multiplicative adjustments applied."""
+        return VanGenuchtenParameters(
+            alpha=float(self.alpha) * float(alpha_adj),
+            n=float(self.n) * float(n_adj),
+            theta_r=float(self.theta_r) * float(theta_r_adj),
+            theta_s=float(self.theta_s) * float(theta_s_adj),
+            K_sat=float(self.K_sat) * float(Ks_adj),
+            L=float(self.L),
+        )
 
     @property
     def m(self) -> float:
@@ -179,7 +257,9 @@ class VanGenuchtenParameters:
             VanGenuchtenParameters for the texture class
         """
         # Carsel & Parrish (1988) parameters
-        # Format: (alpha [1/cm], n, theta_r, theta_s, K_sat [cm/day])
+        # NOTE: alpha values here are in 1/m (not 1/cm). Many published tables use 1/cm;
+        # those would be ~100x smaller.
+        # Format: (alpha [1/m], n, theta_r, theta_s, K_sat [cm/day])
         params = {
             'sand': (14.5, 2.68, 0.045, 0.43, 712.8),
             'loamy_sand': (12.4, 2.28, 0.057, 0.41, 350.2),
@@ -206,7 +286,7 @@ class VanGenuchtenParameters:
         alpha_cm, n, theta_r, theta_s, K_sat_cm_day = params[texture_key]
 
         return cls(
-            alpha=alpha_cm * 100,  # 1/cm → 1/m
+            alpha=alpha_cm,  # already 1/m
             n=n,
             theta_r=theta_r,
             theta_s=theta_s,
@@ -445,9 +525,22 @@ def van_genuchten_theta_from_psi(
         # Saturated or positive pressure
         return params.theta_s
 
-    # Effective saturation
-    alpha_psi_n = (params.alpha * abs(psi)) ** params.n
-    Se = (1.0 + alpha_psi_n) ** (-params.m)
+    # Effective saturation, computed in a log-safe way.
+    x = float(params.alpha) * float(abs(psi))
+    if x <= 0.0:
+        Se = 1.0
+    else:
+        log_x = float(np.log(x))
+        log_alpha_psi_n = float(params.n) * log_x
+        if log_alpha_psi_n >= _LOG_MAX_FLOAT64:
+            alpha_psi_n = float("inf")
+        else:
+            alpha_psi_n = float(np.exp(log_alpha_psi_n))
+        # For very large alpha_psi_n, Se -> 0; avoid warnings from inf arithmetic.
+        if not np.isfinite(alpha_psi_n):
+            Se = 0.0
+        else:
+            Se = float((1.0 + alpha_psi_n) ** (-params.m))
 
     # Convert to water content
     theta = params.theta_r + (params.theta_s - params.theta_r) * Se
@@ -484,7 +577,15 @@ def van_genuchten_psi_from_theta(
     # => (α|ψ|)^n = Se^(-1/m) - 1
     # => |ψ| = (1/α) * [Se^(-1/m) - 1]^(1/n)
 
-    term = Se ** (-1.0 / params.m) - 1.0
+    # log-safe computation of Se^(-1/m)
+    log_Se = float(np.log(Se))
+    log_Se_pow = (-1.0 / float(params.m)) * log_Se
+    if log_Se_pow >= _LOG_MAX_FLOAT64:
+        Se_pow = float("inf")
+    else:
+        Se_pow = float(np.exp(log_Se_pow))
+
+    term = Se_pow - 1.0
 
     if term <= 0:
         return 0.0  # At or above saturation
@@ -536,7 +637,11 @@ def van_genuchten_mualem_K(
 
     K_rel = (Se ** params.L) * (outer_term ** 2)
 
-    return params.K_sat * np.clip(K_rel, 1e-15, 1.0)
+    K_unsat = float(params.K_sat) * float(np.clip(K_rel, 0.0, 1.0))
+
+    # Prevent underflow to (near) zero which can destabilize numerical fluxes.
+    K_min = float(params.K_sat) * float(K_MIN_RELATIVE_TO_KSAT)
+    return float(max(K_unsat, K_min))
 
 
 def van_genuchten_mualem_K_from_psi(
@@ -635,18 +740,39 @@ def specific_water_capacity(
     if psi >= 0:
         return 0.0  # No change at saturation
 
-    alpha_psi = params.alpha * abs(psi)
-    alpha_psi_n = alpha_psi ** params.n
+    alpha_psi = float(params.alpha) * float(abs(psi))
+    if alpha_psi <= 0.0:
+        return 0.0
+
+    log_alpha_psi = float(np.log(alpha_psi))
+    log_alpha_psi_n = float(params.n) * log_alpha_psi
+    if log_alpha_psi_n >= _LOG_MAX_FLOAT64:
+        alpha_psi_n = float("inf")
+    else:
+        alpha_psi_n = float(np.exp(log_alpha_psi_n))
+
+    # alpha_psi^(n-1) computed log-safe
+    log_alpha_psi_n_minus_1 = float(params.n - 1.0) * log_alpha_psi
+    if log_alpha_psi_n_minus_1 >= _LOG_MAX_FLOAT64:
+        alpha_psi_n_minus_1 = float("inf")
+    else:
+        alpha_psi_n_minus_1 = float(np.exp(log_alpha_psi_n_minus_1))
 
     numerator = (
-        params.alpha * params.m * params.n *
-        (params.theta_s - params.theta_r) *
-        (alpha_psi ** (params.n - 1))
+        float(params.alpha) * float(params.m) * float(params.n) *
+        float(params.theta_s - params.theta_r) *
+        float(alpha_psi_n_minus_1)
     )
 
-    denominator = (1.0 + alpha_psi_n) ** (params.m + 1)
+    if not np.isfinite(alpha_psi_n):
+        return 0.0
 
-    return numerator / denominator
+    denominator = float((1.0 + alpha_psi_n) ** (float(params.m) + 1.0))
+
+    if denominator <= 0.0 or not np.isfinite(denominator) or not np.isfinite(numerator):
+        return 0.0
+
+    return float(numerator / denominator)
 
 
 # =============================================================================
@@ -833,18 +959,22 @@ def darcy_flux(
     """
     Calculate Darcy flux.
 
-    q = -K * dH/dz
+    q_down = K * dH/dz
 
-    Positive flux is downward (in direction of decreasing z).
+    Sign convention used in SMPS: positive flux is downward.
+
+    Note: In many hydrology texts, Darcy flux is defined positive upward,
+    which would introduce a leading minus sign. Here we use a downward-positive
+    convention to match the rest of the codebase (e.g. `vertical_flux`).
 
     Args:
         K: Hydraulic conductivity (m/day)
         dH_dz: Hydraulic head gradient (m/m)
 
     Returns:
-        Darcy flux (m/day)
+        Darcy flux (m/day, positive = downward)
     """
-    return -K * dH_dz
+    return K * dH_dz
 
 
 def darcy_flux_between_layers(
