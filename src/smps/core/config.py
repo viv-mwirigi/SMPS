@@ -22,6 +22,11 @@ class DataSourceType(str, Enum):
     MODIS = "modis"
     SENSLOG = "senslog"
     WAZIUP = "waziup"
+    # SpaceIoTBox API sources
+    SPACEIOTBOX_WEATHER = "spaceiotbox_weather"
+    SPACEIOTBOX_COPERNICUS = "spaceiotbox_copernicus"
+    SPACEIOTBOX_AGRO = "spaceiotbox_agro"
+    SPACEIOTBOX_DATASETS = "spaceiotbox_datasets"
 
 
 class DataConfig(BaseSettings):
@@ -35,6 +40,16 @@ class DataConfig(BaseSettings):
     era5_cds_uid: Optional[str] = Field(None, description="Copernicus CDS UID")
     era5_cds_key: Optional[str] = Field(
         None, description="Copernicus CDS API key")
+
+    # SpaceIoTBox API credentials
+    spaceiotbox_username: Optional[str] = Field(
+        None, description="SpaceIoTBox API username")
+    spaceiotbox_password: Optional[str] = Field(
+        None, description="SpaceIoTBox API password")
+    spaceiotbox_base_url: str = Field(
+        "http://127.0.0.1:8000", description="SpaceIoTBox API base URL")
+    use_spaceiotbox: bool = Field(
+        False, description="Enable SpaceIoTBox API for data fetching")
 
     # OPTIONAL: Google Earth Engine (for Sentinel-2, MODIS, GRAFS)
     gee_project_id: Optional[str] = Field(

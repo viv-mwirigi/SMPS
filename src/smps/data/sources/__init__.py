@@ -59,6 +59,19 @@ from smps.data.sources.weather import (
     OpenMeteoSource as OpenMeteoWeatherSource,  # Alias for consistency
 )
 
+# SpaceIoTBox API data sources
+from smps.data.sources.spaceiotbox import (
+    SpaceIoTBoxClient,
+    SpaceIoTBoxConfig,
+    SpaceIoTBoxWeatherSource,
+    SpaceIoTBoxCopernicusSource,
+    SpaceIoTBoxAgroSource,
+    SpaceIoTBoxDatasetsSource,
+    SpaceIoTBoxUnifiedSource,
+    get_spaceiotbox_weather,
+    get_spaceiotbox_satellite,
+)
+
 # Validation data sources
 from smps.data.sources.validation_sources import (
     ISMNDataSource,
@@ -104,6 +117,17 @@ __all__ = [
 
     # Weather sources
     "OpenMeteoWeatherSource",
+
+    # SpaceIoTBox sources
+    "SpaceIoTBoxClient",
+    "SpaceIoTBoxConfig",
+    "SpaceIoTBoxWeatherSource",
+    "SpaceIoTBoxCopernicusSource",
+    "SpaceIoTBoxAgroSource",
+    "SpaceIoTBoxDatasetsSource",
+    "SpaceIoTBoxUnifiedSource",
+    "get_spaceiotbox_weather",
+    "get_spaceiotbox_satellite",
 
     # Validation sources
     "ISMNDataSource",
