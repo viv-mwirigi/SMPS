@@ -1,9 +1,0 @@
-{
-    "recommendations": [
-        "ms-python.vscode-pylance",
-        "mechatroner.rainbow-csv",
-        "ms-python.isort",
-        "ms-python.autopep8",
-        "github.vscode-github-actions"
-    ]
-}
