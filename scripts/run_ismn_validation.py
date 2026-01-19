@@ -329,23 +329,17 @@ class ISMNValidationRunner:
         logger.info(
             f"  Sensor depths: {[int(d) for d in station_data.available_depths_cm]} cm")
 
-        # Data quality check
-        obs = self._get_observations(station_data)
-        if obs:
-            for depth, series in obs.items():
-                n_valid = series.notna().sum()
-                date_range = f"{series.index.min().date()} to {series.index.max().date()}" if len(
-                    series) > 0 else "N/A"
-                logger.info(
-                    f"  → {int(depth):3d}cm: {n_valid} valid days ({date_range})")
-
         # Determine the station-specific observation window for correct forcing fetch.
         # This prevents fetching weather/satellite for years where the station has no observations.
         obs_start = None
         obs_end = None
-        if obs:
-            starts = [s.index.min() for s in obs.values() if len(s) > 0]
-            ends = [s.index.max() for s in obs.values() if len(s) > 0]
+
+        # First, get observations for the full runner period to determine available data
+        obs_full = self._get_observations(
+            station_data, start_date=self.start_date, end_date=self.end_date)
+        if obs_full:
+            starts = [s.index.min() for s in obs_full.values() if len(s) > 0]
+            ends = [s.index.max() for s in obs_full.values() if len(s) > 0]
             if starts and ends:
                 obs_start = min(starts)
                 obs_end = max(ends)
@@ -363,6 +357,17 @@ class ISMNValidationRunner:
                 f"Station {station_data.station_id} has no observations within configured period; skipping"
             )
             return
+
+        # Data quality check with filtered observations
+        obs = self._get_observations(
+            station_data, start_date=fetch_start, end_date=fetch_end)
+        if obs:
+            for depth, series in obs.items():
+                n_valid = series.notna().sum()
+                date_range = f"{series.index.min().date()} to {series.index.max().date()}" if len(
+                    series) > 0 else "N/A"
+                logger.info(
+                    f"  → {int(depth):3d}cm: {n_valid} valid days ({date_range})")
 
         logger.info(
             f"  Forcing fetch window: {fetch_start.date()} to {fetch_end.date()} (from observations)"
@@ -403,7 +408,8 @@ class ISMNValidationRunner:
             model, forcings.index, target_depths_cm=target_depths)
 
         # 5. Get ISMN observations by depth
-        observations = self._get_observations(station_data)
+        observations = self._get_observations(
+            station_data, start_date=fetch_start, end_date=fetch_end)
 
         # 6. Align and validate
         self._compute_and_store_metrics(
@@ -965,7 +971,7 @@ class ISMNValidationRunner:
                 # Same params for all layers
                 vg_params=[vg_params, vg_params,
                            vg_params, vg_params, vg_params],
-                crop_type="grassland",  # Natural grassland vegetation for ISMN validation
+                crop_type="savanna",  # Natural grassland vegetation for ISMN validation
                 use_green_ampt=True,
                 use_fao56_dual=True,
                 use_feddes_uptake=True,
@@ -1113,9 +1119,11 @@ class ISMNValidationRunner:
 
     def _get_observations(
         self,
-        station_data: ISMNStationData
+        station_data: ISMNStationData,
+        start_date: Optional[pd.Timestamp] = None,
+        end_date: Optional[pd.Timestamp] = None
     ) -> Dict[float, pd.Series]:
-        """Get ISMN observations organized by depth."""
+        """Get ISMN observations organized by depth, optionally filtered by date range."""
         if station_data.daily_data is None:
             return {}
 
@@ -1124,7 +1132,15 @@ class ISMNValidationRunner:
             df = get_daily_soil_moisture(station_data, depth_cm=depth_cm)
             if not df.empty:
                 series = df.set_index('date')['soil_moisture_mean']
-                observations[depth_cm] = series
+
+                # Filter to date range if provided
+                if start_date is not None:
+                    series = series[series.index >= start_date]
+                if end_date is not None:
+                    series = series[series.index <= end_date]
+
+                if not series.empty:
+                    observations[depth_cm] = series
 
         return observations
 

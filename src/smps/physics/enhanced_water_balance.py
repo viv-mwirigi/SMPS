@@ -1,7 +1,7 @@
 """
 Physics-Enhanced Water Balance Model.
 
-This module integrates rigorous soil physics:
+This module integrates soil physics:
 
 1. GREEN-AMPT INFILTRATION: Rainfall intensity consideration with wetting front
 2. FAO-56 DUAL COEFFICIENT: Proper ET partitioning with Kcb and Ke

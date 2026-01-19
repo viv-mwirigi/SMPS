@@ -670,23 +670,20 @@ def estimate_soil_parameters_tropical(
     # The correction needs to be very aggressive because:
     # - Model theta_min = max(theta_r, 0.5*WP)
     # - To reach obs=0.028, we need 0.5*WP < 0.028 → WP < 0.056
-    if clay_percent > 30:
-        # Progressive reduction from 30% to 60% clay
-        clay_effect = min((clay_percent - 30) / 30.0, 1.0)
+    if clay_percent > 30 and clay_percent <= 50:
+        # Progressive reduction from 30% to 50% clay
+        clay_effect = (clay_percent - 30) / 20.0
 
-        # Reduce WP very aggressively - oxide clays hold almost no water
-        # Target: WP ≈ 0.03-0.06 for high-clay tropical soils
-        # At 60% clay, reduce WP to ~10% of original (effectively like sand)
-        wp_reduction = 0.90 * clay_effect  # 0% reduction at 30% clay, 90% at 60%
+        # Reduce WP - oxide clays hold less water
+        wp_reduction = 0.80 * clay_effect  # 0% reduction at 30% clay, 80% at 50%
         wilting_point *= (1.0 - wp_reduction)
 
         # Reduce FC proportionally
-        # At 60% clay, reduce FC to ~35% of original
-        fc_reduction = 0.65 * clay_effect
+        fc_reduction = 0.50 * clay_effect
         field_capacity *= (1.0 - fc_reduction)
 
-        # Increase Ksat - well-aggregated clays drain very fast
-        ksat_multiplier = 1.0 + 5.0 * clay_effect  # Up to 6× at 60% clay
+        # Increase Ksat - well-aggregated clays drain faster
+        ksat_multiplier = 1.0 + 3.0 * clay_effect  # Up to 4× at 50% clay
         k_sat = base_params.saturated_hydraulic_conductivity_cm_day * ksat_multiplier
     else:
         k_sat = base_params.saturated_hydraulic_conductivity_cm_day
