@@ -85,11 +85,25 @@ class FeatureEngineer:
         """Add lagged versions of key variables."""
         result = df.copy()
 
-        lag_columns = ['precipitation_mm', 'et0_mm', 'physics_theta_root']
+        # Enhanced lag features for temporal memory
+        lag_columns = [
+            'precipitation_mm', 'et0_mm',
+            'physics_theta_surface', 'physics_theta_root', 'physics_theta_deep'
+        ]
+
+        # More comprehensive lag periods for soil moisture memory
+        # Expert recommendation: t-1, t-3, t-7
+        soil_moisture_lags = [1, 3, 7, 14]
+        weather_lags = [1, 3, 7, 14, 30]
 
         for col in lag_columns:
             if col in result.columns:
-                for lag in self.lag_days:
+                if 'theta' in col:  # Soil moisture variables
+                    lag_periods = soil_moisture_lags
+                else:  # Weather variables
+                    lag_periods = weather_lags
+
+                for lag in lag_periods:
                     result[f'{col}_lag{lag}'] = result[col].shift(lag)
 
         return result
@@ -128,31 +142,53 @@ class FeatureEngineer:
         return result
 
     def _add_cumulative_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add cumulative water balance features."""
+        """Add cumulative water balance features with enhanced deficit tracking."""
         result = df.copy()
 
-        # Cumulative water balance (P - ET0)
+        # Enhanced cumulative water balance (P - ET0)
         if 'precipitation_mm' in result.columns and 'et0_mm' in result.columns:
             result['daily_water_balance'] = result['precipitation_mm'] - \
                 result['et0_mm']
+
+            # Cumulative balance from start
             result['cumulative_water_balance'] = result['daily_water_balance'].cumsum()
 
-            # Rolling cumulative indices
-            for window in [7, 14, 30]:
+            # Rolling cumulative indices with longer windows
+            for window in [7, 14, 30, 60]:  # Added 60-day for longer-term memory
                 result[f'water_balance_{window}d'] = (
                     result['daily_water_balance'].rolling(
                         window, min_periods=1).sum()
                 )
 
-        # Aridity index proxy (ET0/P) over rolling windows
+                # Water deficit (negative cumulative balance)
+                result[f'water_deficit_{window}d'] = result[f'water_balance_{window}d'].clip(
+                    upper=0).abs()
+
+        # Enhanced aridity index proxy (ET0/P) over rolling windows
         if 'precipitation_mm' in result.columns and 'et0_mm' in result.columns:
-            for window in [7, 30]:
+            for window in [7, 30, 90]:  # Added 90-day for seasonal aridity
                 precip_sum = result['precipitation_mm'].rolling(
                     window, min_periods=1).sum()
                 et0_sum = result['et0_mm'].rolling(window, min_periods=1).sum()
                 # Avoid division by zero
                 result[f'aridity_index_{window}d'] = et0_sum / \
                     (precip_sum + 0.1)
+
+        # Soil moisture memory - rate of change features
+        soil_cols = ['physics_theta_surface',
+                     'physics_theta_root', 'physics_theta_deep']
+        for col in soil_cols:
+            if col in result.columns:
+                # Rate of change over different periods
+                for period in [1, 3, 7]:
+                    result[f'{col}_change_{period}d'] = result[col] - \
+                        result[col].shift(period)
+
+                # Soil moisture deficit relative to recent maximum
+                for window in [30, 60]:  # Look back for recent max
+                    rolling_max = result[col].rolling(
+                        window, min_periods=1).max()
+                    result[f'{col}_deficit_from_max_{window}d'] = rolling_max - result[col]
 
         return result
 

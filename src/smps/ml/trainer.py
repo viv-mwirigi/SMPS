@@ -28,14 +28,30 @@ Usage:
 >>> orchestrator.save("models/site_001/")
 """
 
+import json
 import logging
+import os
+import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, date
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
+import joblib
+import lightgbm as lgb
 import numpy as np
 import pandas as pd
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
+from sklearn.impute import KNNImputer
+from sklearn.preprocessing import RobustScaler
+from sklearn.model_selection import KFold, TimeSeriesSplit, cross_val_score
+import optuna
+from optuna.samplers import TPESampler
+import mlflow
+import mlflow.lightgbm
+
+from smps.ml import dataset_builder, ensemble, explainer, feature_store, hybrid_model
 
 logger = logging.getLogger("smps.ml.trainer")
 
@@ -152,6 +168,7 @@ class TrainingOrchestrator:
         self._y_train: Optional[Dict[str, np.ndarray]] = None
         self._y_val: Optional[Dict[str, np.ndarray]] = None
         self._y_test: Optional[Dict[str, np.ndarray]] = None
+        self._dataset: Optional[pd.DataFrame] = None
 
         # Results
         self.results: Optional[TrainingResults] = None
@@ -160,16 +177,15 @@ class TrainingOrchestrator:
     def dataset_builder(self):
         """Lazy-load dataset builder."""
         if self._dataset_builder is None:
-            from smps.ml.dataset_builder import CanonicalDatasetBuilder, DatasetConfig
-
-            ds_config = DatasetConfig(
+            ds_config = dataset_builder.DatasetConfig(
                 site_id=self.config.site_id,
                 latitude=self.config.latitude,
                 longitude=self.config.longitude,
                 start_date=self.config.start_date,
                 end_date=self.config.end_date,
             )
-            self._dataset_builder = CanonicalDatasetBuilder(ds_config)
+            self._dataset_builder = dataset_builder.CanonicalDatasetBuilder(
+                ds_config)
 
         return self._dataset_builder
 
@@ -177,8 +193,7 @@ class TrainingOrchestrator:
     def feature_store(self):
         """Lazy-load feature store."""
         if self._feature_store is None:
-            from smps.ml.feature_store import FeatureStore
-            self._feature_store = FeatureStore()
+            self._feature_store = feature_store.FeatureStore()
 
         return self._feature_store
 
@@ -189,7 +204,6 @@ class TrainingOrchestrator:
         Returns:
             TrainingResults with metrics, predictions, and metadata
         """
-        import time
 
         start_time = datetime.now()
         timer_start = time.perf_counter()
@@ -227,7 +241,7 @@ class TrainingOrchestrator:
                 logger.info("\n[Step 5/5] Saving results...")
                 self._save_results()
 
-        except Exception:
+        except Exception as e:
             logger.exception("Training failed")
             raise
 
@@ -235,7 +249,7 @@ class TrainingOrchestrator:
         self.results.training_time = time.perf_counter() - timer_start
         self.results.end_time = datetime.now()
 
-        logger.info("\n" + "=" * 60)
+        logger.info("=" * 60)
         logger.info("Training Complete!")
         logger.info("Total time: %.2f s", self.results.training_time)
         self._log_summary()
@@ -246,7 +260,11 @@ class TrainingOrchestrator:
     def _build_dataset(self) -> pd.DataFrame:
         """Build canonical dataset."""
         try:
-            dataset = self.dataset_builder.build()
+            dataset = self.dataset_builder.build(
+                site_id=self.config.site_id,
+                start_date=date.fromisoformat(self.config.start_date),
+                end_date=date.fromisoformat(self.config.end_date),
+            )
             logger.info("Dataset shape: %s", str(dataset.shape))
             logger.info("Date range: %s to %s",
                         dataset.index.min(), dataset.index.max())
@@ -254,6 +272,7 @@ class TrainingOrchestrator:
             # Register features
             self._register_features(dataset)
 
+            self._dataset = dataset
             return dataset
 
         except Exception as e:
@@ -274,7 +293,8 @@ class TrainingOrchestrator:
         n_samples = len(dates)
 
         # Weather features (with seasonal patterns)
-        day_of_year = dates.dayofyear
+        # Use .dt accessor on a Series to obtain day-of-year to avoid static-analysis issues
+        day_of_year = pd.Series(dates).dt.dayofyear.values
         seasonal = np.sin(2 * np.pi * day_of_year / 365)
 
         data = {
@@ -340,8 +360,6 @@ class TrainingOrchestrator:
 
     def _register_features(self, dataset: pd.DataFrame):
         """Register features in feature store."""
-        from smps.ml.feature_store import FeatureMetadata
-
         for col in dataset.columns:
             # Categorize feature
             if 'physics' in col.lower():
@@ -362,10 +380,12 @@ class TrainingOrchestrator:
             else:
                 group = 'other'
 
-            metadata = FeatureMetadata(
+            metadata = feature_store.FeatureMetadata(
                 name=col,
+                description=f"Feature {col} from canonical builder",
                 dtype=str(dataset[col].dtype),
                 source='canonical_builder',
+                category='other',
             )
             self.feature_store.register_feature(col, group, metadata)
 
@@ -375,7 +395,7 @@ class TrainingOrchestrator:
 
         # Identify feature and target columns
         target_cols = [c for c in dataset.columns if c.startswith('obs_sm_')]
-        physics_cols = [
+        _physics_cols = [
             c for c in dataset.columns if c.startswith('physics_sm_')]
         feature_cols = [c for c in dataset.columns if c not in target_cols]
 
@@ -401,8 +421,6 @@ class TrainingOrchestrator:
 
         else:
             # Random split
-            from sklearn.model_selection import train_test_split
-
             train_val_idx, test_idx = train_test_split(
                 range(n_samples),
                 test_size=self.config.test_frac,
@@ -444,23 +462,17 @@ class TrainingOrchestrator:
 
     def _train_stacking_model(self):
         """Train stacking ensemble."""
-        from smps.ml.ensemble import (
-            MultiDepthEnsemble,
-            EnsembleConfig,
-            BaseModelConfig,
-        )
-
         # Create base model configs
         base_configs = []
         for i, model_type in enumerate(self.config.base_models):
-            base_configs.append(BaseModelConfig(
+            base_configs.append(ensemble.BaseModelConfig(
                 name=f"{model_type}_{i}",
                 model_type=model_type,
                 early_stopping_rounds=self.config.early_stopping_rounds,
             ))
 
         # Ensemble config
-        ensemble_config = EnsembleConfig(
+        ensemble_config = ensemble.EnsembleConfig(
             base_models=base_configs,
             meta_model=self.config.meta_model,
             n_folds=self.config.n_folds,
@@ -469,7 +481,7 @@ class TrainingOrchestrator:
         )
 
         # Create multi-depth ensemble
-        self._model = MultiDepthEnsemble(
+        self._model = ensemble.MultiDepthEnsemble(
             depths=self.config.depths,
             config=ensemble_config,
         )
@@ -489,9 +501,8 @@ class TrainingOrchestrator:
 
     def _train_hybrid_model(self):
         """Train hybrid physics-ML model."""
-        from smps.ml.hybrid_model import HybridSoilMoistureModel
 
-        self._model = HybridSoilMoistureModel()
+        self._model = hybrid_model.HybridSoilMoistureModel()
 
         # Prepare targets
         for depth in self.config.depths:
@@ -505,8 +516,23 @@ class TrainingOrchestrator:
                     obs_col=obs_col,
                 )
 
-        # Fit
-        self._model.fit(self._X_train, self._y_train)
+        # Fit - prepare training data, targets and physics column mapping
+        train_idx = self._X_train.index
+        X_train_df = self._dataset.loc[train_idx]
+
+        # y: dict depth -> ndarray (use existing _y_train mapping)
+        y_train = {depth: self._y_train[depth]
+                   for depth in self._y_train.keys()}
+
+        # physics_cols mapping for depths present in X_train_df
+        physics_cols = {
+            depth: f'physics_sm_{depth}'
+            for depth in self.config.depths
+            if f'physics_sm_{depth}' in X_train_df.columns and depth in y_train
+        }
+
+        # Fit the hybrid model
+        self._model.fit(X_train_df, y_train, physics_cols)
 
         # Get importance
         self.results.feature_importance = self._model.get_feature_importance()
@@ -514,7 +540,6 @@ class TrainingOrchestrator:
     def _train_single_model(self):
         """Train single model (for comparison)."""
         try:
-            import lightgbm as lgb
 
             self._model = {}
             self.results.feature_importance = {}
@@ -553,13 +578,12 @@ class TrainingOrchestrator:
                     zip(feature_cols, model.feature_importances_))
                 self.results.feature_importance[depth] = importance
 
-        except ImportError:
+        except ImportError as exc:
             raise ImportError(
-                "LightGBM required for single model. pip install lightgbm")
+                "LightGBM required for single model. pip install lightgbm") from exc
 
     def _evaluate(self):
         """Evaluate model on all splits."""
-        from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
         self.results.metrics = {}
 
@@ -577,12 +601,33 @@ class TrainingOrchestrator:
                 preds_train = self._model.predict(
                     self._X_train, physics_cols).get(depth, np.array([]))
             elif self.config.model_type == 'hybrid':
-                preds_test = self._model.predict(
-                    self._X_test).get(depth, np.array([]))
-                preds_val = self._model.predict(
-                    self._X_val).get(depth, np.array([]))
-                preds_train = self._model.predict(
-                    self._X_train).get(depth, np.array([]))
+                # Build physics column mappings for each split and pass to predict
+                physics_cols_test = {
+                    d: f'physics_sm_{d}'
+                    for d in self.config.depths
+                    if f'physics_sm_{d}' in self._X_test.columns and d in self._y_test
+                }
+                preds_df = self._model.predict(
+                    self._X_test, physics_cols=physics_cols_test)
+                preds_test = preds_df[f'pred_vwc_{depth}'].values
+
+                physics_cols_val = {
+                    d: f'physics_sm_{d}'
+                    for d in self.config.depths
+                    if f'physics_sm_{d}' in self._X_val.columns and d in self._y_val
+                }
+                preds_df_val = self._model.predict(
+                    self._X_val, physics_cols=physics_cols_val)
+                preds_val = preds_df_val[f'pred_vwc_{depth}'].values
+
+                physics_cols_train = {
+                    d: f'physics_sm_{d}'
+                    for d in self.config.depths
+                    if f'physics_sm_{d}' in self._X_train.columns and d in self._y_train
+                }
+                preds_df_train = self._model.predict(
+                    self._X_train, physics_cols=physics_cols_train)
+                preds_train = preds_df_train[f'pred_vwc_{depth}'].values
             else:
                 features = self._model[depth]['features']
                 preds_test = self._model[depth]['model'].predict(
@@ -634,15 +679,20 @@ class TrainingOrchestrator:
                 continue
 
             if self.config.model_type in ['stacking', 'hybrid']:
-                physics_cols = {depth: f'physics_sm_{depth}'}
+                # build physics mapping for training split
+                physics_cols_train = {
+                    d: f'physics_sm_{d}'
+                    for d in self.config.depths
+                    if f'physics_sm_{d}' in self._X_train.columns and d in self._y_train
+                }
                 if self.config.model_type == 'stacking':
                     train_preds[f'pred_{depth}'] = self._model.predict(
-                        self._X_train, physics_cols
+                        self._X_train, physics_cols_train
                     ).get(depth, [])
                 else:
                     train_preds[f'pred_{depth}'] = self._model.predict(
-                        self._X_train
-                    ).get(depth, [])
+                        self._X_train, physics_cols=physics_cols_train
+                    )[f'pred_vwc_{depth}'].values
             else:
                 features = self._model[depth]['features']
                 train_preds[f'pred_{depth}'] = self._model[depth]['model'].predict(
@@ -728,7 +778,7 @@ class TrainingOrchestrator:
                 for feat, imp in top_features:
                     logger.info("  - %s: %.4f", feat, imp)
 
-    def explain(self, X: Optional[pd.DataFrame] = None) -> 'SHAPExplainer':
+    def explain(self, X: Optional[pd.DataFrame] = None) -> Any:
         """
         Create SHAP explainer for trained model.
 
@@ -738,8 +788,6 @@ class TrainingOrchestrator:
         Returns:
             SHAPExplainer instance
         """
-        from smps.ml.explainer import SHAPExplainer
-
         if self._model is None:
             raise RuntimeError("Model not trained. Call run() first.")
 
@@ -757,12 +805,13 @@ class TrainingOrchestrator:
             # (Full SHAP for ensemble is complex)
             depth = self.config.depths[0]
             if hasattr(self._model, 'ensembles'):
-                ensemble = self._model.ensembles[depth]
-                model = ensemble.base_models[0].model
+                ensemble_obj = self._model.ensembles[depth]
+                model = ensemble_obj.base_models[0].model
             else:
                 model = self._model
 
-        self._explainer = SHAPExplainer(model, feature_names=list(X.columns))
+        self._explainer = explainer.SHAPExplainer(
+            model, feature_names=list(X.columns))
         self._explainer.compute_shap_values(X)
 
         return self._explainer
@@ -801,3 +850,442 @@ def train_site(
 
     orchestrator = TrainingOrchestrator(config)
     return orchestrator.run()
+
+
+class MLTrainingPipeline:
+    """
+    Comprehensive ML training pipeline with best practices for soil moisture prediction.
+
+    Implements:
+    - Data cleaning and preprocessing
+    - Feature engineering and selection
+    - Hyperparameter tuning (Bayesian optimization)
+    - Cross-validation strategies
+    - Experiment tracking
+    - Model validation and diagnostics
+    """
+
+    def __init__(self, output_dir: Path, experiment_name: str = "soil_moisture_ml"):
+        self.output_dir = output_dir
+        self.experiment_name = experiment_name
+
+        # Initialize MLflow for experiment tracking
+        mlflow.set_experiment(experiment_name)
+
+        # Data preprocessing components
+        self.imputer = KNNImputer(n_neighbors=5)
+        self.scaler = RobustScaler()  # Robust to outliers
+        self.feature_selector = None
+
+        # Model storage
+        self.models = {}
+        self.best_params = {}
+        self.cv_results = {}
+
+        # Domain knowledge constraints
+        # Realistic bounds for soil moisture
+        self.soil_moisture_bounds = (0.0, 0.6)
+
+    def preprocess_data(self, df: pd.DataFrame, feature_cols: List[str],
+                        target_col: str) -> Tuple[pd.DataFrame, pd.Series]:
+        """
+        Comprehensive data preprocessing with domain knowledge.
+
+        Args:
+            df: Raw dataframe
+            feature_cols: Feature column names
+            target_col: Target column name
+
+        Returns:
+            Preprocessed features and target
+        """
+        logger.info("Starting comprehensive data preprocessing...")
+
+        # 1. Data Cleaning
+        df_clean = df.copy()
+
+        # Remove unrealistic soil moisture values
+        if target_col in df_clean.columns:
+            mask = (df_clean[target_col] >= self.soil_moisture_bounds[0]) & \
+                   (df_clean[target_col] <= self.soil_moisture_bounds[1])
+            df_clean = df_clean[mask]
+            logger.info(
+                f"Removed {len(df) - len(df_clean)} unrealistic target values")
+
+        # 2. Handle Missing Values with Domain Knowledge
+        # For weather features: interpolate temporally
+        weather_cols = [c for c in feature_cols if any(x in c.lower() for x in
+                                                       ['temp', 'precip', 'humidity', 'wind', 'radiation'])]
+        for col in weather_cols:
+            if col in df_clean.columns:
+                df_clean[col] = df_clean[col].interpolate(
+                    method='linear', limit=3)
+
+        # For satellite features: use spatial-temporal interpolation
+        satellite_cols = [c for c in feature_cols if any(x in c.lower() for x in
+                                                         ['ndvi', 'satellite', 'gee'])]
+        for col in satellite_cols:
+            if col in df_clean.columns:
+                df_clean[col] = df_clean[col].interpolate(
+                    method='linear', limit=7)
+
+        # For soil features: use KNN imputation
+        soil_cols = [c for c in feature_cols if any(x in c.lower() for x in
+                                                    ['soil', 'sand', 'clay', 'bulk'])]
+        if soil_cols:
+            existing_soil_cols = [
+                c for c in soil_cols if c in df_clean.columns]
+            if existing_soil_cols:
+                df_clean[existing_soil_cols] = self.imputer.fit_transform(
+                    df_clean[existing_soil_cols])
+
+        # 3. Feature Engineering (must come before filling NaNs)
+        df_clean = self._add_domain_features(df_clean, feature_cols)
+
+        # Fill remaining NaNs with median for numeric features
+        numeric_cols = df_clean[feature_cols].select_dtypes(
+            include=[np.number]).columns
+        for col in numeric_cols:
+            if df_clean[col].isna().any():
+                median_val = df_clean[col].median()
+                df_clean[col] = df_clean[col].fillna(median_val)
+
+        # 4. Outlier Detection and Treatment (Domain-specific)
+        for col in feature_cols:
+            if col in df_clean.columns and df_clean[col].dtype in ['float64', 'int64']:
+                # Use IQR method but with domain constraints
+                Q1 = df_clean[col].quantile(0.25)
+                Q3 = df_clean[col].quantile(0.75)
+                IQR = Q3 - Q1
+
+                # Domain-specific bounds
+                if 'precip' in col.lower():
+                    upper_bound = Q3 + 3 * IQR  # Allow heavy rainfall
+                    lower_bound = 0  # No negative precipitation
+                elif 'temp' in col.lower():
+                    upper_bound = Q3 + 2 * IQR
+                    lower_bound = Q1 - 2 * IQR
+                else:
+                    upper_bound = Q3 + 1.5 * IQR
+                    lower_bound = Q1 - 1.5 * IQR
+
+                # Clip outliers
+                df_clean[col] = df_clean[col].clip(lower_bound, upper_bound)
+
+        # 5. Normalization/Standardization
+        # Use RobustScaler for features (handles outliers better than StandardScaler)
+        feature_data = df_clean[feature_cols].values
+        feature_data_scaled = self.scaler.fit_transform(feature_data)
+
+        X = pd.DataFrame(feature_data_scaled,
+                         columns=feature_cols, index=df_clean.index)
+        y = df_clean[target_col] if target_col in df_clean.columns else None
+
+        logger.info(
+            f"Preprocessing complete: {len(X)} samples, {len(feature_cols)} features")
+        return X, y
+
+    def _add_domain_features(self, df: pd.DataFrame, feature_cols: List[str]) -> pd.DataFrame:
+        """Add domain-specific features for soil moisture prediction."""
+        # Water balance indicators
+        if 'precip_mm' in df.columns and 'et_mm' in df.columns:
+            df['net_water_input'] = df['precip_mm'] - df['et_mm']
+            if 'net_water_input' not in feature_cols:
+                feature_cols.append('net_water_input')
+
+        # Soil moisture memory (exponential decay)
+        soil_moisture_cols = [
+            c for c in df.columns if 'sm_' in c and '_lag' in c]
+        for col in soil_moisture_cols:
+            # Extract depth from column name (e.g., 'obs_sm_surface_lag1' -> 'surface')
+            parts = col.split('_')
+            depth_idx = parts.index('sm') + 1 if 'sm' in parts else 1
+            depth = parts[depth_idx] if depth_idx < len(parts) else 'surface'
+            decay_col = f'{depth}_memory'
+            df[decay_col] = df[col] * \
+                np.exp(-np.arange(len(df)) / 7)  # 7-day memory
+            if decay_col not in feature_cols:
+                feature_cols.append(decay_col)
+
+        return df
+
+    def optimize_hyperparameters(self, X_train: pd.DataFrame, y_train: pd.Series,
+                                 horizon_name: str, depth: str) -> Dict:
+        """
+        Bayesian hyperparameter optimization using Optuna.
+
+        Args:
+            X_train: Training features
+            y_train: Training target
+            horizon_name: Forecast horizon
+            depth: Soil depth
+
+        Returns:
+            Best hyperparameters
+        """
+        def objective(trial):
+            # Define hyperparameter search space with domain knowledge
+            params = {
+                'n_estimators': trial.suggest_int('n_estimators', 500, 3000),
+                'learning_rate': trial.suggest_float('learning_rate', 0.005, 0.05, log=True),
+                'max_depth': trial.suggest_int('max_depth', 4, 12),
+                'num_leaves': trial.suggest_int('num_leaves', 20, 100),
+                'min_child_samples': trial.suggest_int('min_child_samples', 10, 100),
+                'min_child_weight': trial.suggest_float('min_child_weight', 1e-5, 1e-1, log=True),
+                'subsample': trial.suggest_float('subsample', 0.6, 0.9),
+                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 0.9),
+                'reg_alpha': trial.suggest_float('reg_alpha', 0.0, 1.0),
+                'reg_lambda': trial.suggest_float('reg_lambda', 0.0, 1.0),
+                'min_split_gain': trial.suggest_float('min_split_gain', 0.0, 0.1),
+            }
+
+            # Adjust regularization based on horizon (longer horizons need more regularization)
+            horizon_days = {'0h': 0, '24h': 1, '72h': 3,
+                            '168h': 7}.get(horizon_name, 0)
+            reg_multiplier = 1.0 + 0.3 * horizon_days
+            params['reg_alpha'] *= reg_multiplier
+            params['reg_lambda'] *= reg_multiplier
+
+            # Cross-validation with time series split
+            tscv = TimeSeriesSplit(n_splits=3)
+            cv_scores = []
+
+            for train_idx, val_idx in tscv.split(X_train):
+                X_fold_train, X_fold_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
+                y_fold_train, y_fold_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
+
+                model = lgb.LGBMRegressor(
+                    **params,
+                    random_state=42,
+                    verbosity=-1,
+                    # Conservative for nested CV
+                    n_jobs=min(2, os.cpu_count() // 4) if os.cpu_count() else 1
+                )
+
+                model.fit(
+                    X_fold_train, y_fold_train,
+                    eval_set=[(X_fold_val, y_fold_val)],
+                    callbacks=[lgb.early_stopping(50, verbose=False)]
+                )
+
+                y_pred = model.predict(X_fold_val)
+                rmse = np.sqrt(mean_squared_error(y_fold_val, y_pred))
+                cv_scores.append(rmse)
+
+            return np.mean(cv_scores)
+
+        # Run optimization
+        study = optuna.create_study(
+            direction='minimize',
+            sampler=TPESampler(seed=42),
+            study_name=f"{horizon_name}_{depth}"
+        )
+
+        logger.info(
+            f"Starting hyperparameter optimization for {horizon_name} at {depth}")
+        # 50 trials, 10min timeout
+        study.optimize(objective, n_trials=50, timeout=600)
+
+        best_params = study.best_params
+        best_params.update({
+            'random_state': 42,
+            'verbosity': -1,
+            # Limit LightGBM parallel jobs
+            'n_jobs': min(4, os.cpu_count() // 2) if os.cpu_count() else 1
+        })
+
+        logger.info(
+            f"Best params for {horizon_name}_{depth}: RMSE={study.best_value:.4f}")
+
+        # Store results
+        self.best_params[f"{horizon_name}_{depth}"] = best_params
+        self.cv_results[f"{horizon_name}_{depth}"] = {
+            'best_score': study.best_value,
+            'best_params': best_params,
+            'study': study
+        }
+
+        return best_params
+
+    def train_with_cross_validation(self, X: pd.DataFrame, y: pd.Series,
+                                    horizon_name: str, depth: str) -> Dict:
+        """
+        Train model with comprehensive cross-validation and diagnostics.
+
+        Args:
+            X: Features
+            y: Target
+            horizon_name: Forecast horizon
+            depth: Soil depth
+
+        Returns:
+            Training results and diagnostics
+        """
+        logger.info(f"Training model for {horizon_name} at {depth}cm")
+
+        # Get optimized hyperparameters
+        best_params = self.optimize_hyperparameters(X, y, horizon_name, depth)
+
+        # Multiple CV strategies for robustness
+        cv_strategies = {
+            'temporal': TimeSeriesSplit(n_splits=5),
+            'kfold': KFold(n_splits=5, shuffle=True, random_state=42),
+        }
+
+        results = {}
+
+        for cv_name, cv_splitter in cv_strategies.items():
+            cv_scores = cross_val_score(
+                lgb.LGBMRegressor(**best_params),
+                X, y,
+                cv=cv_splitter,
+                scoring='neg_mean_squared_error',
+                # Limit parallel jobs to prevent resource leaks
+                n_jobs=min(4, cv_splitter.get_n_splits())
+            )
+            results[f'{cv_name}_rmse'] = np.sqrt(-cv_scores.mean())
+            results[f'{cv_name}_rmse_std'] = np.sqrt(-cv_scores).std()
+
+        # Final model training with early stopping
+        X_train, X_val, y_train, y_val = train_test_split(
+            X, y, test_size=0.2, random_state=42, shuffle=False  # Preserve temporal order
+        )
+
+        model = lgb.LGBMRegressor(**best_params)
+        model.fit(
+            X_train, y_train,
+            eval_set=[(X_train, y_train), (X_val, y_val)],
+            callbacks=[
+                lgb.early_stopping(100, verbose=False),
+                lgb.log_evaluation(period=50)
+            ]
+        )
+
+        # Store model
+        model_key = f"{horizon_name}_{depth}"
+        self.models[model_key] = model
+
+        # Compute comprehensive metrics
+        y_train_pred = model.predict(X_train)
+        y_val_pred = model.predict(X_val)
+
+        train_metrics = self._compute_metrics(y_train, y_train_pred)
+        val_metrics = self._compute_metrics(y_val, y_val_pred)
+
+        # Check for overfitting/underfitting
+        overfitting_detected = val_metrics['rmse'] > train_metrics['rmse'] * 1.2
+
+        results.update({
+            'model': model,
+            'best_params': best_params,
+            'train_metrics': train_metrics,
+            'val_metrics': val_metrics,
+            'overfitting_detected': overfitting_detected,
+            'feature_importance': dict(zip(X.columns, model.feature_importances_)),
+            'best_iteration': model.best_iteration_,
+        })
+
+        logger.info(f"Training complete: Val RMSE={val_metrics['rmse']:.4f}, "
+                    f"Overfitting: {overfitting_detected}")
+
+        return results
+
+    def _compute_metrics(self, y_true: pd.Series, y_pred: np.ndarray) -> Dict:
+        """Compute comprehensive evaluation metrics."""
+        # Clip predictions to physical bounds
+        y_pred_clipped = np.clip(y_pred, *self.soil_moisture_bounds)
+
+        metrics = {
+            'rmse': np.sqrt(mean_squared_error(y_true, y_pred_clipped)),
+            'mae': mean_absolute_error(y_true, y_pred_clipped),
+            'r2': r2_score(y_true, y_pred_clipped),
+            'bias': np.mean(y_pred_clipped - y_true),
+        }
+
+        # Hydrological metrics
+        nse = 1 - np.sum((y_true - y_pred_clipped)**2) / \
+            np.sum((y_true - y_true.mean())**2)
+        metrics['nse'] = nse
+
+        # KGE components
+        r = np.corrcoef(y_true, y_pred_clipped)[
+            0, 1] if np.std(y_true) > 0 else 0
+        alpha = np.std(y_pred_clipped) / \
+            np.std(y_true) if np.std(y_true) > 0 else 1
+        beta = np.mean(y_pred_clipped) / \
+            np.mean(y_true) if np.mean(y_true) != 0 else 1
+        kge = 1 - np.sqrt((r - 1)**2 + (alpha - 1)**2 + (beta - 1)**2)
+        metrics['kge'] = kge
+
+        return metrics
+
+    def validate_model_assumptions(self, X: pd.DataFrame, y: pd.Series,
+                                   model_key: str) -> Dict:
+        """
+        Validate model assumptions and check for bias.
+
+        Args:
+            X: Features
+            y: Target
+            model_key: Model identifier
+
+        Returns:
+            Validation results
+        """
+        model = self.models[model_key]
+        y_pred = model.predict(X)
+
+        validation_results = {
+            'residual_analysis': self._analyze_residuals(y, y_pred),
+            'feature_importance_stability': self._check_feature_stability(model),
+            'prediction_bias_analysis': self._analyze_prediction_bias(y, y_pred),
+        }
+
+        return validation_results
+
+    def _analyze_residuals(self, y_true: pd.Series, y_pred: np.ndarray) -> Dict:
+        """Analyze residuals for patterns indicating model issues."""
+        residuals = y_true - y_pred
+
+        # Heteroscedasticity test (should be random)
+        residual_std = residuals.rolling(30).std()
+        heteroscedasticity_ratio = residual_std.max() / residual_std.min()
+
+        # Autocorrelation (should be low)
+        autocorr = residuals.autocorr(lag=1)
+
+        # Normality test
+        from scipy.stats import shapiro
+        _, normality_p = shapiro(residuals.sample(min(5000, len(residuals))))
+
+        return {
+            'heteroscedasticity_ratio': heteroscedasticity_ratio,
+            'autocorrelation': autocorr,
+            'normality_p_value': normality_p,
+            'mean_residual': residuals.mean(),
+            'residual_std': residuals.std(),
+        }
+
+    def _check_feature_stability(self, model) -> Dict:
+        """Check if feature importance is stable."""
+        # This would require multiple model fits - simplified version
+        importance = model.feature_importances_
+        return {
+            'top_features': np.argsort(importance)[-5:],
+            'importance_std': np.std(importance),
+            'importance_gini': 1 - np.sum((importance / importance.sum())**2),
+        }
+
+    def _analyze_prediction_bias(self, y_true: pd.Series, y_pred: np.ndarray) -> Dict:
+        """Analyze prediction bias across different ranges."""
+        # Bias by soil moisture ranges
+        ranges = [(0, 0.2), (0.2, 0.4), (0.4, 0.6)]
+        bias_by_range = {}
+
+        for low, high in ranges:
+            mask = (y_true >= low) & (y_true <= high)
+            if mask.sum() > 10:
+                bias = np.mean(y_pred[mask] - y_true[mask])
+                bias_by_range[f'{low}-{high}'] = bias
+
+        return bias_by_range

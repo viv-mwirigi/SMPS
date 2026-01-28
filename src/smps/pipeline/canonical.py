@@ -15,8 +15,8 @@ from smps.core.config import get_config, DataConfig
 from smps.core.exceptions import DataSourceError, DataValidationError
 from smps.data.contracts import CanonicalDailyRow, SoilProfile
 from smps.data.sources.base import DataSourceRegistry, DataFetchRequest
-from smps.data.sources.weather import OpenMeteoSource, MockWeatherSource
-from smps.data.sources.soil import SoilGridsSource, MockSoilSource
+from smps.data.sources.weather import OpenMeteoSource
+from smps.data.sources.soil import SoilGridsSource
 from smps.physics import create_water_balance_model
 from smps.physics.pedotransfer import estimate_soil_parameters
 from smps.features.engineering import FeatureEngineer
@@ -167,17 +167,38 @@ class CanonicalTableBuilder:
         # Weather sources
         if "open_meteo" in self.config.enabled_sources:
             self.data_registry.register(OpenMeteoSource(cache_dir))
-        else:
-            self.data_registry.register(MockWeatherSource(cache_dir))
+        # No fallback - system requires real weather data
 
-        # Soil sources
+        # Soil sources - try ISDA first if credentials available, then SoilGrids, then mock
+        from smps.data.sources.isda_authenticated import IsdaAfricaAuthenticatedSource
+
+        isda_source = IsdaAfricaAuthenticatedSource(cache_dir=cache_dir)
+        if isda_source.username and isda_source.password:
+            self.data_registry.register(isda_source)
+            self.logger.info("Registered iSDA Africa soil source")
+        else:
+            self.logger.info("iSDA credentials not available, skipping")
+
         if "soilgrids" in self.config.enabled_sources:
             self.data_registry.register(SoilGridsSource(cache_dir))
-        else:
-            self.data_registry.register(MockSoilSource(cache_dir))
+        # No fallback - system requires real soil data
+
+        # Remote sensing sources
+        try:
+            from smps.data.sources import GoogleEarthEngineSatelliteSource
+            if GoogleEarthEngineSatelliteSource is not None:
+                gee_source = GoogleEarthEngineSatelliteSource(
+                    cache_dir=cache_dir)
+                self.data_registry.register(gee_source)
+                self.logger.info(
+                    "Registered Google Earth Engine satellite source")
+            else:
+                self.logger.warning("Google Earth Engine not available")
+        except Exception as e:
+            self.logger.warning(f"Could not initialize GEE source: {e}")
 
         # Note: Remote sensing and sensor sources would be added here
-        # For now, we'll use mock data or skip
+        # For now, only configured real data sources are used
 
         self.logger.info(
             f"Initialized data sources: {list(self.data_registry.get_all().keys())}")
@@ -220,17 +241,71 @@ class CanonicalTableBuilder:
                 raw_data["weather"].extend(result.data)
             elif "soil" in source_name.lower():
                 raw_data["soil"] = result.data
-            # Add other categories as needed
+            elif "gee" in source_name.lower() or "satellite" in source_name.lower():
+                raw_data["remote_sensing"].extend(result.data)
 
-        # If no weather data, create mock data
+        # If no weather data, raise error
         if not raw_data["weather"]:
-            self.logger.warning("No weather data fetched, using mock data")
-            mock_source = MockWeatherSource()
-            weather_result = mock_source.fetch(request)
-            if weather_result.success:
-                raw_data["weather"] = weather_result.data
+            raise DataSourceError(
+                "No weather data fetched from any source. Real data sources must be available."
+            )
+
+        # Merge NDVI data into weather data
+        raw_data["weather"] = self._merge_ndvi_into_weather(
+            raw_data["weather"], raw_data["remote_sensing"])
 
         return raw_data
+
+    def _merge_ndvi_into_weather(self, weather_data: List, remote_sensing_data: List) -> List:
+        """
+        Merge NDVI data from remote sensing into weather data.
+
+        Args:
+            weather_data: List of DailyWeather objects
+            remote_sensing_data: List of RemoteSensingData objects
+
+        Returns:
+            Updated weather_data with NDVI values
+        """
+        if not remote_sensing_data:
+            self.logger.warning("No remote sensing data available for NDVI")
+            return weather_data
+
+        # Create NDVI lookup by date
+        ndvi_by_date = {}
+        for rs_data in remote_sensing_data:
+            if rs_data.ndvi is not None:
+                ndvi_by_date[rs_data.date] = rs_data.ndvi
+
+        if not ndvi_by_date:
+            self.logger.warning("No NDVI values found in remote sensing data")
+            return weather_data
+
+        # Merge NDVI into weather data
+        updated_weather = []
+        for weather in weather_data:
+            # Find closest NDVI date (within 8 days for 16-day MODIS composite)
+            closest_ndvi = None
+            min_days_diff = float('inf')
+
+            for ndvi_date, ndvi_value in ndvi_by_date.items():
+                days_diff = abs((ndvi_date - weather.date).days)
+                if days_diff <= 8 and days_diff < min_days_diff:  # 8 days tolerance
+                    min_days_diff = days_diff
+                    closest_ndvi = ndvi_value
+
+            if closest_ndvi is not None:
+                # Create a new weather object with NDVI
+                weather_dict = weather.dict()
+                weather_dict['ndvi'] = closest_ndvi
+                # Reconstruct the object (this is a bit hacky, but works)
+                updated_weather.append(weather.__class__(**weather_dict))
+            else:
+                updated_weather.append(weather)
+
+        self.logger.info(
+            f"Merged NDVI data for {len([w for w in updated_weather if hasattr(w, 'ndvi') and w.ndvi is not None])} weather records")
+        return updated_weather
 
     def _get_soil_profile(self, site_id: SiteID) -> SoilProfile:
         """Get soil profile from cache or fetch fresh"""
@@ -238,20 +313,25 @@ class CanonicalTableBuilder:
             self.logger.debug(f"Using cached soil profile for {site_id}")
             return self._soil_profile_cache[site_id]
 
-        # Fetch from soil source
-        soil_source = self.data_registry.get(
-            "soilgrids") or self.data_registry.get("mock_soil")
-        if not soil_source:
-            raise DataSourceError("No soil source available")
+        # Try sources in priority order: ISDA, SoilGrids, Mock
+        sources_to_try = ["isda_africa", "soilgrids", "mock_soil"]
 
-        try:
-            soil_profile = soil_source.fetch_soil_profile(site_id)
-            self._soil_profile_cache[site_id] = soil_profile
-            return soil_profile
-        except Exception as e:
-            self.logger.error(f"Failed to fetch soil profile: {e}")
-            # Create default profile
-            return self._create_default_soil_profile(site_id)
+        for source_name in sources_to_try:
+            soil_source = self.data_registry.get(source_name)
+            if soil_source:
+                try:
+                    soil_profile = soil_source.fetch_soil_profile(site_id)
+                    self._soil_profile_cache[site_id] = soil_profile
+                    self.logger.info(
+                        f"Successfully fetched soil profile from {source_name}")
+                    return soil_profile
+                except Exception as e:
+                    self.logger.warning(
+                        f"Failed to fetch from {source_name}: {e}")
+                    continue
+
+        raise DataValidationError(
+            f"No soil profile available for {site_id} from any source")
 
     def _run_physics_prior(self, site_id: SiteID,
                            start_date: date,
@@ -313,10 +393,15 @@ class CanonicalTableBuilder:
 
         # Build forcings DataFrame for run_period
         forcings = weather_df[['precipitation_mm', 'et0_mm']].copy()
-        if 'ndvi' in weather_df.columns:
+
+        # Check for NDVI data - required for physics model
+        if 'ndvi' in weather_df.columns and weather_df['ndvi'].notna().any():
             forcings['ndvi'] = weather_df['ndvi']
+            self.logger.info("Using NDVI data from remote sensing")
         else:
-            forcings['ndvi'] = 0.5  # Default NDVI
+            raise DataValidationError(
+                "NDVI data is required for physics model but not available. "
+                "Ensure Google Earth Engine is properly configured and can fetch satellite data.")
 
         if irrigation_df is not None:
             forcings['irrigation_mm'] = irrigation_df['volume_mm'].reindex(
@@ -325,11 +410,46 @@ class CanonicalTableBuilder:
             forcings['irrigation_mm'] = 0.0
 
         # Run model using run_period for efficient batch processing
-        physics_results = physics_model.run_period(
-            forcings=forcings,
-            warmup_days=min(30, len(forcings) // 4),
-            return_fluxes=False
-        )
+        try:
+            physics_results = physics_model.run_period(
+                forcings=forcings,
+                warmup_days=min(30, len(forcings) // 4),
+                return_fluxes=False
+            )
+
+            # Ensure physics_results has the correct date index
+            # Physics model returns results only after warmup period
+            warmup_days = min(30, len(forcings) // 4)
+            result_dates = forcings.index[warmup_days:]
+            if len(physics_results) == len(result_dates):
+                physics_results.index = result_dates
+                physics_results.index.name = 'date'
+            else:
+                self.logger.warning(
+                    f"Physics results length mismatch: {len(physics_results)} vs {len(result_dates)}")
+                raise DataValidationError(
+                    "Physics model returned wrong number of results")
+
+            # Check if results are valid (not all NaN)
+            self.logger.info(
+                f"Physics results columns: {list(physics_results.columns)}")
+            self.logger.info(f"Physics results shape: {physics_results.shape}")
+            if 'theta_phys_surface' in physics_results.columns:
+                self.logger.info(
+                    f"theta_phys_surface values: {physics_results['theta_phys_surface'].head()}")
+                if physics_results['theta_phys_surface'].isna().any():
+                    raise DataValidationError(
+                        "Physics model returned NaN results")
+
+            if physics_results.empty or (len(physics_results.columns) == 0):
+                raise DataValidationError(
+                    "Physics model returned invalid results")
+
+        except Exception as e:
+            self.logger.error(
+                f"Physics model failed: {e}")
+            raise DataValidationError(
+                f"Physics model execution failed: {e}") from e
 
         return physics_results
 
@@ -388,19 +508,10 @@ class CanonicalTableBuilder:
         base_df['field_capacity'] = soil_profile.field_capacity
         base_df['wilting_point'] = soil_profile.wilting_point
 
-        # Add site metadata (would come from site configuration)
-        base_df['latitude'] = 35.222866  # Example
-        base_df['longitude'] = 9.090245
-        base_df['elevation_m'] = 150.0
-        base_df['crop_type'] = 'olive'
+        # Add site metadata (must come from real data sources)
+        # Note: latitude, longitude, elevation_m, crop_type must be provided by data sources
 
-        # Add remote sensing data if available
-        if raw_data.get("remote_sensing"):
-            rs_df = pd.DataFrame([r.dict()
-                                 for r in raw_data["remote_sensing"]])
-            rs_df['date'] = pd.to_datetime(rs_df['date'])
-            rs_df.set_index(['site_id', 'date'], inplace=True)
-            base_df = base_df.join(rs_df, how='left')
+        # Note: NDVI is already merged into weather data in _merge_ndvi_into_weather
 
         # Add irrigation data
         if raw_data.get("irrigation"):
@@ -451,22 +562,44 @@ class CanonicalTableBuilder:
         """
         Validate canonical table and convert to proper format.
         """
-        # Ensure required columns exist
-        required_columns = [
-            'site_id', 'date', 'precipitation_mm', 'et0_mm',
-            'physics_theta_surface', 'physics_theta_root'
-        ]
+        # Get the expected fields from CanonicalDailyRow model
+        from smps.data.contracts import CanonicalDailyRow
+        import inspect
 
-        missing_columns = [
-            col for col in required_columns if col not in df.columns]
-        if missing_columns:
+        # Get model fields
+        model_fields = set(CanonicalDailyRow.model_fields.keys())
+
+        # Filter DataFrame to only include expected columns
+        available_columns = [col for col in df.columns if col in model_fields]
+        filtered_df = df[available_columns].copy()
+
+        # Check for missing required columns (those without defaults in the model)
+        required_fields_without_defaults = {
+            'site_id', 'date', 'latitude', 'longitude', 'precipitation_mm', 'et0_mm',
+            'temperature_mean_c', 'temperature_min_c', 'temperature_max_c',
+            'solar_radiation_mj_m2', 'relative_humidity_mean', 'wind_speed_mean_m_s',
+            'precip_cumulative_3d', 'precip_cumulative_7d', 'precip_cumulative_14d', 'precip_cumulative_30d',
+            'et0_cumulative_3d', 'et0_cumulative_7d', 'et0_cumulative_14d',
+            'sand_percent', 'silt_percent', 'clay_percent', 'porosity', 'field_capacity', 'wilting_point',
+            'physics_theta_surface', 'physics_theta_root', 'day_of_year', 'day_of_year_sin', 'day_of_year_cos',
+            'month', 'season', 'water_deficit_mm', 'available_water_capacity', 'created_at', 'etl_version', 'data_sources'
+        }
+
+        missing_required = required_fields_without_defaults - \
+            set(filtered_df.columns)
+        if missing_required:
             raise DataValidationError(
-                f"Missing required columns: {missing_columns}")
+                f"Missing required fields without defaults: {missing_required}. "
+                "All required data must come from real data sources."
+            )
+
+        # For fields with defaults in the model, let Pydantic handle them during validation
+        # No hardcoded defaults added here
 
         # Convert to list of CanonicalDailyRow objects (for validation)
         validated_rows = []
 
-        for _, row in df.iterrows():
+        for _, row in filtered_df.iterrows():
             try:
                 # Convert row to dict and create canonical row
                 row_dict = row.to_dict()

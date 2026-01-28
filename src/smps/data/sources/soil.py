@@ -1,6 +1,6 @@
 """
 Soil data source implementations.
-Currently supports SoilGrids API and mock data for testing.
+Currently supports SoilGrids API.
 """
 import requests
 import numpy as np
@@ -235,98 +235,3 @@ class SoilGridsSource(SoilSource):
         return base_metadata
 
 
-class MockSoilSource(SoilSource):
-    """
-    Mock soil source for testing and development.
-    Generates realistic synthetic soil profiles.
-    """
-
-    # Predefined soil texture classes with typical properties
-    SOIL_CLASSES = {
-        "sand": {
-            "sand": 85, "clay": 10, "silt": 5,
-            "porosity": 0.43, "fc": 0.10, "wp": 0.03,
-            "k_sat": 100.0, "description": "Coarse-textured"
-        },
-        "loam": {
-            "sand": 40, "clay": 20, "silt": 40,
-            "porosity": 0.47, "fc": 0.27, "wp": 0.15,
-            "k_sat": 25.0, "description": "Medium-textured"
-        },
-        "clay_loam": {
-            "sand": 30, "clay": 35, "silt": 35,
-            "porosity": 0.48, "fc": 0.32, "wp": 0.24,
-            "k_sat": 10.0, "description": "Fine-textured"
-        },
-        "clay": {
-            "sand": 20, "clay": 60, "silt": 20,
-            "porosity": 0.46, "fc": 0.38, "wp": 0.27,
-            "k_sat": 5.0, "description": "Very fine-textured"
-        }
-    }
-
-    def __init__(self, cache_dir: Optional[Path] = None):
-        super().__init__("mock_soil", cache_dir)
-
-    def fetch_soil_profile(self, site_id: SiteID,
-                         depth_cm: Optional[int] = None) -> SoilProfile:
-        """Generate synthetic soil profile"""
-
-        # Determine soil class based on site_id (deterministic hash)
-        soil_classes = list(self.SOIL_CLASSES.keys())
-        class_idx = hash(site_id) % len(soil_classes)
-        soil_class = soil_classes[class_idx]
-        class_props = self.SOIL_CLASSES[soil_class]
-
-        # Add some randomness
-        import random
-        random.seed(hash(site_id))
-
-        sand = class_props["sand"] + random.uniform(-5, 5)
-        clay = class_props["clay"] + random.uniform(-5, 5)
-        silt = 100 - sand - clay
-
-        # Ensure valid ranges
-        sand = max(0, min(100, sand))
-        clay = max(0, min(100, clay))
-        silt = max(0, min(100, silt))
-
-        # Normalize to sum to 100
-        total = sand + clay + silt
-        sand = (sand / total) * 100
-        clay = (clay / total) * 100
-        silt = (silt / total) * 100
-
-        # Other properties with some variation
-        porosity = class_props["porosity"] + random.uniform(-0.02, 0.02)
-        field_capacity = class_props["fc"] + random.uniform(-0.03, 0.03)
-        wilting_point = class_props["wp"] + random.uniform(-0.02, 0.02)
-        k_sat = class_props["k_sat"] * random.uniform(0.8, 1.2)
-
-        # Create profile
-        profile = SoilProfile(
-            site_id=site_id,
-            sand_percent=round(sand, 1),
-            silt_percent=round(silt, 1),
-            clay_percent=round(clay, 1),
-            porosity=round(porosity, 3),
-            field_capacity=round(field_capacity, 3),
-            wilting_point=round(wilting_point, 3),
-            saturated_hydraulic_conductivity_cm_day=round(k_sat, 1),
-            profile_depth_cm=100.0,
-            effective_rooting_depth_cm=40.0,
-            source="mock",
-            confidence=0.9
-        )
-
-        return profile
-
-    def get_metadata(self) -> Dict[str, Any]:
-        """Get source metadata"""
-        base_metadata = super().get_metadata()
-        base_metadata.update({
-            "provider": "Mock Soil Data",
-            "available_classes": list(self.SOIL_CLASSES.keys()),
-            "description": "Synthetic soil data for testing"
-        })
-        return base_metadata

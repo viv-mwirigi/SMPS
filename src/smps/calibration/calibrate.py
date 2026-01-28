@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""Utilities for parameter calibration of the SMPS model."""
+
 import json
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -9,7 +11,7 @@ from scipy.optimize import differential_evolution, minimize
 
 from smps.calibration.objective import evaluate_parameters
 from smps.calibration.problem import CalibrationConfig, CalibrationDataset, CalibrationResult
-from smps.physics.enhanced_water_balance import EnhancedWaterBalance
+from smps.physics.simple_water_balance import SimpleWaterBalance
 
 
 @dataclass(frozen=True)
@@ -49,7 +51,7 @@ def default_parameter_space() -> List[ParameterSpec]:
 
 
 def calibrate(
-    base_model: EnhancedWaterBalance,
+    base_model: SimpleWaterBalance,
     dataset: CalibrationDataset,
     config: CalibrationConfig,
     specs: Optional[List[ParameterSpec]] = None,

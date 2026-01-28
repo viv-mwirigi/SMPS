@@ -2,7 +2,7 @@
 Pedotransfer functions for estimating soil hydraulic parameters from texture.
 
 Implements multiple established methods with uncertainty estimation.
-Includes tropical soil corrections (Gap 6) for:
+Includes tropical soil corrections for:
 - Enhanced organic matter effects on water retention
 - Structure factor for Ksat adjustment
 - Parameter distribution representation
@@ -21,11 +21,9 @@ import logging
 
 from smps.core.types import SoilParameters
 
-logger = logging.getLogger(__name__)
-
 
 # =============================================================================
-# TROPICAL SOIL CORRECTIONS (Gap 6)
+# TROPICAL SOIL CORRECTIONS
 # =============================================================================
 
 @dataclass
@@ -795,6 +793,55 @@ def estimate_van_genuchten_parameters(
     return alpha_kpa, n
 
 
+def calculate_theta_from_pressure(
+    pressure_head: float,
+    theta_r: float,
+    theta_s: float,
+    alpha: float,
+    n: float
+) -> float:
+    """
+    Calculate volumetric water content (theta) for a given pressure head using
+    the van Genuchten (1980) retention function.
+
+    Args:
+        pressure_head: Pressure head in kPa (negative for suction). Non-negative
+            values are treated as saturated (theta_s).
+        theta_r: Residual water content (m3/m3).
+        theta_s: Saturated water content (m3/m3).
+        alpha: van Genuchten alpha parameter in 1/kPa.
+        n: van Genuchten n parameter (must be > 1).
+
+    Returns:
+        Volumetric water content (m3/m3).
+    """
+    # Saturated or positive pressure -> saturated water content
+    if pressure_head >= 0:
+        return float(np.clip(theta_s, min(theta_r, theta_s), max(theta_r, theta_s)))
+
+    h = abs(float(pressure_head))
+    alpha = float(alpha) if alpha is not None else 0.0
+    n = float(n) if n is not None else 1.01
+
+    # Guard against invalid n or alpha
+    if n <= 1.0:
+        n = 1.01
+    if alpha <= 0.0:
+        alpha = 1e-8
+
+    m = 1.0 - 1.0 / n
+
+    # van Genuchten effective saturation
+    se = 1.0 / (1.0 + (alpha * h) ** n) ** m
+
+    theta = theta_r + (theta_s - theta_r) * se
+
+    # Ensure physically meaningful bounds
+    theta = float(np.clip(theta, min(theta_r, theta_s), max(theta_r, theta_s)))
+
+    return theta
+
+
 def estimate_soil_parameters_rosetta(
     sand_percent: float,
     clay_percent: float,
@@ -868,7 +915,6 @@ def estimate_soil_parameters_rosetta(
 
     # Field capacity and wilting point from van Genuchten
     # θ at -33 kPa and -1500 kPa
-    from smps.physics.van_genuchten import calculate_theta_from_pressure
 
     field_capacity = calculate_theta_from_pressure(
         pressure_head=-33,  # kPa

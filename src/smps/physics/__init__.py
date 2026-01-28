@@ -3,36 +3,30 @@ Physics modules for soil moisture prediction.
 
 PRODUCTION MODEL (Recommended for farmers):
 ==========================================
-Use `create_water_balance_model()` - this creates the full-physics
-EnhancedWaterBalance model optimized for accurate predictions.
+Use `create_water_balance_model()` - this creates the SimpleWaterBalance model
+with physics-based soil moisture predictions.
 
     >>> from smps.physics import create_water_balance_model
     >>> model = create_water_balance_model(crop_type="maize")
-    >>> result, fluxes = model.run_daily(precipitation_mm=15, et0_mm=5, ndvi=0.6)
+    >>> fluxes, output_theta = model.run_daily(precipitation_mm=15, et0_mm=5, ndvi=0.6)
 
 The production model includes:
-  1. Green-Ampt infiltration - accurate runoff during storms
-  2. FAO-56 dual Kc - proper ET partitioning by growth stage
-  3. Feddes root uptake - realistic drought stress timing
-  4. Darcy vertical flux - correct soil water redistribution
-  5. Capillary rise - dry season moisture from water table
+  1. Van Genuchten water retention curves
+  2. Darcy-based drainage
+  3. FAO-56 evapotranspiration partitioning
+  4. Root zone water uptake
+  5. Multi-layer soil profile simulation
 
 Legacy Models (for testing/comparison only):
-- TwoBucketWaterBalance: Simple 2-layer, fast but less accurate
-- ThreeLayerWaterBalance: Simple 3-layer, used in initial ISMN validation
+- SimpleWaterBalance: Current production model with configurable complexity
 
 Supporting Modules:
-- soil_hydraulics: Van Genuchten, Feddes, hydraulic functions
-- infiltration: Green-Ampt model
-- evapotranspiration: FAO-56 dual Kc model
-- root_uptake: Feddes root water uptake
-- vertical_flux: Darcy-based percolation and capillary rise
-- crop_development: GDD-based phenology and root growth
+- soil_hydraulics: Van Genuchten, hydraulic functions
 - pedotransfer: PTFs with tropical corrections
+- adaptive_calibration: Site-specific parameter adjustments
 
-Note: The legacy TwoBucketWaterBalance and ThreeLayerWaterBalance have been
-replaced by EnhancedWaterBalance which provides full physics capabilities.
-Use create_water_balance_model() for the recommended production model.
+Note: The SimpleWaterBalance model provides the recommended physics capabilities.
+Use create_water_balance_model() for the production model.
 """
 from smps.physics.pedotransfer import (
     TextureClass,
@@ -85,13 +79,6 @@ from smps.physics.vertical_flux import (
     VerticalFluxResult,
     LayerState,
 )
-from smps.physics.enhanced_water_balance import (
-    EnhancedWaterBalance,
-    EnhancedModelParameters,
-    EnhancedLayerState,
-    EnhancedFluxes,
-    create_enhanced_model,
-)
 
 # Gap 7: Dynamic crop development
 from smps.physics.crop_development import (
@@ -114,6 +101,27 @@ from smps.physics.numerical_solver import (
     AdaptiveWaterBalanceSolver,
     create_adaptive_solver,
     validate_mass_balance,
+)
+
+# Adaptive calibration and improved physics (v2.4)
+from smps.physics.adaptive_calibration import (
+    AdaptivePhysicsCalibrator,
+    AdaptiveCalibrationParameters,
+    SiteCharacteristics,
+    ClimateZone,
+    LandCoverType,
+    create_site_calibrator,
+    tropical_ptf_van_genuchten,
+)
+
+# Simple water balance model (current production model)
+from smps.physics.simple_water_balance import (
+    SimpleWaterBalance,
+    ModelConfig,
+    LayerConfig,
+    SoilHydraulicParams,
+    create_simple_config_improved,
+    create_simple_config,
 )
 
 __all__ = [
@@ -164,13 +172,6 @@ __all__ = [
     "VerticalFluxResult",
     "LayerState",
 
-    # Enhanced model (v2)
-    "EnhancedWaterBalance",
-    "EnhancedModelParameters",
-    "EnhancedLayerState",
-    "EnhancedFluxes",
-    "create_enhanced_model",
-
     # Crop development (v2.1 - Gap 7)
     "GrowthStage",
     "PhenologyParameters",
@@ -189,6 +190,14 @@ __all__ = [
     "AdaptiveWaterBalanceSolver",
     "create_adaptive_solver",
     "validate_mass_balance",
+
+    # Simple water balance model (current production)
+    "SimpleWaterBalance",
+    "ModelConfig",
+    "LayerConfig",
+    "SoilHydraulicParams",
+    "create_simple_config_improved",
+    "create_simple_config",
 
     # Main factory function (RECOMMENDED)
     "create_water_balance_model",
@@ -214,161 +223,67 @@ def create_water_balance_model(
     """
     Create a water balance model for soil moisture prediction.
 
-    This is the RECOMMENDED way to create a model for farmer-facing
-    prediction systems. By default, it creates the full-physics model
-    for maximum accuracy.
+    This creates the SimpleWaterBalance model which provides physics-based
+    soil moisture predictions with configurable complexity.
 
     Args:
-        crop_type: Crop type for root parameters ("maize", "wheat", etc.)
+        crop_type: Crop type for root parameters ("maize", "wheat", etc.) - currently not used
         n_layers: Number of soil layers (default: 3 for 0-100cm)
         soil_texture: Soil texture class ("sand", "loam", "clay", etc.)
-        use_full_physics: If True (default), use EnhancedWaterBalance.
-                         If False, use simpler ThreeLayerWaterBalance.
+        use_full_physics: If True (default), use full physics. If False, use simpler settings.
+        soil_params: Optional soil parameters dict with sand_pct, clay_pct, etc.
         **kwargs: Additional parameters passed to model
 
     Returns:
-        Water balance model instance
+        SimpleWaterBalance model instance
 
     Example:
         >>> model = create_water_balance_model(crop_type="maize")
-        >>> result, fluxes = model.run_daily(
+        >>> fluxes, output_theta = model.run_daily(
         ...     precipitation_mm=15.0,
         ...     et0_mm=5.0,
-        ...     ndvi=0.6
+        ...     ndvi=0.6,
+        ...     irrigation_mm=5.0  # NEW: Irrigation water input
         ... )
-        >>> print(f"Soil moisture: {result.theta_surface:.3f} m³/m³")
+        >>> print(f"Soil moisture: {output_theta:.3f} m³/m³")
     """
-    if use_full_physics:
-        # Production model with full physics
-        from smps.physics.soil_hydraulics import VanGenuchtenParameters
-
-        # Honor explicit user-provided VG parameters.
-        explicit_vg_params = kwargs.pop("vg_params", None)
-
-        if soil_params is not None:
-            params = EnhancedModelParameters.from_soil_parameters(
-                soil_params,
-                crop_type=crop_type,
-                **kwargs,
-            )
-
-        elif explicit_vg_params is not None:
-            params = EnhancedModelParameters(
-                n_layers=n_layers,
-                crop_type=crop_type,
-                vg_params=list(explicit_vg_params),
-                use_green_ampt=True,
-                use_fao56_dual=True,
-                use_feddes_uptake=True,
-                use_darcy_flux=True,
-                enable_capillary_rise=True,
-                **kwargs,
-            )
-
-        else:
-            # If requested, build VG params using pedotransfer functions.
-            if soil_param_method.lower() in {"saxton", "rosetta", "tropical"}:
-                from smps.physics.pedotransfer import (
-                    estimate_soil_parameters_saxton,
-                    estimate_soil_parameters_rosetta,
-                    estimate_soil_parameters_tropical,
-                )
-
-                sand_percent = kwargs.pop("sand_percent", None)
-                clay_percent = kwargs.pop("clay_percent", None)
-                organic_matter_percent = kwargs.pop(
-                    "organic_matter_percent", 2.0)
-
-                if sand_percent is None or clay_percent is None:
-                    raise ValueError(
-                        "sand_percent and clay_percent are required when soil_param_method is saxton/rosetta/tropical"
-                    )
-
-                method = soil_param_method.lower()
-                if method == "saxton":
-                    sp = estimate_soil_parameters_saxton(
-                        sand_percent=sand_percent,
-                        clay_percent=clay_percent,
-                        organic_matter_percent=organic_matter_percent,
-                    )
-                elif method == "rosetta":
-                    sp = estimate_soil_parameters_rosetta(
-                        sand_percent=sand_percent,
-                        clay_percent=clay_percent,
-                        organic_matter_percent=organic_matter_percent,
-                    )
-                else:
-                    sp = estimate_soil_parameters_tropical(
-                        sand_percent=sand_percent,
-                        clay_percent=clay_percent,
-                        organic_matter_percent=organic_matter_percent,
-                    )
-
-                params = EnhancedModelParameters.from_soil_parameters(
-                    sp,
-                    crop_type=crop_type,
-                    **kwargs,
-                )
-            else:
-                vg_params = [
-                    VanGenuchtenParameters.from_texture_class(soil_texture)
-                    for _ in range(n_layers)
-                ]
-
-                params = EnhancedModelParameters(
-                    n_layers=n_layers,
-                    crop_type=crop_type,
-                    vg_params=vg_params,
-                    use_green_ampt=True,
-                    use_fao56_dual=True,
-                    use_feddes_uptake=True,
-                    use_darcy_flux=True,
-                    enable_capillary_rise=True,
-                    **kwargs
-                )
-
-        # Optional per-profile calibration multipliers
-        if (theta_s_adj != 1.0) or (Ks_adj != 1.0) or (alpha_adj != 1.0):
-            params.vg_params = [
-                vg.with_multipliers(
-                    theta_s_adj=theta_s_adj,
-                    Ks_adj=Ks_adj,
-                    alpha_adj=alpha_adj,
-                )
-                for vg in params.vg_params
-            ]
-
-        return EnhancedWaterBalance(params)
+    # Extract soil parameters
+    if soil_params is not None:
+        sand_percent = soil_params.get(
+            'sand_pct', soil_params.get('sand_percent', 40))
+        clay_percent = soil_params.get(
+            'clay_pct', soil_params.get('clay_percent', 20))
     else:
-        # Simplified model uses same EnhancedWaterBalance but with simpler settings
-        from smps.physics.soil_hydraulics import VanGenuchtenParameters
+        # Default soil parameters based on texture
+        texture_defaults = {
+            'sand': (90, 5),
+            'loamy_sand': (80, 10),
+            'sandy_loam': (65, 15),
+            'loam': (40, 20),
+            'silt_loam': (20, 25),
+            'sandy_clay_loam': (55, 30),
+            'clay_loam': (35, 35),
+            'silty_clay_loam': (15, 40),
+            'sandy_clay': (50, 45),
+            'silty_clay': (10, 50),
+            'clay': (20, 60)
+        }
+        sand_percent, clay_percent = texture_defaults.get(
+            soil_texture.lower(), (40, 20))
 
-        explicit_vg_params = kwargs.pop("vg_params", None)
+    # Create model config
+    config = create_simple_config_improved(
+        sand_percent=sand_percent,
+        clay_percent=clay_percent,
+        output_depth_m=0.10,
+        # SimpleWaterBalance works best with fewer layers
+        n_layers=min(n_layers, 5),
+        max_depth_m=1.0,
+        vegetation_fraction=kwargs.get('vegetation_fraction', 0.5),
+        latitude=kwargs.get('latitude'),
+        longitude=kwargs.get('longitude'),
+        use_tropical_ptf=True,
+        apply_adaptive_calibration=use_full_physics,
+    )
 
-        vg_params = list(explicit_vg_params) if explicit_vg_params is not None else [
-            VanGenuchtenParameters.from_texture_class(soil_texture)
-            for _ in range(n_layers)
-        ]
-
-        if (theta_s_adj != 1.0) or (Ks_adj != 1.0) or (alpha_adj != 1.0):
-            vg_params = [
-                vg.with_multipliers(
-                    theta_s_adj=theta_s_adj,
-                    Ks_adj=Ks_adj,
-                    alpha_adj=alpha_adj,
-                )
-                for vg in vg_params
-            ]
-
-        params = EnhancedModelParameters(
-            n_layers=n_layers,
-            crop_type=crop_type,
-            vg_params=vg_params,
-            use_green_ampt=False,  # Simpler infiltration
-            use_fao56_dual=False,  # Simpler ET
-            use_feddes_uptake=False,  # No stress function
-            use_darcy_flux=False,  # Simple drainage
-            enable_capillary_rise=False,
-            **kwargs
-        )
-        return EnhancedWaterBalance(params)
+    return SimpleWaterBalance(config)

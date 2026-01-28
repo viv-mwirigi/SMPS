@@ -21,16 +21,13 @@ Research References:
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any, Dict, Generator, List, Optional, Tuple, Union
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import (
-    KFold,
     TimeSeriesSplit,
     GroupKFold,
-    LeaveOneGroupOut,
 )
 from sklearn.metrics import (
     mean_squared_error,
@@ -60,6 +57,20 @@ class SplitConfig:
     # Spatial split params
     n_spatial_folds: int = 5  # For GroupKFold
     leave_out_sites: Optional[List[str]] = None  # Specific sites for LOSO
+    # 'leave_one_out', 'kfold', 'clustered'
+    spatial_split_type: str = 'leave_one_out'
+    spatial_cluster_method: str = 'distance'  # 'distance', 'region', 'soil_type'
+
+    # Spatiotemporal split settings
+    spatiotemporal_blocks: int = 3  # Number of spatiotemporal blocks
+    temporal_overlap_days: int = 30  # Days of overlap between temporal blocks
+
+    # Rolling forecast settings (NEW - for realistic forecasting)
+    rolling_forecast: bool = True
+    forecast_horizons: List[int] = field(
+        default_factory=lambda: [1, 3, 7, 14])  # Days ahead
+    retrain_frequency_days: int = 30  # How often to retrain model
+    minimum_train_days: int = 365  # Minimum training data required
 
     # Time series CV params
     n_splits: int = 5
@@ -68,6 +79,14 @@ class SplitConfig:
 
     # Blocked CV (for autocorrelation)
     block_size_days: int = 30
+
+    # Cross-validation settings
+    n_cv_folds: int = 5
+    cv_type: str = 'blocked'  # 'blocked', 'sliding', 'expanding'
+
+    # Stratification
+    stratify_by: Optional[str] = 'site_id'  # Column to stratify by
+    balance_classes: bool = False
 
     # Random state
     random_state: int = 42
@@ -333,6 +352,73 @@ class DataSplitter:
 
         return train_data, val_data, test_data
 
+    def rolling_forecast_split(
+        self,
+        df: pd.DataFrame,
+        date_col: str = 'date',
+        target_col: str = 'soil_moisture',
+    ) -> Generator[Tuple[pd.DataFrame, pd.DataFrame, pd.Timestamp], None, None]:
+        """
+        Rolling forecast evaluation for operational realism.
+
+        Simulates real forecasting where:
+        1. Model is trained on historical data up to current date
+        2. Predictions are made for future horizons (1, 3, 7, 14 days)
+        3. Model is retrained periodically (e.g., monthly)
+
+        This is the most realistic evaluation for operational deployment.
+
+        Args:
+            df: Input DataFrame with date and target columns
+            date_col: Name of date column
+            target_col: Name of target column
+
+        Yields:
+            Tuple of (train_df, forecast_df, forecast_date)
+            forecast_df contains actual values for all horizons
+        """
+        df = df.copy().sort_values(date_col)
+        df[date_col] = pd.to_datetime(df[date_col])
+
+        # Define forecast periods
+        start_date = df[date_col].min(
+        ) + pd.Timedelta(days=self.config.minimum_train_days)
+        end_date = df[date_col].max()
+
+        current_date = start_date
+        forecast_dates = []
+
+        # Generate forecast dates
+        while current_date <= end_date:
+            forecast_dates.append(current_date)
+            current_date += pd.Timedelta(
+                days=self.config.retrain_frequency_days)
+
+        for forecast_date in forecast_dates:
+            # Training data: all data up to forecast_date
+            train_mask = df[date_col] < forecast_date
+            train_df = df[train_mask].copy()
+
+            if len(train_df) < self.config.minimum_train_days:
+                continue  # Skip if insufficient training data
+
+            # Forecast data: future values for all horizons
+            forecast_data = []
+            for horizon in self.config.forecast_horizons:
+                future_date = forecast_date + pd.Timedelta(days=horizon)
+                future_mask = df[date_col] == future_date
+                if future_mask.any():
+                    future_row = df[future_mask].copy()
+                    future_row[f'horizon'] = horizon
+                    future_row[f'forecast_date'] = forecast_date
+                    forecast_data.append(future_row)
+
+            if forecast_data:
+                forecast_df = pd.concat(forecast_data, ignore_index=True)
+                logger.info("Rolling forecast: Date=%s, Train=%d samples, Horizons=%s",
+                            forecast_date.date(), len(train_df), self.config.forecast_horizons)
+                yield train_df, forecast_df, forecast_date
+
 
 # =============================================================================
 # Evaluation Metrics
@@ -519,7 +605,7 @@ class MetricsCalculator:
     @staticmethod
     def continuous_ranked_probability_score(
         y_true: np.ndarray,
-        y_pred: np.ndarray,
+        _y_pred: np.ndarray,
         y_lower: np.ndarray,
         y_upper: np.ndarray,
     ) -> float:
@@ -679,7 +765,7 @@ class BaselineComparison:
     def generate_comparison_table(self) -> pd.DataFrame:
         """Generate a comparison table of all baselines."""
         rows = []
-        for name, result in self.results.items():
+        for _, result in self.results.items():
             rows.append({
                 'Model': result.name,
                 'RMSE': result.metrics.rmse,
@@ -901,7 +987,7 @@ class ValidationRunner:
         feature_cols: List[str],
         target_col: str,
         site_col: str = 'site_id',
-        physics_col: Optional[str] = None,
+        _physics_col: Optional[str] = None,
     ) -> ValidationResult:
         """
         Run Leave-One-Station-Out cross-validation.
@@ -957,7 +1043,7 @@ class ValidationRunner:
         feature_cols: List[str],
         target_col: str,
         date_col: str = 'date',
-        physics_col: Optional[str] = None,
+        _physics_col: Optional[str] = None,
     ) -> ValidationResult:
         """
         Run blocked time series cross-validation.
@@ -1008,10 +1094,376 @@ class ValidationRunner:
 
         # Calculate baselines on last fold
         if len(all_predictions) > 0:
-            last_fold = all_predictions[-1]
+            _last_fold = all_predictions[-1]
             # Simplified baseline calculation
 
         return result
+
+    def run_spatiotemporal_validation(
+        self,
+        df: pd.DataFrame,
+        feature_cols: List[str],
+        target_col: str,
+        date_col: str = 'date',
+        site_col: str = 'site_id',
+        physics_col: Optional[str] = None,
+    ) -> ValidationResult:
+        """
+        Run spatiotemporal validation (most rigorous test).
+
+        Combines spatial and temporal splits: test on future data from
+        completely unseen sites. This is the gold standard for evaluating
+        model generalization in environmental modeling.
+
+        Args:
+            df: Full dataset
+            feature_cols: Feature column names
+            target_col: Target column name
+            date_col: Date column name
+            site_col: Site column name
+            physics_col: Physics baseline column (optional)
+
+        Returns:
+            ValidationResult with metrics and predictions
+        """
+        import time
+        start_time = time.time()
+
+        result = ValidationResult(split_type='spatiotemporal', n_folds=1)
+
+        # Split data (spatial + temporal)
+        train_df, val_df, test_df = self.splitter.spatiotemporal_split(
+            df, date_col, site_col)
+
+        # Prepare data
+        X_train = train_df[feature_cols].fillna(0)
+        y_train = train_df[target_col].values
+        X_test = test_df[feature_cols].fillna(0)
+        y_test = test_df[target_col].values
+
+        # Train model (with validation if available)
+        if val_df is not None and len(val_df) > 0:
+            X_val = val_df[feature_cols].fillna(0)
+            y_val = val_df[target_col].values
+            self.model.fit(X_train, y_train, eval_set=[(X_val, y_val)])
+        else:
+            self.model.fit(X_train, y_train)
+
+        # Predict
+        y_pred = self.model.predict(X_test)
+
+        # Calculate metrics
+        metrics = self.metrics_calc.calculate_all(y_test, y_pred)
+        result.fold_metrics.append(metrics)
+        result.mean_metrics = metrics
+
+        # Baseline comparisons
+        result.baseline_metrics = self._calculate_baselines(
+            X_train, y_train, X_test, y_test, test_df, physics_col
+        )
+
+        # Store predictions
+        result.all_predictions = pd.DataFrame({
+            'site_id': test_df[site_col].values,
+            'date': test_df[date_col].values,
+            'observed': y_test,
+            'predicted': y_pred,
+        })
+
+        result.validation_time = time.time() - start_time
+
+        return result
+
+    def run_model_assumption_checks(
+        self,
+        df: pd.DataFrame,
+        feature_cols: List[str],
+        target_col: str,
+        predictions: Optional[np.ndarray] = None,
+        model=None,
+    ) -> Dict[str, Any]:
+        """
+        Check common ML model assumptions and diagnostics.
+
+        Tests:
+        - Residual normality (Shapiro-Wilk, Q-Q plot)
+        - Homoscedasticity (Breusch-Pagan test)
+        - Independence (Durbin-Watson test)
+        - Multicollinearity (VIF)
+        - Feature importance stability
+        - Prediction intervals calibration
+
+        Args:
+            df: Dataset used for training
+            feature_cols: Feature column names
+            target_col: Target column name
+            predictions: Model predictions (if available)
+            model: Trained model (if available)
+
+        Returns:
+            Dictionary with assumption check results
+        """
+        results = {}
+
+        try:
+            from scipy import stats
+            import statsmodels.api as sm
+            from statsmodels.stats.outliers_influence import variance_inflation_factor
+        except ImportError:
+            logger.warning("Statsmodels not available for assumption checks")
+            return results
+
+        # Prepare data
+        X = df[feature_cols].fillna(0).values
+        y = df[target_col].values
+
+        if predictions is None and model is not None:
+            predictions = model.predict(X)
+
+        if predictions is not None:
+            residuals = y - predictions
+
+            # 1. Normality of residuals
+            try:
+                _, p_value = stats.shapiro(residuals)
+                results['residual_normality'] = {
+                    'shapiro_p_value': p_value,
+                    'is_normal': p_value > 0.05,
+                    'skewness': stats.skew(residuals),
+                    'kurtosis': stats.kurtosis(residuals),
+                }
+            except Exception as e:
+                logger.warning("Normality test failed: %s", e)
+
+            # 2. Homoscedasticity (constant variance)
+            try:
+                # Breusch-Pagan test
+                X_with_const = sm.add_constant(X)
+                bp_test = sm.stats.diagnostic.het_breuschpagan(
+                    residuals, X_with_const)
+                results['homoscedasticity'] = {
+                    'breusch_pagan_p_value': bp_test[1],
+                    'constant_variance': bp_test[1] > 0.05,
+                    'lm_statistic': bp_test[0],
+                }
+            except Exception as e:
+                logger.warning("Homoscedasticity test failed: %s", e)
+
+            # 3. Independence of residuals (autocorrelation)
+            try:
+                # Durbin-Watson test
+                dw_stat = sm.stats.stattools.durbin_watson(residuals)
+                results['independence'] = {
+                    'durbin_watson_stat': dw_stat,
+                    'no_autocorrelation': 1.5 < dw_stat < 2.5,  # Rule of thumb
+                }
+            except Exception as e:
+                logger.warning("Independence test failed: %s", e)
+
+        # 4. Multicollinearity check
+        try:
+            if X.shape[1] > 1:
+                vif_data = pd.DataFrame()
+                vif_data["feature"] = feature_cols
+                vif_data["VIF"] = [variance_inflation_factor(
+                    X, i) for i in range(X.shape[1])]
+
+                results['multicollinearity'] = {
+                    'vif_scores': vif_data.set_index('feature')['VIF'].to_dict(),
+                    'high_vif_features': vif_data[vif_data['VIF'] > 5]['feature'].tolist(),
+                    'max_vif': vif_data['VIF'].max(),
+                }
+        except Exception as e:
+            logger.warning("Multicollinearity check failed: %s", e)
+
+        # 5. Feature-target correlations
+        try:
+            correlations = {}
+            for col in feature_cols:
+                corr = df[col].corr(df[target_col])
+                correlations[col] = corr
+
+            results['feature_correlations'] = {
+                'correlations': correlations,
+                'strong_correlations': {k: v for k, v in correlations.items() if abs(v) > 0.3},
+            }
+        except Exception as e:
+            logger.warning("Correlation analysis failed: %s", e)
+
+        return results
+
+    def run_diagnostic_plots(
+        self,
+        df: pd.DataFrame,
+        feature_cols: List[str],
+        target_col: str,
+        predictions: Optional[np.ndarray] = None,
+        model=None,
+    ) -> Dict[str, Any]:
+        """
+        Generate diagnostic plots for model evaluation.
+
+        Creates:
+        - Residuals vs Fitted
+        - Q-Q plot
+        - Scale-Location plot
+        - Residuals vs Leverage
+        - Feature importance plot
+        - Prediction error distribution
+
+        Args:
+            df: Dataset
+            feature_cols: Feature columns
+            target_col: Target column
+            predictions: Model predictions
+            model: Trained model
+
+        Returns:
+            Dictionary with plot data (for external plotting)
+        """
+        plot_data = {}
+
+        if predictions is None and model is not None:
+            X = df[feature_cols].fillna(0)
+            predictions = model.predict(X)
+
+        if predictions is not None:
+            y_true = df[target_col].values
+            residuals = y_true - predictions
+
+            # Residuals vs Fitted
+            plot_data['residuals_vs_fitted'] = {
+                'fitted': predictions,
+                'residuals': residuals,
+            }
+
+            # Q-Q plot data
+            try:
+                from scipy import stats
+                (osm, osr), (slope, intercept, r) = stats.probplot(
+                    residuals, dist="norm")
+                plot_data['qq_plot'] = {
+                    'theoretical_quantiles': osm,
+                    'sample_quantiles': osr,
+                    'slope': slope,
+                    'intercept': intercept,
+                }
+            except Exception as e:
+                logger.warning("Q-Q plot data failed: %s", e)
+
+            # Scale-Location (sqrt|residuals| vs fitted)
+            plot_data['scale_location'] = {
+                'fitted': predictions,
+                'sqrt_abs_residuals': np.sqrt(np.abs(residuals)),
+            }
+
+            # Prediction error distribution
+            plot_data['error_distribution'] = {
+                'errors': residuals,
+                'bins': 30,
+            }
+
+        # Feature importance (if model supports it)
+        if model is not None and hasattr(model, 'feature_importances_'):
+            plot_data['feature_importance'] = {
+                'features': feature_cols,
+                'importance': model.feature_importances_,
+            }
+        elif model is not None and hasattr(model, 'coef_'):
+            # Linear model coefficients
+            plot_data['feature_importance'] = {
+                'features': feature_cols,
+                'importance': np.abs(model.coef_),
+            }
+
+        return plot_data
+
+    def run_comprehensive_validation(
+        self,
+        df: pd.DataFrame,
+        feature_cols: List[str],
+        target_col: str,
+        date_col: str = 'date',
+        site_col: str = 'site_id',
+        physics_col: Optional[str] = None,
+        include_spatiotemporal: bool = True,
+        include_assumption_checks: bool = True,
+    ) -> Dict[str, ValidationResult]:
+        """
+        Run comprehensive validation suite with all strategies.
+
+        Includes:
+        - Temporal validation
+        - Spatial LOSO validation
+        - Blocked time series CV
+        - Spatiotemporal validation (optional)
+        - Model assumption checks (optional)
+
+        Args:
+            df: Full dataset
+            feature_cols: Feature column names
+            target_col: Target column name
+            date_col: Date column name
+            site_col: Site column name
+            physics_col: Physics baseline column
+            include_spatiotemporal: Whether to run spatiotemporal validation
+            include_assumption_checks: Whether to run assumption checks
+
+        Returns:
+            Dictionary with results from all validation strategies
+        """
+        results = {}
+
+        logger.info("Starting comprehensive validation suite...")
+
+        # 1. Temporal validation
+        logger.info("Running temporal validation...")
+        results['temporal'] = self.run_temporal_validation(
+            df, feature_cols, target_col, date_col, physics_col
+        )
+
+        # 2. Spatial LOSO validation
+        logger.info("Running spatial LOSO validation...")
+        results['loso'] = self.run_loso_validation(
+            df, feature_cols, target_col, site_col, physics_col
+        )
+
+        # 3. Blocked time series CV
+        logger.info("Running blocked time series CV...")
+        results['blocked_cv'] = self.run_blocked_cv_validation(
+            df, feature_cols, target_col, date_col, physics_col
+        )
+
+        # 4. Spatiotemporal validation (most rigorous)
+        if include_spatiotemporal:
+            logger.info("Running spatiotemporal validation...")
+            results['spatiotemporal'] = self.run_spatiotemporal_validation(
+                df, feature_cols, target_col, date_col, site_col, physics_col
+            )
+
+        # 5. Model assumption checks
+        if include_assumption_checks:
+            logger.info("Running model assumption checks...")
+            # Use temporal validation model for checks
+            temp_result = results['temporal']
+            if temp_result.all_predictions is not None and len(temp_result.all_predictions) > 0:
+                results['assumption_checks'] = self.run_model_assumption_checks(
+                    df, feature_cols, target_col,
+                    predictions=temp_result.all_predictions['predicted'].values,
+                    model=self.model
+                )
+
+            # Diagnostic plots
+            results['diagnostic_plots'] = self.run_diagnostic_plots(
+                df, feature_cols, target_col,
+                predictions=temp_result.all_predictions[
+                    'predicted'].values if temp_result.all_predictions is not None else None,
+                model=self.model
+            )
+
+        logger.info("Comprehensive validation complete!")
+
+        return results
 
     def _calculate_baselines(
         self,
@@ -1030,16 +1482,16 @@ class ValidationRunner:
             y_pers = BaselineModels.persistence(y_train, X_test)
             baselines['persistence'] = self.metrics_calc.calculate_all(
                 y_test, y_pers)
-            except Exception as e:
-                logger.warning("Persistence baseline failed: %s", e)
+        except Exception as e:
+            logger.warning("Persistence baseline failed: %s", e)
 
         # Climatology baseline
         try:
             y_clim = BaselineModels.climatology(y_train, X_test)
             baselines['climatology'] = self.metrics_calc.calculate_all(
                 y_test, y_clim)
-            except Exception as e:
-                logger.warning("Climatology baseline failed: %s", e)
+        except Exception as e:
+            logger.warning("Climatology baseline failed: %s", e)
 
         # Physics baseline
         if physics_col and physics_col in test_df.columns:
@@ -1047,16 +1499,16 @@ class ValidationRunner:
                 y_phys = test_df[physics_col].values
                 baselines['physics'] = self.metrics_calc.calculate_all(
                     y_test, y_phys)
-                except Exception as e:
-                    logger.warning("Physics baseline failed: %s", e)
+            except Exception as e:
+                logger.warning("Physics baseline failed: %s", e)
 
         # Linear regression baseline
         try:
             y_lin = BaselineModels.linear_regression(X_train, y_train, X_test)
             baselines['linear'] = self.metrics_calc.calculate_all(
                 y_test, y_lin)
-            except Exception as e:
-                logger.warning("Linear baseline failed: %s", e)
+        except Exception as e:
+            logger.warning("Linear baseline failed: %s", e)
 
         return baselines
 

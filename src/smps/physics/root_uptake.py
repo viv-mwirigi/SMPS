@@ -22,11 +22,13 @@ import logging
 from smps.physics.soil_hydraulics import (
     VanGenuchtenParameters,
     FeddesParameters,
+    DualDomainParameters,
     van_genuchten_psi_from_theta,
     van_genuchten_theta_from_psi,
     van_genuchten_mualem_K,
     feddes_stress_factor,
     s_shape_stress_factor,
+    dual_domain_root_access_factor,
 )
 
 logger = logging.getLogger(__name__)
@@ -78,12 +80,15 @@ class RootDistributionParameters:
 
 @dataclass
 class SoilLayer:
-    """Soil layer for root uptake calculations"""
+    """Soil layer for root uptake calculations with dual-domain support"""
     depth_top: float  # Top of layer (m, from surface)
     depth_bottom: float  # Bottom of layer (m, from surface)
-    theta: float  # Volumetric water content (m³/m³)
+    theta: float  # Total volumetric water content (m³/m³)
     vg_params: VanGenuchtenParameters
     root_fraction: float = 0.0  # Fraction of roots in this layer
+    # Dual-domain parameters
+    dual_params: Optional[DualDomainParameters] = None
+    theta_macro: float = 0.0  # Macropore water content (m³/m³)
 
     @property
     def thickness(self) -> float:
@@ -97,13 +102,44 @@ class SoilLayer:
 
     @property
     def psi(self) -> float:
-        """Matric potential (m)"""
-        return van_genuchten_psi_from_theta(self.theta, self.vg_params)
+        """Matric potential (m) - from micropore domain"""
+        return van_genuchten_psi_from_theta(self.theta_micro, self.vg_params)
+
+    @property
+    def theta_micro(self) -> float:
+        """Micropore water content (m³/m³)"""
+        if self.dual_params is None:
+            return self.theta  # Single domain
+        else:
+            # Total theta = (1-w) * theta_micro + w * theta_macro
+            return (self.theta - self.dual_params.w * self.theta_macro) / (1.0 - self.dual_params.w)
 
     @property
     def K(self) -> float:
         """Unsaturated hydraulic conductivity (m/day)"""
-        return van_genuchten_mualem_K(self.theta, self.vg_params)
+        if self.dual_params is None:
+            return van_genuchten_mualem_K(self.theta, self.vg_params)
+        else:
+            # Use dual-domain conductivity
+            from smps.physics.soil_hydraulics import dual_domain_K_total
+            return dual_domain_K_total(self.theta, self.psi, self.vg_params, self.dual_params)
+
+    @property
+    def root_access_factor(self) -> float:
+        """Root access factor considering dual domains"""
+        if self.dual_params is None:
+            # Single domain - use standard Feddes
+            from smps.physics.soil_hydraulics import FeddesParameters
+            feddes_params = FeddesParameters()  # Default parameters
+            return feddes_stress_factor(self.psi, feddes_params)
+        else:
+            # Dual domain - enhanced access
+            from smps.physics.soil_hydraulics import FeddesParameters
+            feddes_params = FeddesParameters()  # Default parameters
+            return dual_domain_root_access_factor(
+                self.theta_micro, self.theta_macro, self.psi,
+                self.dual_params, feddes_params
+            )
 
 
 def calculate_static_root_distribution(
@@ -250,8 +286,8 @@ def calculate_layer_uptake_feddes(
     if root_fraction <= 0 or T_pot <= 0:
         return 0.0
 
-    # Get stress factor from Feddes function
-    alpha = feddes_stress_factor(layer.psi, feddes_params, T_pot)
+    # Use layer's root access factor (includes dual-domain effects)
+    alpha = layer.root_access_factor
 
     # Layer potential uptake
     uptake = alpha * T_pot * root_fraction
@@ -297,11 +333,8 @@ def calculate_compensatory_uptake(
     if T_pot <= 0:
         return [0.0] * len(layers)
 
-    # Calculate stress factor for each layer
-    alphas = []
-    for layer in layers:
-        alpha = feddes_stress_factor(layer.psi, feddes_params, T_pot)
-        alphas.append(alpha)
+    # Calculate stress factor for each layer using root access factor
+    alphas = [layer.root_access_factor for layer in layers]
 
     # Non-compensated uptake first (to calculate deficit)
     non_comp_uptakes = []

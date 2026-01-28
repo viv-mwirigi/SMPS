@@ -42,13 +42,22 @@ class PhysicsResidualTarget:
     The ML model predicts:
         residual = observation - physics_prior
 
+    Or with delta learning:
+        delta_residual = (observation - physics_prior) - (observation_lag1 - physics_prior_lag1)
+
     Final prediction:
         prediction = physics_prior + ML_residual
+        or with delta: prediction = physics_prior + (physics_prior - physics_prior_lag1) + ML_delta_residual
     """
     target_depth: str  # 'surface', 'root', 'deep'
     observation_col: str  # Column name for observations
     physics_col: str  # Column name for physics prior
     residual_col: str  # Column name for residual (computed)
+
+    # Delta learning: predict change in residual instead of absolute residual
+    use_delta_learning: bool = False
+    observation_lag_col: Optional[str] = None  # Required for delta learning
+    physics_lag_col: Optional[str] = None      # Required for delta learning
 
     # Bounds for predictions
     min_value: float = 0.0
@@ -59,26 +68,77 @@ class PhysicsResidualTarget:
 
 
 @dataclass
+class ReliabilityWeightConfig:
+    """
+    Configuration for reliability-weighted blending.
+
+    Learns weights based on physics performance metrics:
+    - NSE (Nash-Sutcliffe Efficiency)
+    - Rolling RMSE
+    - Bias
+    """
+    # Weight learning method
+    method: str = "nse"  # 'nse', 'rmse', 'bias', 'combined'
+
+    # Smoothing parameters
+    rolling_window_days: int = 30
+    min_samples_for_weight: int = 10
+
+    # Weight bounds
+    min_weight: float = 0.0
+    max_weight: float = 1.0
+
+    # Depth-specific defaults (physics dominance)
+    default_weights: Dict[str, float] = field(default_factory=lambda: {
+        "surface": 0.7,  # Physics good at surface
+        "root": 0.3,     # ML better in root zone
+        "deep": 0.8,     # Physics good at deep
+    })
+
+
+@dataclass
+class QuantileLearnerConfig:
+    """
+    Configuration for quantile regression.
+
+    Trains separate models for different quantiles to capture uncertainty.
+    """
+    quantiles: List[float] = field(default_factory=lambda: [0.1, 0.5, 0.9])
+    use_median_as_prediction: bool = True
+    include_uncertainty_bounds: bool = True
+
+    # Training parameters for quantile models
+    n_estimators: int = 1000
+    learning_rate: float = 0.01
+    max_depth: int = 6
+
+
+@dataclass
 class ResidualLearnerConfig:
     """Configuration for the residual learning model."""
 
     # Model type
     model_type: str = "lightgbm"  # 'lightgbm', 'xgboost', 'catboost'
+    # Global random state used for deterministic behavior (also used by quantile models)
+    random_state: int = 42
 
-    # LightGBM parameters
+    # LightGBM parameters - OPTIMIZED for soil moisture prediction
+    # Key improvements: lower learning rate, stronger regularization, more subsampling
     lightgbm_params: Dict[str, Any] = field(default_factory=lambda: {
         "objective": "regression",
         "metric": "rmse",
         "boosting_type": "gbdt",
-        "num_leaves": 31,
-        "max_depth": 8,
-        "learning_rate": 0.05,
-        "feature_fraction": 0.8,
-        "bagging_fraction": 0.8,
-        "bagging_freq": 5,
-        "min_data_in_leaf": 20,
-        "lambda_l1": 0.1,
-        "lambda_l2": 0.1,
+        "num_leaves": 31,           # 2^5-1, good balance
+        "max_depth": 8,             # Allow deeper patterns
+        "learning_rate": 0.015,     # Slower = better generalization
+        "feature_fraction": 0.65,   # More aggressive feature subsampling
+        "bagging_fraction": 0.65,   # More aggressive row subsampling
+        "bagging_freq": 1,          # Subsample every iteration
+        "min_data_in_leaf": 50,     # More samples per leaf = less overfitting
+        "min_sum_hessian_in_leaf": 1e-3,
+        "lambda_l1": 0.5,           # Stronger L1 for sparsity
+        "lambda_l2": 1.0,           # Stronger L2 for smoothness
+        "min_gain_to_split": 0.01,  # Minimum gain to make a split
         "verbose": -1,
         "n_jobs": -1,
         "random_state": 42,
@@ -99,10 +159,10 @@ class ResidualLearnerConfig:
         "random_state": 42,
     })
 
-    # Training parameters
-    n_estimators: int = 1000
-    early_stopping_rounds: int = 50
-    validation_fraction: float = 0.2
+    # Training parameters - OPTIMIZED
+    n_estimators: int = 2000        # More iterations, rely on early stopping
+    early_stopping_rounds: int = 100  # Longer patience for low learning rate
+    validation_fraction: float = 0.15  # Standard validation split
 
     # Feature selection
     max_features: int = 100
@@ -111,6 +171,16 @@ class ResidualLearnerConfig:
     # Physics constraint
     enforce_bounds: bool = True
     residual_clip_percentile: float = 99.0
+
+    # New: Reliability-weighted blending
+    use_reliability_weighting: bool = True
+    reliability_config: ReliabilityWeightConfig = field(
+        default_factory=ReliabilityWeightConfig)
+
+    # New: Quantile regression for uncertainty
+    use_quantile_regression: bool = True
+    quantile_config: QuantileLearnerConfig = field(
+        default_factory=QuantileLearnerConfig)
 
 
 class ResidualLearner:
@@ -124,7 +194,7 @@ class ResidualLearner:
     - Complex feature interactions
     """
 
-    def __init__(self, config: Optional[ResidualLearnerConfig] = None):
+    def __init__(self, config: Optional["ResidualLearnerConfig"] = None):
         """
         Initialize residual learner.
 
@@ -133,9 +203,14 @@ class ResidualLearner:
         """
         self.config = config or ResidualLearnerConfig()
         self.model = None
+        self.quantile_models = {}  # For quantile regression
         self.scaler = StandardScaler()
         self.feature_names: List[str] = []
         self.feature_importance: Dict[str, float] = {}
+
+        # Reliability weighting
+        self.reliability_weights: Optional[pd.Series] = None
+        self.physics_performance: Dict[str, float] = {}
 
         # Training metadata
         self.training_info: Dict[str, Any] = {}
@@ -149,6 +224,10 @@ class ResidualLearner:
         """
         Compute residual target from observations and physics.
 
+        Supports both absolute residual learning and delta residual learning:
+        - Absolute: residual = observation - physics_prior
+        - Delta: delta_residual = (obs - physics) - (obs_lag1 - physics_lag1)
+
         Args:
             df: DataFrame with observations and physics predictions
             target: Target configuration
@@ -158,14 +237,61 @@ class ResidualLearner:
         """
         result = df.copy()
 
-        # Compute residual where observations exist
-        mask = result[target.observation_col].notna()
+        if target.use_delta_learning:
+            # DELTA LEARNING: Predict change in residual
+            if target.observation_lag_col is None or target.physics_lag_col is None:
+                raise ValueError(
+                    "Delta learning requires observation_lag_col and physics_lag_col")
 
-        result[target.residual_col] = np.nan
-        result.loc[mask, target.residual_col] = (
-            result.loc[mask, target.observation_col] -
-            result.loc[mask, target.physics_col]
-        )
+            # Compute current residual
+            current_mask = result[target.observation_col].notna()
+            result['current_residual'] = np.nan
+            result.loc[current_mask, 'current_residual'] = (
+                result.loc[current_mask, target.observation_col] -
+                result.loc[current_mask, target.physics_col]
+            )
+
+            # Compute lagged residual
+            lag_mask = (result[target.observation_lag_col].notna() &
+                        result[target.physics_lag_col].notna())
+            result['lag_residual'] = np.nan
+            result.loc[lag_mask, 'lag_residual'] = (
+                result.loc[lag_mask, target.observation_lag_col] -
+                result.loc[lag_mask, target.physics_lag_col]
+            )
+
+            # Delta residual = change in residual
+            valid_mask = current_mask & lag_mask
+            result[target.residual_col] = np.nan
+            result.loc[valid_mask, target.residual_col] = (
+                result.loc[valid_mask, 'current_residual'] -
+                result.loc[valid_mask, 'lag_residual']
+            )
+
+            logger.info(
+                "Computed delta residuals for %s: mean=%.4f, std=%.4f",
+                target.target_depth,
+                float(result[target.residual_col].mean()),
+                float(result[target.residual_col].std()),
+            )
+
+        else:
+            # ABSOLUTE RESIDUAL LEARNING
+            # Compute residual where observations exist
+            mask = result[target.observation_col].notna()
+
+            result[target.residual_col] = np.nan
+            result.loc[mask, target.residual_col] = (
+                result.loc[mask, target.observation_col] -
+                result.loc[mask, target.physics_col]
+            )
+
+            logger.info(
+                "Computed absolute residuals for %s: mean=%.4f, std=%.4f",
+                target.target_depth,
+                float(result[target.residual_col].mean()),
+                float(result[target.residual_col].std()),
+            )
 
         # Clip extreme residuals
         if self.config.residual_clip_percentile < 100:
@@ -178,14 +304,207 @@ class ResidualLearner:
                 result[target.residual_col] = result[target.residual_col].clip(
                     lower, upper)
 
+        return result
+
+    def compute_reliability_weights(
+        self,
+        df: pd.DataFrame,
+        target: PhysicsResidualTarget,
+        site_id: Optional[str] = None,
+    ) -> pd.Series:
+        """
+        Compute reliability weights for physics model based on historical performance.
+
+        Args:
+            df: DataFrame with physics predictions and observations
+            target: Target configuration
+            site_id: Optional site filter
+
+        Returns:
+            Series of weights (0-1) where 1 = full physics trust, 0 = full ML trust
+        """
+        if not self.config.use_reliability_weighting:
+            # Return default weights
+            default_weight = self.config.reliability_config.default_weights.get(
+                target.target_depth, 0.5)
+            return pd.Series([default_weight] * len(df), index=df.index)
+
+        # Filter to site if specified
+        work_df = df.copy()
+        if site_id and 'site_id' in df.columns:
+            work_df = df[df['site_id'] == site_id].copy()
+
+        # Need observations and physics predictions
+        obs_col = target.observation_col
+        phys_col = target.physics_col
+
+        if obs_col not in work_df.columns or phys_col not in work_df.columns:
+            default_weight = self.config.reliability_config.default_weights.get(
+                target.target_depth, 0.5)
+            return pd.Series([default_weight] * len(df), index=df.index)
+
+        # Compute performance metrics over rolling window
+        valid_mask = work_df[obs_col].notna() & work_df[phys_col].notna()
+        if valid_mask.sum() < self.config.reliability_config.min_samples_for_weight:
+            default_weight = self.config.reliability_config.default_weights.get(
+                target.target_depth, 0.5)
+            return pd.Series([default_weight] * len(df), index=df.index)
+
+        obs = work_df.loc[valid_mask, obs_col]
+        phys = work_df.loc[valid_mask, phys_col]
+
+        # Compute rolling performance metrics
+        window = self.config.reliability_config.rolling_window_days
+
+        # NSE (Nash-Sutcliffe Efficiency) - higher is better
+        nse = 1 - np.sum((obs - phys)**2) / np.sum((obs - obs.mean())**2)
+
+        # Rolling RMSE (lower is better, so invert)
+        rmse = np.sqrt(np.mean((obs - phys)**2))
+
+        # Bias (absolute bias, lower is better)
+        bias = abs(obs.mean() - phys.mean())
+
+        # Combine metrics based on method
+        method = self.config.reliability_config.method
+        if method == "nse":
+            # NSE: 1 (perfect) -> 0 (no skill)
+            raw_score = max(0, nse)  # Clamp negative NSE to 0
+        elif method == "rmse":
+            # RMSE: invert and normalize (lower RMSE = higher weight)
+            max_rmse = obs.std() * 2  # Rough upper bound
+            raw_score = 1 - min(rmse / max_rmse, 1)
+        elif method == "bias":
+            # Bias: lower bias = higher weight
+            max_bias = obs.std()  # Rough upper bound
+            raw_score = 1 - min(bias / max_bias, 1)
+        elif method == "combined":
+            # Weighted combination
+            nse_score = max(0, nse)
+            rmse_score = 1 - min(rmse / (obs.std() * 2), 1)
+            bias_score = 1 - min(bias / obs.std(), 1)
+            raw_score = (0.5 * nse_score + 0.3 * rmse_score + 0.2 * bias_score)
+        else:
+            raw_score = 0.5
+
+        # Clamp to bounds
+        weight = np.clip(raw_score,
+                         self.config.reliability_config.min_weight,
+                         self.config.reliability_config.max_weight)
+
+        # Store for logging
+        self.physics_performance[target.target_depth] = {
+            'nse': nse,
+            'rmse': rmse,
+            'bias': bias,
+            'weight': weight
+        }
+
         logger.info(
-            "Computed residuals for %s: mean=%.4f, std=%.4f",
-            target.target_depth,
-            float(result[target.residual_col].mean()),
-            float(result[target.residual_col].std()),
+            "Physics reliability for %s: NSE=%.3f, RMSE=%.4f, weight=%.3f",
+            target.target_depth, nse, rmse, weight
         )
 
-        return result
+        # Return weight for all samples (could be made time-varying in future)
+        return pd.Series([weight] * len(df), index=df.index)
+
+    def _fit_quantile_models(
+        self,
+        X_train: pd.DataFrame,
+        y_train: pd.Series,
+        target: PhysicsResidualTarget,
+        site_id: Optional[str] = None,
+    ) -> None:
+        """
+        Fit quantile regression models for uncertainty estimation.
+
+        Args:
+            X_train: Training features
+            y_train: Training targets (residuals)
+            target: Target configuration
+            site_id: Optional site filter
+        """
+        if not self.config.use_quantile_regression:
+            return
+
+        logger.info("Fitting quantile models for %s", target.target_depth)
+
+        # Initialize quantile models dict for this target
+        target_key = f"{target.target_depth}_{site_id}" if site_id else target.target_depth
+        self.quantile_models[target_key] = {}
+
+        # Ensure LightGBM is available for quantile modelling
+        try:
+            import lightgbm as lgb
+        except ImportError:
+            raise ImportError(
+                "LightGBM not installed. Run: pip install lightgbm")
+
+        # Fit models for each quantile
+        for quantile in self.config.quantile_config.quantiles:
+            logger.info("Fitting quantile model for q=%.2f", quantile)
+
+            # Use LightGBM for quantile regression
+            model = lgb.LGBMRegressor(
+                objective='quantile',
+                alpha=quantile,
+                n_estimators=self.config.quantile_config.n_estimators,
+                learning_rate=self.config.quantile_config.learning_rate,
+                max_depth=self.config.quantile_config.max_depth,
+                random_state=self.config.random_state,
+                verbose=-1  # Suppress output
+            )
+
+            # Fit the model
+            model.fit(X_train, y_train)
+
+            # Store the model
+            self.quantile_models[target_key][quantile] = model
+
+            logger.info("Completed quantile model for q=%.2f", quantile)
+
+    def predict_quantile(
+        self,
+        X: pd.DataFrame,
+        target: PhysicsResidualTarget,
+        site_id: Optional[str] = None,
+        quantiles: Optional[List[float]] = None,
+    ) -> pd.DataFrame:
+        """
+        Predict quantiles for uncertainty estimation.
+
+        Args:
+            X: Feature matrix
+            target: Target configuration
+            site_id: Optional site filter
+            quantiles: Quantiles to predict (default: config quantiles)
+
+        Returns:
+            DataFrame with quantile predictions as columns
+        """
+        if not self.config.use_quantile_regression:
+            raise ValueError("Quantile regression not enabled")
+
+        if quantiles is None:
+            quantiles = self.config.quantile_config.quantiles
+
+        target_key = f"{target.target_depth}_{site_id}" if site_id else target.target_depth
+
+        if target_key not in self.quantile_models:
+            raise ValueError(f"No quantile models fitted for {target_key}")
+
+        results = {}
+        for quantile in quantiles:
+            if quantile not in self.quantile_models[target_key]:
+                logger.warning(
+                    "Quantile %.2f not available, skipping", quantile)
+                continue
+
+            model = self.quantile_models[target_key][quantile]
+            pred = model.predict(X)
+            results[f'q_{quantile:.2f}'] = pred
+
+        return pd.DataFrame(results, index=X.index)
 
     def select_features(
         self,
@@ -326,6 +645,12 @@ class ResidualLearner:
             float(self.training_info['val_r2']),
         )
 
+        # Fit quantile models for uncertainty estimation
+        if self.config.use_quantile_regression:
+            X_train_df = pd.DataFrame(X_train, columns=self.feature_names)
+            y_train_series = pd.Series(y_train)
+            self._fit_quantile_models(X_train_df, y_train_series, target)
+
         return self.training_info
 
     def _fit_lightgbm(
@@ -415,16 +740,18 @@ class ResidualLearner:
         self,
         df: pd.DataFrame,
         target: PhysicsResidualTarget,
+        reliability_weights: Optional[pd.Series] = None,
     ) -> np.ndarray:
         """
-        Predict residuals.
+        Predict residuals with optional reliability weighting.
 
         Args:
             df: DataFrame with features
             target: Target configuration
+            reliability_weights: Optional weights for physics-ML blending
 
         Returns:
-            Array of predicted residuals
+            Array of predicted residuals (or blended predictions if weights provided)
         """
         if not self.is_fitted:
             raise RuntimeError("Model not fitted. Call fit() first.")
@@ -439,6 +766,52 @@ class ResidualLearner:
             residuals = self.model.predict(dtest)
         else:
             residuals = self.model.predict(X_scaled)
+
+        # Apply reliability weighting if provided
+        if reliability_weights is not None and self.config.use_reliability_weighting:
+            # Get physics predictions
+            if target.physics_col not in df.columns:
+                logger.warning("Physics column %s not found, using residuals only",
+                               target.physics_col)
+                return residuals
+
+            physics_preds = df[target.physics_col].values
+
+            # Handle delta learning
+            if target.use_delta_learning:
+                if target.physics_lag_col not in df.columns:
+                    logger.warning("Physics lag column %s not found for delta learning",
+                                   target.physics_lag_col)
+                    return residuals
+
+                # Delta prediction: physics + (physics - physics_lag) + delta_residual
+                physics_lag = df[target.physics_lag_col].values
+                physics_change = physics_preds - physics_lag
+                blended = physics_preds + physics_change + residuals
+            else:
+                # Standard blending: prediction = α * physics + (1-α) * (physics + residual)
+                alpha = reliability_weights.values
+                blended = alpha * physics_preds + \
+                    (1 - alpha) * (physics_preds + residuals)
+
+            logger.info(
+                "Applied reliability weighting: α_mean=%.3f", alpha.mean())
+            return blended
+
+        # No reliability weighting - return residuals (or delta residuals)
+        if target.use_delta_learning:
+            # For delta learning, we need to reconstruct the full prediction
+            if target.physics_col not in df.columns or target.physics_lag_col not in df.columns:
+                logger.warning(
+                    "Delta learning requires physics and physics_lag columns")
+                return residuals
+
+            physics_preds = df[target.physics_col].values
+            physics_lag = df[target.physics_lag_col].values
+            physics_change = physics_preds - physics_lag
+
+            # Final prediction = physics + physics_change + delta_residual
+            return physics_preds + physics_change + residuals
 
         return residuals
 
@@ -526,6 +899,22 @@ class HybridSoilMoistureModel:
         self.model_info: Dict[str, Any] = {}
         self.is_fitted = False
 
+    def add_target(
+        self,
+        depth: str,
+        physics_col: str,
+        obs_col: str,
+    ):
+        """Add a target for training."""
+        target = PhysicsResidualTarget(
+            target_depth=depth,
+            observation_col=obs_col,
+            physics_col=physics_col,
+            residual_col=f"residual_{depth}",
+            weight=1.0,
+        )
+        self.targets.append(target)
+
     def fit(
         self,
         df: pd.DataFrame,
@@ -589,7 +978,7 @@ class HybridSoilMoistureModel:
     def _cross_validate(
         self,
         df: pd.DataFrame,
-        learner: ResidualLearner,
+        learner: "ResidualLearner",
         target: PhysicsResidualTarget,
         n_folds: int,
     ) -> Dict[str, Any]:

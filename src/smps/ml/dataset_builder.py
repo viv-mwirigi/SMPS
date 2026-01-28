@@ -83,6 +83,13 @@ class FeatureConfig:
 class DatasetConfig:
     """Configuration for dataset building."""
 
+    # Site configuration
+    site_id: str = "default_site"
+    latitude: float = 0.0
+    longitude: float = 0.0
+    start_date: str = "2020-01-01"
+    end_date: str = "2024-01-01"
+
     # Data sources
     use_spaceiotbox: bool = True
     use_open_meteo_fallback: bool = True
@@ -95,11 +102,11 @@ class DatasetConfig:
     # Quality control
     min_data_coverage: float = 0.8
     max_gap_days: int = 7
-    outlier_sigma: float = 3.0
 
-    # Target configuration
+    # Target configuration (with defaults)
     target_depths_cm: List[int] = field(default_factory=lambda: [10, 30, 50])
     target_variable: str = "soil_moisture_vwc"
+    outlier_sigma: float = 3.0
 
     # Cache settings
     cache_dir: Optional[Path] = None
@@ -312,6 +319,7 @@ class CanonicalDatasetBuilder:
         raw_data = {
             "weather": [],
             "remote_sensing": [],
+            "irrigation": [],  # NEW: Irrigation data
             "agro": {},
             "soil": None,
         }
@@ -356,6 +364,7 @@ class CanonicalDatasetBuilder:
         result = {
             "weather": [],
             "remote_sensing": [],
+            "irrigation": [],  # NEW: Irrigation data
             "agro": {},
         }
 
@@ -391,6 +400,13 @@ class CanonicalDatasetBuilder:
         agro_result = agro_source.fetch(request)
         if agro_result.success:
             result["agro"] = agro_result.data
+
+        # Irrigation data - NEW
+        from smps.data.sources.irrigation import IrrigationDataSource
+        irrigation_source = IrrigationDataSource()
+        irrigation_result = irrigation_source.fetch(request)
+        if irrigation_result.success:
+            result["irrigation"] = irrigation_result.data
 
         return result
 
@@ -562,17 +578,102 @@ class CanonicalDatasetBuilder:
         if 'ndvi' not in forcings.columns:
             forcings['ndvi'] = 0.5  # Default
 
-        forcings['irrigation_mm'] = 0.0  # No irrigation by default
+        # Add irrigation data - NEW
+        irrigation_records = raw_data.get("irrigation", [])
+        if irrigation_records:
+            irrigation_df = pd.DataFrame([
+                r.model_dump() if hasattr(r, 'model_dump') else r.dict()
+                for r in irrigation_records
+            ])
+            irrigation_df['date'] = pd.to_datetime(
+                irrigation_df['timestamp']).dt.date
+            irrigation_df.set_index('date', inplace=True)
+            # Aggregate daily irrigation volume
+            daily_irrigation = irrigation_df.groupby('date')['volume_mm'].sum()
+            forcings['irrigation_mm'] = daily_irrigation.reindex(
+                forcings.index).fillna(0.0)
+        else:
+            forcings['irrigation_mm'] = 0.0  # No irrigation data
 
         # Run model
         try:
-            physics_results = physics_model.run_period(
-                forcings=forcings,
-                warmup_days=min(self.config.physics_warmup_days,
-                                len(forcings) // 4),
-                return_fluxes=self.feature_config.include_physics_fluxes,
-            )
+            # New (preferred) signature: build kwargs dynamically and pass only supported params
+            import inspect
+
+            sig = inspect.signature(physics_model.run_period)
+            params = sig.parameters.keys()
+
+            kwargs = {"ndvi": forcings["ndvi"]}
+
+            # Dates/index argument
+            if "dates" in params:
+                kwargs["dates"] = forcings.index
+            elif "index" in params:
+                kwargs["index"] = forcings.index
+
+            # Precipitation naming variants
+            if "precipitation" in params:
+                kwargs["precipitation"] = forcings["precipitation_mm"]
+            elif "precipitation_mm" in params:
+                kwargs["precipitation_mm"] = forcings["precipitation_mm"]
+            elif "precip" in params:
+                kwargs["precip"] = forcings["precipitation_mm"]
+            else:
+                kwargs["precipitation"] = forcings["precipitation_mm"]
+
+            # ET0 naming variants
+            if "et0" in params:
+                kwargs["et0"] = forcings["et0_mm"]
+            elif "et0_mm" in params:
+                kwargs["et0_mm"] = forcings["et0_mm"]
+            elif "eto" in params:
+                kwargs["eto"] = forcings["et0_mm"]
+            else:
+                kwargs["et0"] = forcings["et0_mm"]
+
+            kwargs["warmup_days"] = min(
+                self.config.physics_warmup_days, len(forcings) // 4)
+
+            # Add irrigation only if supported by the model signature
+            if "irrigation" in params:
+                kwargs["irrigation"] = forcings["irrigation_mm"]
+            elif "irrigation_mm" in params:
+                kwargs["irrigation_mm"] = forcings["irrigation_mm"]
+
+            physics_results = physics_model.run_period(**kwargs)
             return physics_results
+        except TypeError:
+            # Fallback: try again using explicit keyword args matched to detected param names
+            try:
+                sig = inspect.signature(physics_model.run_period)
+                params = sig.parameters.keys()
+                fb_kwargs = {}
+
+                if "dates" in params:
+                    fb_kwargs["dates"] = forcings.index
+                if "precipitation" in params:
+                    fb_kwargs["precipitation"] = forcings["precipitation_mm"]
+                elif "precipitation_mm" in params:
+                    fb_kwargs["precipitation_mm"] = forcings["precipitation_mm"]
+                if "et0" in params:
+                    fb_kwargs["et0"] = forcings["et0_mm"]
+                elif "et0_mm" in params:
+                    fb_kwargs["et0_mm"] = forcings["et0_mm"]
+                if "ndvi" in params:
+                    fb_kwargs["ndvi"] = forcings["ndvi"]
+                if "warmup_days" in params:
+                    fb_kwargs["warmup_days"] = min(
+                        self.config.physics_warmup_days, len(forcings) // 4)
+                if "irrigation" in params:
+                    fb_kwargs["irrigation"] = forcings["irrigation_mm"]
+                elif "irrigation_mm" in params:
+                    fb_kwargs["irrigation_mm"] = forcings["irrigation_mm"]
+
+                physics_results = physics_model.run_period(**fb_kwargs)
+                return physics_results
+            except Exception as e:
+                self.logger.error("Physics model failed (fallback): %s", e)
+                return pd.DataFrame()
         except Exception as e:
             self.logger.error("Physics model failed: %s", e)
             return pd.DataFrame()
@@ -787,6 +888,9 @@ class CanonicalDatasetBuilder:
         # ----- Climate Indices -----
         result = self._add_climate_indices(result)
 
+        # ----- Memory Optimization -----
+        result = self._optimize_memory_usage(result)
+
         return result
 
     def _add_temporal_features(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -828,28 +932,47 @@ class CanonicalDatasetBuilder:
         return result
 
     def _add_lag_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add lagged features for key variables."""
+        """Add extended lagged features for soil memory effects."""
         result = df.copy()
 
-        # Weather lags
-        weather_lag_cols = ['precipitation_mm', 'et0_mm', 'temperature_mean_c']
+        # Extended lag days for soil memory (30-90 day windows)
+        extended_lag_days = [1, 2, 3, 5, 7, 10, 14, 21, 30, 45, 60, 75, 90]
+
+        # Weather lags (extended for climate memory)
+        weather_lag_cols = ['precipitation_mm', 'et0_mm', 'temperature_mean_c',
+                            'relative_humidity_mean', 'vapor_pressure_deficit_kpa']
         for col in weather_lag_cols:
             if col in result.columns:
-                for lag in self.feature_config.lag_days:
+                for lag in extended_lag_days:
                     result[f'{col}_lag{lag}'] = result[col].shift(lag)
 
-        # Physics prior lags
+        # Physics prior lags (extended for model memory)
         physics_lag_cols = ['physics_theta_surface',
                             'physics_theta_root', 'physics_theta_deep']
         for col in physics_lag_cols:
             if col in result.columns:
-                for lag in [1, 3, 7, 14]:
+                for lag in extended_lag_days:
                     result[f'{col}_lag{lag}'] = result[col].shift(lag)
 
-        # Observation lags (if available)
+        # Observation lags (extended for soil memory)
         obs_cols = [c for c in result.columns if c.startswith('obs_vwc_')]
         for col in obs_cols:
-            for lag in [1, 3, 7, 14, 30]:
+            # Very long memory for observations
+            for lag in extended_lag_days + [120, 150, 180]:
+                result[f'{col}_lag{lag}'] = result[col].shift(lag)
+
+        # Remote sensing lags (extended for vegetation memory)
+        rs_lag_cols = ['ndvi', 'evi', 'lai', 'sar_vv_db', 'sar_vh_db']
+        for col in rs_lag_cols:
+            if col in result.columns:
+                for lag in [1, 3, 7, 14, 30, 60, 90]:  # Vegetation phenology memory
+                    result[f'{col}_lag{lag}'] = result[col].shift(lag)
+
+        # Irrigation lags (for irrigation scheduling memory)
+        irrigation_cols = [
+            c for c in result.columns if 'irrigation' in c.lower()]
+        for col in irrigation_cols:
+            for lag in extended_lag_days:
                 result[f'{col}_lag{lag}'] = result[col].shift(lag)
 
         return result
@@ -986,41 +1109,152 @@ class CanonicalDatasetBuilder:
         return result
 
     def _add_ndvi_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add NDVI-derived features."""
+        """Add comprehensive remote sensing features."""
         result = df.copy()
 
-        if 'ndvi' not in result.columns:
-            return result
+        # NDVI features
+        if 'ndvi' in result.columns:
+            # NDVI lags (extended for soil memory)
+            for lag in [0, 7, 14, 30, 60, 90]:  # Extended lags
+                if lag > 0:
+                    result[f'ndvi_lag{lag}'] = result['ndvi'].shift(lag)
+                else:
+                    result['ndvi_current'] = result['ndvi']
 
-        # NDVI lags
-        for lag in self.feature_config.ndvi_lag_days:
-            if lag > 0:
-                result[f'ndvi_lag{lag}'] = result['ndvi'].shift(lag)
+            # NDVI rolling statistics
+            for window in [14, 30, 60, 90]:
+                result[f'ndvi_mean_{window}d'] = (
+                    result['ndvi'].rolling(window, min_periods=1).mean()
+                )
+                result[f'ndvi_std_{window}d'] = (
+                    result['ndvi'].rolling(window, min_periods=1).std()
+                )
+                result[f'ndvi_min_{window}d'] = (
+                    result['ndvi'].rolling(window, min_periods=1).min()
+                )
+                result[f'ndvi_max_{window}d'] = (
+                    result['ndvi'].rolling(window, min_periods=1).max()
+                )
 
-        # NDVI rolling statistics
-        for window in [14, 30]:
-            result[f'ndvi_mean_{window}d'] = (
-                result['ndvi'].rolling(window, min_periods=1).mean()
+            # NDVI trend and derivatives
+            result['ndvi_trend_14d'] = result['ndvi'].diff(14) / 14
+            result['ndvi_trend_30d'] = result['ndvi'].diff(30) / 30
+            result['ndvi_acceleration'] = result['ndvi_trend_14d'].diff(7)
+
+            # NDVI anomaly (relative to seasonal mean)
+            result['ndvi_seasonal_mean'] = result.groupby(
+                'month')['ndvi'].transform('mean')
+            result['ndvi_anomaly'] = result['ndvi'] - \
+                result['ndvi_seasonal_mean']
+
+            # Vegetation fraction and phenology
+            result['vegetation_fraction'] = (
+                (result['ndvi'] - 0.1) / 0.8).clip(0, 1)
+            result['ndvi_greenness_index'] = result['ndvi'] * \
+                result['vegetation_fraction']
+
+        # EVI features (if available)
+        if 'evi' in result.columns:
+            for lag in [0, 7, 14, 30]:
+                col_name = f'evi_lag{lag}' if lag > 0 else 'evi_current'
+                result[col_name] = result['evi'].shift(
+                    lag) if lag > 0 else result['evi']
+
+            result['evi_mean_30d'] = result['evi'].rolling(
+                30, min_periods=1).mean()
+            result['evi_trend_14d'] = result['evi'].diff(14) / 14
+
+        # LAI features (if available)
+        if 'lai' in result.columns:
+            for lag in [0, 7, 14, 30]:
+                col_name = f'lai_lag{lag}' if lag > 0 else 'lai_current'
+                result[col_name] = result['lai'].shift(
+                    lag) if lag > 0 else result['lai']
+
+            result['lai_mean_30d'] = result['lai'].rolling(
+                30, min_periods=1).mean()
+            result['lai_trend_14d'] = result['lai'].diff(14) / 14
+
+            # LAI-based vegetation structure
+            result['lai_density'] = result['lai'] / \
+                (result['vegetation_fraction'] + 0.01)
+
+        # SAR backscatter features (if available)
+        if 'sar_vv_db' in result.columns:
+            # VV backscatter lags
+            for lag in [0, 3, 7, 14]:
+                col_name = f'sar_vv_lag{lag}' if lag > 0 else 'sar_vv_current'
+                result[col_name] = result['sar_vv_db'].shift(
+                    lag) if lag > 0 else result['sar_vv_db']
+
+            # SAR temporal statistics
+            result['sar_vv_mean_7d'] = result['sar_vv_db'].rolling(
+                7, min_periods=1).mean()
+            result['sar_vv_std_7d'] = result['sar_vv_db'].rolling(
+                7, min_periods=1).std()
+            result['sar_vv_trend_7d'] = result['sar_vv_db'].diff(7) / 7
+
+            # SAR soil moisture index (higher backscatter = wetter soil due to water's dielectric constant)
+            # Use change detection approach with normalization
+            vv_min = result['sar_vv_db'].quantile(
+                0.05)  # 5th percentile as minimum
+            vv_max = result['sar_vv_db'].quantile(
+                0.95)  # 95th percentile as maximum
+            result['sar_sm_index'] = (
+                result['sar_vv_db'] - vv_min) / (vv_max - vv_min + 0.001)
+            result['sar_sm_index'] = result['sar_sm_index'].clip(
+                0, 1)  # Ensure 0-1 range
+
+        if 'sar_vh_db' in result.columns:
+            # VH backscatter lags
+            for lag in [0, 3, 7, 14]:
+                col_name = f'sar_vh_lag{lag}' if lag > 0 else 'sar_vh_current'
+                result[col_name] = result['sar_vh_db'].shift(
+                    lag) if lag > 0 else result['sar_vh_db']
+
+            result['sar_vh_mean_7d'] = result['sar_vh_db'].rolling(
+                7, min_periods=1).mean()
+            result['sar_vh_trend_7d'] = result['sar_vh_db'].diff(7) / 7
+
+            # VH/VV ratio (vegetation/soil moisture indicator)
+            if 'sar_vv_db' in result.columns:
+                result['sar_vh_vv_ratio'] = result['sar_vh_db'] / \
+                    (result['sar_vv_db'] + 0.01)
+
+            # VH soil moisture index (similar physics to VV)
+            vh_min = result['sar_vh_db'].quantile(0.05)
+            vh_max = result['sar_vh_db'].quantile(0.95)
+            result['sar_vh_sm_index'] = (
+                result['sar_vh_db'] - vh_min) / (vh_max - vh_min + 0.001)
+            result['sar_vh_sm_index'] = result['sar_vh_sm_index'].clip(0, 1)
+
+        # Optical soil moisture indices (derived from NDVI and other bands if available)
+        if 'ndvi' in result.columns:
+            # NDWI (Normalized Difference Water Index) approximation using NDVI
+            # This is a proxy - real NDWI would use green and NIR bands
+            result['ndwi_proxy'] = (
+                result['vegetation_fraction'] - 0.5) / (result['vegetation_fraction'] + 0.5)
+
+            # Soil moisture optical index (combination of NDVI and other features)
+            result['optical_sm_index'] = result['ndvi'] * \
+                (1 - result.get('ndwi_proxy', 0))
+
+        # Cross-sensor features
+        if all(col in result.columns for col in ['ndvi', 'sar_sm_index']):
+            # NDVI-SAR correlation features (optical vs microwave soil moisture signals)
+            result['ndvi_sar_correlation'] = (
+                result['ndvi'].rolling(14).corr(result['sar_sm_index'])
             )
-            result[f'ndvi_std_{window}d'] = (
-                result['ndvi'].rolling(window, min_periods=1).std()
+
+            # Multi-sensor soil moisture fusion proxy
+            result['multisensor_sm_fusion'] = (
+                0.6 * result['sar_sm_index'] + 0.4 * result['optical_sm_index']
             )
-
-        # NDVI trend
-        result['ndvi_trend_14d'] = result['ndvi'].diff(14) / 14
-
-        # NDVI anomaly (relative to rolling mean)
-        result['ndvi_anomaly'] = result['ndvi'] - \
-            result.get('ndvi_mean_30d', result['ndvi'])
-
-        # Vegetation fraction estimate
-        result['vegetation_fraction'] = (
-            (result['ndvi'] - 0.1) / 0.8).clip(0, 1)
 
         return result
 
     def _add_interaction_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add interaction features between variables."""
+        """Add comprehensive interaction features between variables."""
         result = df.copy()
 
         # Precipitation × soil moisture interactions
@@ -1032,10 +1266,21 @@ class CanonicalDatasetBuilder:
                     (1 - result['physics_theta_root'])
                 )
 
+                # Precipitation effectiveness (reduced by surface sealing when dry)
+                result['precip_effectiveness'] = (
+                    result['precipitation_mm'] /
+                    (1 + np.exp(-5 * (result['physics_theta_root'] - 0.2)))
+                )
+
         # ET × soil moisture interactions
         if 'et0_mm' in result.columns and 'physics_theta_root' in result.columns:
             result['et_stress_ratio'] = (
                 result['et0_mm'] / (result['physics_theta_root'] + 0.01)
+            )
+
+            # ET reduction due to water stress
+            result['et_water_stress_factor'] = (
+                1 / (1 + np.exp(-10 * (result['physics_theta_root'] - 0.1)))
             )
 
         # Temperature × moisture interactions
@@ -1044,16 +1289,104 @@ class CanonicalDatasetBuilder:
                 result['temperature_mean_c'] * result['physics_theta_root']
             )
 
-        # NDVI × soil moisture
+            # Evaporation enhancement in warm, dry conditions
+            result['evaporation_enhancement'] = (
+                result['temperature_mean_c'] *
+                (1 - result['physics_theta_root']) *
+                result.get('wind_speed_mean_m_s', 1.0)
+            )
+
+        # NDVI × soil moisture (vegetation-water coupling)
         if 'ndvi' in result.columns and 'physics_theta_root' in result.columns:
             result['ndvi_moisture_product'] = (
                 result['ndvi'] * result['physics_theta_root']
             )
 
-        # Clay × moisture (drainage indicator)
+            # Vegetation stress indicator
+            result['vegetation_stress'] = (
+                result['ndvi'] * (1 - result['physics_theta_root'])
+            )
+
+        # SAR backscatter × soil moisture (microwave remote sensing coupling)
+        if 'sar_sm_index' in result.columns and 'physics_theta_root' in result.columns:
+            result['sar_moisture_sensitivity'] = (
+                result['sar_sm_index'] * result['physics_theta_root']
+            )
+
+        # Clay × moisture (drainage and retention interactions)
         if 'clay_percent' in result.columns and 'physics_theta_root' in result.columns:
             result['clay_moisture_product'] = (
                 result['clay_percent'] / 100 * result['physics_theta_root']
+            )
+
+            # Clay swelling potential
+            result['clay_swelling_potential'] = (
+                (result['clay_percent'] / 100) *
+                (result['physics_theta_root'] - 0.2).clip(0, 0.3)
+            )
+
+        # Elevation × climate interactions
+        if 'elevation_m' in result.columns:
+            if 'temperature_mean_c' in result.columns:
+                # Lapse rate effect
+                result['elev_temp_lapse'] = (
+                    result['elevation_m'] * result['temperature_mean_c']
+                )
+
+            if 'precipitation_mm' in result.columns:
+                # Orographic precipitation effect
+                result['elev_precip_orographic'] = (
+                    result['elevation_m'] * result['precipitation_mm']
+                )
+
+        # Slope × hydrology interactions
+        if 'slope_degrees' in result.columns:
+            if 'precipitation_mm' in result.columns:
+                # Runoff potential
+                slope_rad = np.sin(np.radians(result['slope_degrees']))
+                result['slope_runoff_potential'] = (
+                    slope_rad * result['precipitation_mm']
+                )
+
+            if 'physics_theta_root' in result.columns:
+                # Lateral flow potential
+                result['slope_lateral_flow'] = (
+                    slope_rad * result['physics_theta_root']
+                )
+
+        # Irrigation × soil interactions
+        irrigation_cols = [
+            c for c in result.columns if 'irrigation' in c.lower()]
+        if irrigation_cols and 'physics_theta_root' in result.columns:
+            irrigation_col = irrigation_cols[0]
+            result['irrigation_efficiency'] = (
+                result[irrigation_col] /
+                (1 - result['physics_theta_root'] + 0.01)
+            )
+
+        # Time-based interactions (seasonal effects)
+        if 'doy_sin' in result.columns and 'doy_cos' in result.columns:
+            if 'ndvi' in result.columns:
+                # Seasonal vegetation development
+                result['seasonal_ndvi_development'] = (
+                    result['doy_sin'] * result['ndvi'] +
+                    result['doy_cos'] * result['ndvi']
+                )
+
+        # Multi-variable compound interactions
+        if all(col in result.columns for col in ['precipitation_mm', 'et0_mm', 'physics_theta_root']):
+            # Water balance stress index
+            result['water_balance_stress'] = (
+                (result['precipitation_mm'] - result['et0_mm']) /
+                (result['physics_theta_root'] + 0.01)
+            )
+
+        if all(col in result.columns for col in ['temperature_mean_c', 'relative_humidity_mean', 'physics_theta_root']):
+            # Atmospheric demand × soil moisture
+            vpd_proxy = result['temperature_mean_c'] * \
+                (1 - result['relative_humidity_mean']/100)
+            result['atmospheric_demand_stress'] = (
+                vpd_proxy / (result['physics_theta_root'] + 0.01)
             )
 
         return result
@@ -1082,6 +1415,146 @@ class CanonicalDatasetBuilder:
                 result['vapor_pressure_deficit_kpa'] /
                 result['vapor_pressure_deficit_kpa'].rolling(30).mean()
             )
+
+        return result
+
+    def _add_data_quality_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add data quality and reliability features.
+
+        Handles sensor heterogeneity, calibration drift, and input reliability.
+        """
+        result = df.copy()
+
+        # Sensor calibration drift detection
+        obs_cols = [c for c in result.columns if c.startswith('obs_vwc_')]
+        for col in obs_cols:
+            if col in result.columns:
+                # Rolling statistics for drift detection
+                result[f'{col}_rolling_mean_30d'] = result[col].rolling(
+                    30, min_periods=10).mean()
+                result[f'{col}_rolling_std_30d'] = result[col].rolling(
+                    30, min_periods=10).std()
+
+                # Anomaly detection (deviation from rolling mean)
+                result[f'{col}_anomaly_score'] = (
+                    np.abs(result[col] - result[f'{col}_rolling_mean_30d']) /
+                    (result[f'{col}_rolling_std_30d'] + 0.001)
+                )
+
+                # Sensor reliability score (lower anomaly = higher reliability)
+                result[f'{col}_reliability'] = 1 / \
+                    (1 + result[f'{col}_anomaly_score'])
+
+        # Weather data quality checks
+        weather_cols = ['precipitation_mm', 'temperature_mean_c', 'et0_mm']
+        for col in weather_cols:
+            if col in result.columns:
+                # Physical bounds checking
+                if col == 'precipitation_mm':
+                    result[f'{col}_quality'] = (result[col] >= 0) & (
+                        result[col] <= 300)  # 0-300mm/day
+                elif col == 'temperature_mean_c':
+                    result[f'{col}_quality'] = (
+                        # -50°C to 60°C
+                        result[col] >= -50) & (result[col] <= 60)
+                elif col == 'et0_mm':
+                    result[f'{col}_quality'] = (result[col] >= 0) & (
+                        result[col] <= 20)  # 0-20mm/day
+
+                # Gap detection
+                result[f'{col}_is_gap'] = result[col].isna()
+                result[f'{col}_gap_length'] = result[f'{col}_is_gap'].rolling(
+                    30).sum()
+
+        # Remote sensing data quality
+        rs_cols = ['ndvi', 'evi', 'lai', 'sar_vv_db', 'sar_vh_db']
+        for col in rs_cols:
+            if col in result.columns:
+                # Satellite data quality indicators
+                result[f'{col}_data_quality'] = (
+                    ~result[col].isna()).astype(int)
+
+                # Temporal consistency check
+                result[f'{col}_temporal_consistency'] = (
+                    np.abs(result[col].diff()) < result[col].rolling(
+                        7).std() * 3
+                ).astype(int)
+
+        # Overall data reliability score
+        quality_cols = [c for c in result.columns if c.endswith('_quality') or
+                        c.endswith('_reliability') or c.endswith('_data_quality')]
+        if quality_cols:
+            result['overall_data_reliability'] = result[quality_cols].mean(
+                axis=1)
+
+        # Sensor type corrections (depth-specific biases)
+        for obs_col in obs_cols:
+            depth_match = obs_col.replace('obs_vwc_', '').replace('cm', '')
+            if depth_match.isdigit():
+                depth = int(depth_match)
+                # Depth-specific correction factors (shallower sensors may be drier)
+                if depth <= 10:  # Surface sensors
+                    result[f'{obs_col}_depth_corrected'] = result[obs_col] * 0.95
+                elif depth >= 50:  # Deep sensors
+                    result[f'{obs_col}_depth_corrected'] = result[obs_col] * 1.05
+                else:  # Root zone
+                    result[f'{obs_col}_depth_corrected'] = result[obs_col]
+
+        return result
+
+    def _optimize_memory_usage(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Optimize memory usage for large datasets.
+
+        Implements several strategies:
+        1. Downcast numeric types
+        2. Remove redundant features
+        3. Compress categorical data
+        4. Chunked processing for very large datasets
+        """
+        result = df.copy()
+        initial_memory = result.memory_usage(deep=True).sum() / 1024**2  # MB
+
+        # Downcast numeric types
+        for col in result.select_dtypes(include=['float64']).columns:
+            result[col] = pd.to_numeric(result[col], downcast='float')
+
+        for col in result.select_dtypes(include=['int64']).columns:
+            result[col] = pd.to_numeric(result[col], downcast='integer')
+
+        # Remove features with too many NaN values (>90%)
+        nan_threshold = 0.9
+        nan_ratios = result.isnull().mean()
+        cols_to_drop = nan_ratios[nan_ratios > nan_threshold].index.tolist()
+        if cols_to_drop:
+            result = result.drop(columns=cols_to_drop)
+            logger.info(
+                f"Dropped {len(cols_to_drop)} columns with >{nan_threshold*100}% NaN values")
+
+        # Remove highly correlated features (correlation > 0.95)
+        numeric_cols = result.select_dtypes(include=[np.number]).columns
+        if len(numeric_cols) > 100:  # Only for large feature sets
+            corr_matrix = result[numeric_cols].corr().abs()
+            upper = corr_matrix.where(
+                np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+            to_drop = [column for column in upper.columns if any(
+                upper[column] > 0.95)]
+            if to_drop:
+                result = result.drop(columns=to_drop)
+                logger.info(
+                    f"Dropped {len(to_drop)} highly correlated features")
+
+        # Compress categorical features
+        for col in result.select_dtypes(include=['object', 'category']).columns:
+            if result[col].nunique() / len(result) < 0.01:  # Low cardinality
+                result[col] = result[col].astype('category')
+
+        final_memory = result.memory_usage(deep=True).sum() / 1024**2  # MB
+        compression_ratio = initial_memory / final_memory if final_memory > 0 else 1.0
+
+        logger.info(f"Memory optimization: {initial_memory:.1f}MB -> {final_memory:.1f}MB "
+                    f"({compression_ratio:.1f}x compression)")
 
         return result
 
@@ -1183,6 +1656,135 @@ class CanonicalDatasetBuilder:
         )
 
         return result
+
+    def preprocess_for_ml(self, df: pd.DataFrame, feature_cols: List[str],
+                          target_col: str) -> Tuple[pd.DataFrame, pd.Series]:
+        """
+        Comprehensive data preprocessing with domain knowledge for ML training.
+
+        Args:
+            df: Raw dataframe
+            feature_cols: Feature column names
+            target_col: Target column name
+
+        Returns:
+            Preprocessed features and target
+        """
+        from sklearn.impute import KNNImputer
+        from sklearn.preprocessing import RobustScaler
+
+        logger.info("Starting comprehensive data preprocessing...")
+
+        # 1. Data Cleaning
+        df_clean = df.copy()
+
+        # Remove unrealistic soil moisture values
+        soil_moisture_bounds = (0.0, 0.6)
+        if target_col in df_clean.columns:
+            mask = (df_clean[target_col] >= soil_moisture_bounds[0]) & \
+                   (df_clean[target_col] <= soil_moisture_bounds[1])
+            df_clean = df_clean[mask]
+            logger.info(
+                f"Removed {len(df) - len(df_clean)} unrealistic target values")
+
+        # 2. Handle Missing Values with Domain Knowledge
+        # For weather features: interpolate temporally
+        weather_cols = [c for c in feature_cols if any(x in c.lower() for x in
+                                                       ['temp', 'precip', 'humidity', 'wind', 'radiation'])]
+        for col in weather_cols:
+            if col in df_clean.columns:
+                df_clean[col] = df_clean[col].interpolate(
+                    method='linear', limit=3)
+
+        # For satellite features: use spatial-temporal interpolation
+        satellite_cols = [c for c in feature_cols if any(x in c.lower() for x in
+                                                         ['ndvi', 'satellite', 'gee'])]
+        for col in satellite_cols:
+            if col in df_clean.columns:
+                df_clean[col] = df_clean[col].interpolate(
+                    method='linear', limit=7)
+
+        # For soil features: use KNN imputation
+        soil_cols = [c for c in feature_cols if any(x in c.lower() for x in
+                                                    ['soil', 'sand', 'clay', 'bulk'])]
+        if soil_cols:
+            imputer = KNNImputer(n_neighbors=5)
+            existing_soil_cols = [
+                c for c in soil_cols if c in df_clean.columns]
+            if existing_soil_cols:
+                df_clean[existing_soil_cols] = imputer.fit_transform(
+                    df_clean[existing_soil_cols])
+
+        # Fill remaining NaNs with median for numeric features
+        numeric_cols = df_clean[feature_cols].select_dtypes(
+            include=[np.number]).columns
+        for col in numeric_cols:
+            if df_clean[col].isna().any():
+                median_val = df_clean[col].median()
+                df_clean[col] = df_clean[col].fillna(median_val)
+
+        # 3. Outlier Detection and Treatment (Domain-specific)
+        for col in feature_cols:
+            if col in df_clean.columns and df_clean[col].dtype in ['float64', 'int64']:
+                # Use IQR method but with domain constraints
+                Q1 = df_clean[col].quantile(0.25)
+                Q3 = df_clean[col].quantile(0.75)
+                IQR = Q3 - Q1
+
+                # Domain-specific bounds
+                if 'precip' in col.lower():
+                    upper_bound = Q3 + 3 * IQR  # Allow heavy rainfall
+                    lower_bound = 0  # No negative precipitation
+                elif 'temp' in col.lower():
+                    upper_bound = Q3 + 2 * IQR
+                    lower_bound = Q1 - 2 * IQR
+                else:
+                    upper_bound = Q3 + 1.5 * IQR
+                    lower_bound = Q1 - 1.5 * IQR
+
+                # Clip outliers
+                df_clean[col] = df_clean[col].clip(lower_bound, upper_bound)
+
+        # 4. Feature Engineering
+        df_clean = self._add_domain_features(df_clean, feature_cols)
+
+        # 5. Normalization/Standardization
+        # Use RobustScaler for features (handles outliers better than StandardScaler)
+        scaler = RobustScaler()
+        feature_data = df_clean[feature_cols].values
+        feature_data_scaled = scaler.fit_transform(feature_data)
+
+        X = pd.DataFrame(feature_data_scaled,
+                         columns=feature_cols, index=df_clean.index)
+        y = df_clean[target_col] if target_col in df_clean.columns else None
+
+        logger.info(
+            f"Preprocessing complete: {len(X)} samples, {len(feature_cols)} features")
+        return X, y
+
+    def _add_domain_features(self, df: pd.DataFrame, feature_cols: List[str]) -> pd.DataFrame:
+        """Add domain-specific features for soil moisture prediction."""
+        # Water balance indicators
+        if 'precip_mm' in df.columns and 'et_mm' in df.columns:
+            df['net_water_input'] = df['precip_mm'] - df['et_mm']
+            if 'net_water_input' not in feature_cols:
+                feature_cols.append('net_water_input')
+
+        # Soil moisture memory (exponential decay)
+        soil_moisture_cols = [
+            c for c in df.columns if 'sm_' in c and '_lag' in c]
+        for col in soil_moisture_cols:
+            # Extract depth from column name (e.g., 'obs_sm_surface_lag1' -> 'surface')
+            parts = col.split('_')
+            depth_idx = parts.index('sm') + 1 if 'sm' in parts else 1
+            depth = parts[depth_idx] if depth_idx < len(parts) else 'surface'
+            decay_col = f'{depth}_memory'
+            df[decay_col] = df[col] * \
+                np.exp(-np.arange(len(df)) / 7)  # 7-day memory
+            if decay_col not in feature_cols:
+                feature_cols.append(decay_col)
+
+        return df
 
     def _calculate_coverage(self, df: pd.DataFrame) -> float:
         """Calculate overall data coverage."""

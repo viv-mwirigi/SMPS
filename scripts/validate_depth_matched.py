@@ -26,9 +26,10 @@ from smps.data.sources.ismn_loader import ISMNStationLoader, ISMNStationData
 from smps.data.sources.weather import OpenMeteoSource
 from smps.data.sources.base import DataFetchRequest
 from smps.core.types import SiteID, SoilParameters
-from smps.physics.enhanced_water_balance import (
-    EnhancedWaterBalance,
-    EnhancedModelParameters,
+from smps.physics.simple_water_balance import (
+    SimpleWaterBalance,
+    ModelConfig,
+    create_simple_config_improved,
 )
 
 warnings.filterwarnings('ignore')
@@ -158,11 +159,6 @@ def run_model_for_station(station: ISMNStationData,
     start_date = dates.min().date()
     end_date = dates.max().date()
 
-    # Create model with default layer configuration
-    # 0-10, 10-30, 30-50, 50-75, 75-100 cm
-    layer_depths_m = [0.10, 0.20, 0.20, 0.25, 0.25]
-    layer_centers = get_model_layer_centers(layer_depths_m)
-
     # Default soil parameters (can be improved with actual soil data)
     soil_params = SoilParameters(
         sand_percent=40.0,
@@ -176,17 +172,31 @@ def run_model_for_station(station: ISMNStationData,
         bulk_density_g_cm3=1.35
     )
 
-    try:
-        # Create model parameters
-        model_params = EnhancedModelParameters.from_soil_parameters(
-            soil_params=soil_params,
-            layer_depths_m=layer_depths_m,
-            crop_type='grassland',
-            use_depth_dependent_properties=True
-        )
+    # Create model with default layer configuration
+    # Get layer centers from the model config
+    config = create_simple_config_improved(
+        sand_percent=soil_params.sand_percent,
+        clay_percent=soil_params.clay_percent,
+        output_depth_m=0.10,  # Default output depth
+        n_layers=5,  # Use 5 layers like before
+        max_depth_m=1.0,  # 1 meter profile
+        vegetation_fraction=0.5,  # Default vegetation fraction
+        latitude=station.latitude,
+        longitude=station.longitude,
+        use_tropical_ptf=True,
+        apply_adaptive_calibration=True,
+    )
 
+    # Calculate layer centers from config
+    layer_centers = []
+    for layer in config.layers:
+        center_m = (layer.depth_top_m + layer.depth_bottom_m) / 2
+        layer_centers.append(center_m * 100)  # Convert to cm
+    layer_centers = np.array(layer_centers)
+
+    try:
         # Initialize model
-        model = EnhancedWaterBalance(model_params)
+        model = SimpleWaterBalance(config)
 
         # Fetch weather
         site_id = SiteID(station.station_id)
@@ -207,12 +217,11 @@ def run_model_for_station(station: ISMNStationData,
         # Run model day by day
         predictions = []
         for w in weather:
-            result = model.step(
-                date=w.date,
+            fluxes, output_theta = model.run_daily(
                 precipitation_mm=w.precipitation_mm,
                 et0_mm=w.et0_mm or 4.0,
+                ndvi=0.4,  # Default NDVI
                 temperature_mean_c=w.temperature_mean_c or 25.0,
-                ndvi=0.4  # Default NDVI
             )
 
             # Get layer soil moisture

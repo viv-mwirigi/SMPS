@@ -32,34 +32,30 @@ Usage:
 ...                      start_date=start, end_date=end)
 """
 
-# Soil data sources
-from smps.data.sources.isda_authenticated import (
-    IsdaAfricaAuthenticatedSource,
-    get_isda_soil_data,
+from smps.data.sources.base import (
+    DataSource,
+    DataFetchRequest,
+    DataFetchResult,
+    SoilSource,
+    WeatherSource,
+    RemoteSensingSource as SatelliteSource,  # Alias for clarity
 )
-from smps.data.sources.soilgrids import (
-    SoilGridsGlobalSource,
-    get_soilgrids_profile,
+from smps.data.sources.ismn_loader import (
+    ISMNStationLoader,
+    ISMNStationData,
+    ISMNSensorMetadata,
+    ISMNSoilProperties,
+    load_ismn_station,
+    get_daily_soil_moisture,
 )
-from smps.data.sources.soil import (
-    MockSoilSource,
+from smps.data.sources.validation_sources import (
+    ISMNDataSource,
+    FluxnetDataSource,
+    ValidationDataManager,
+    ValidationObservation,
+    print_attribute_guide,
+    SOIL_MOISTURE_PREDICTION_ATTRIBUTES,
 )
-
-# Satellite data sources
-from smps.data.sources.gee_satellite import (
-    GoogleEarthEngineSatelliteSource,
-    setup_gee_authentication,
-)
-from smps.data.sources.satellite import (
-    MODISNDVISource,
-)
-
-# Weather data sources
-from smps.data.sources.weather import (
-    OpenMeteoSource as OpenMeteoWeatherSource,  # Alias for consistency
-)
-
-# SpaceIoTBox API data sources
 from smps.data.sources.spaceiotbox import (
     SpaceIoTBoxClient,
     SpaceIoTBoxConfig,
@@ -71,42 +67,52 @@ from smps.data.sources.spaceiotbox import (
     get_spaceiotbox_weather,
     get_spaceiotbox_satellite,
 )
+from smps.data.sources.weather import (
+    OpenMeteoSource as OpenMeteoWeatherSource,  # Alias for consistency
+)
+from smps.data.sources.satellite import (
+    MODISNDVISource,
+)
+from smps.data.sources.soilgrids import (
+    SoilGridsGlobalSource,
+    get_soilgrids_profile,
+)
+from smps.data.sources.isda_authenticated import (
+    IsdaAfricaAuthenticatedSource,
+    get_isda_soil_data,
+)
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Soil data sources
+
+# Satellite data sources
+try:
+    import ee  # Test if earthengine-api is available
+    from smps.data.sources.gee_satellite import (
+        GoogleEarthEngineSatelliteSource,
+        setup_gee_authentication,
+    )
+except ImportError as e:
+    logger.warning(f"Could not import Google Earth Engine: {e}")
+    GoogleEarthEngineSatelliteSource = None
+    setup_gee_authentication = None
+
+# Weather data sources
+
+# SpaceIoTBox API data sources
 
 # Validation data sources
-from smps.data.sources.validation_sources import (
-    ISMNDataSource,
-    FluxnetDataSource,
-    ValidationDataManager,
-    ValidationObservation,
-    print_attribute_guide,
-    SOIL_MOISTURE_PREDICTION_ATTRIBUTES,
-)
 
 # ISMN file loader
-from smps.data.sources.ismn_loader import (
-    ISMNStationLoader,
-    ISMNStationData,
-    ISMNSensorMetadata,
-    ISMNSoilProperties,
-    load_ismn_station,
-    get_daily_soil_moisture,
-)
 
 # Base classes
-from smps.data.sources.base import (
-    DataSource,
-    DataFetchRequest,
-    DataFetchResult,
-    SoilSource,
-    WeatherSource,
-    RemoteSensingSource as SatelliteSource,  # Alias for clarity
-)
 
 __all__ = [
     # Soil sources
     "IsdaAfricaAuthenticatedSource",
     "SoilGridsGlobalSource",
-    "MockSoilSource",
     "get_isda_soil_data",
     "get_soilgrids_profile",
 

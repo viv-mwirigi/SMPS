@@ -78,6 +78,7 @@ class DailyWeather(BaseModel):
     atmospheric_pressure_hpa: Optional[float] = None
     soil_temperature_c: Optional[float] = None
     growing_degree_days: Optional[float] = None
+    ndvi: Optional[float] = Field(default=None, ge=-1, le=1)
 
     # Quality and metadata
     source: str
@@ -127,7 +128,8 @@ class SoilProfile(BaseModel):
         """Ensure texture percentages sum to 100% (± tolerance)"""
         total = self.sand_percent + self.silt_percent + self.clay_percent
         if abs(total - 100) > 1:  # 1% tolerance
-            raise ValueError(f'Texture percentages must sum to 100% (got {total})')
+            raise ValueError(
+                f'Texture percentages must sum to 100% (got {total})')
         return self
 
     @model_validator(mode='after')
@@ -147,8 +149,22 @@ class RemoteSensingData(BaseModel):
 
     # Optical (Sentinel-2)
     ndvi: Optional[float] = Field(default=None, ge=-1, le=1)
-    evi: Optional[float] = None
+    evi: Optional[float] = Field(default=None, ge=-1, le=1)
     lai: Optional[float] = Field(default=None, ge=0)
+
+    # Additional vegetation indices
+    savi: Optional[float] = Field(default=None, ge=-1, le=1)
+    arvi: Optional[float] = Field(default=None, ge=-1, le=1)
+    gndvi: Optional[float] = Field(default=None, ge=-1, le=1)
+    cvi: Optional[float] = Field(default=None, ge=0)
+
+    # Spectral bands (reflectance values)
+    blue: Optional[float] = Field(default=None, ge=0, le=1)
+    green: Optional[float] = Field(default=None, ge=0, le=1)
+    red: Optional[float] = Field(default=None, ge=0, le=1)
+    nir: Optional[float] = Field(default=None, ge=0, le=1)
+    swir1: Optional[float] = Field(default=None, ge=0, le=1)
+    swir2: Optional[float] = Field(default=None, ge=0, le=1)
 
     # SAR (Sentinel-1)
     sar_vv_db: Optional[float] = None
@@ -245,7 +261,8 @@ class PhysicsPriorRecord(BaseModel):
         """Validate water balance closure"""
         if abs(self.water_balance_error_mm) > 1.0:  # More than 1 mm error
             if self.water_balance_closure_percent < 95:  # Less than 95% closure
-                raise ValueError(f'Poor water balance closure: {self.water_balance_closure_percent}%')
+                raise ValueError(
+                    f'Poor water balance closure: {self.water_balance_closure_percent}%')
         return self
 
 

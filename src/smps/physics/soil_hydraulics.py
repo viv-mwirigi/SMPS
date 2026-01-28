@@ -501,6 +501,102 @@ class BrooksCoreyParameters:
         )
 
 
+@dataclass
+class DualDomainParameters:
+    """
+    Dual-domain hydraulic conductivity parameters for root-zone physics refinement.
+
+    Dual-domain models separate soil water flow into:
+    1. Micropore domain: Matrix flow through small pores (slow, high retention)
+    2. Macropore domain: Fast flow through large pores/cracks (fast, low retention)
+
+    This is important for root water uptake because:
+    - Roots primarily access micropore water (matrix potential)
+    - Macropores provide preferential flow paths
+    - Deep roots can access both domains differently
+
+    Based on Jarvis (2007) and Šimůnek et al. (2003) dual-porosity/dual-permeability models.
+
+    Parameters:
+        w: Fraction of soil volume in macropore domain (0-1)
+        K_macro: Macropore saturated conductivity (m/day)
+        theta_macro_s: Macropore saturated water content (m³/m³)
+        exchange_coeff: Water exchange coefficient between domains (1/day)
+        macro_psi_threshold: Pressure head threshold for macropore flow (m)
+    """
+    w: float  # Macropore volume fraction (0-1)
+    K_macro: float  # Macropore saturated conductivity (m/day)
+    theta_macro_s: float  # Macropore saturated water content (m³/m³)
+    exchange_coeff: float  # Inter-domain exchange coefficient (1/day)
+    # Pressure head threshold for macropore activation (m)
+    macro_psi_threshold: float
+
+    def __post_init__(self) -> None:
+        """Validate parameters."""
+        self.w = np.clip(self.w, 0.0, 0.5)  # Max 50% macropores
+        self.K_macro = max(self.K_macro, 1e-6)  # Minimum conductivity
+        self.theta_macro_s = np.clip(
+            self.theta_macro_s, 0.0, 0.3)  # Reasonable range
+        self.exchange_coeff = max(
+            self.exchange_coeff, 1e-6)  # Minimum exchange
+        self.macro_psi_threshold = np.clip(
+            self.macro_psi_threshold, -10.0, -0.01)  # Negative suction
+
+    @classmethod
+    def default_for_texture(
+        cls,
+        sand_percent: float,
+        clay_percent: float,
+        bulk_density: float = 1.4
+    ) -> "DualDomainParameters":
+        """
+        Estimate dual-domain parameters based on soil texture.
+
+        Macroporosity increases with:
+        - Higher sand content (better drainage)
+        - Lower bulk density (more structure)
+        - Lower clay content (less cohesion)
+
+        Args:
+            sand_percent: Sand content (%)
+            clay_percent: Clay content (%)
+            bulk_density: Bulk density (g/cm³)
+
+        Returns:
+            DualDomainParameters instance
+        """
+        # Base macroporosity from texture and density
+        # Higher sand and lower density = more macropores
+        texture_factor = (sand_percent / 100.0) * (1.0 - clay_percent / 100.0)
+        density_factor = max(0, 1.6 - bulk_density) / \
+            0.6  # Lower density = more pores
+
+        w_base = 0.02 + 0.08 * texture_factor + 0.06 * density_factor
+        w = np.clip(w_base, 0.01, 0.15)  # 1-15% macroporosity
+
+        # Macropore conductivity scales with macroporosity
+        # Sandy soils have higher K_macro
+        K_macro_base = 100.0  # m/day base
+        K_macro = K_macro_base * (w / 0.05) * (sand_percent / 50.0 + 0.5)
+
+        # Macropore water content
+        theta_macro_s = w * 0.8  # Most macropores drain quickly
+
+        # Exchange coefficient - slower in clayey soils
+        exchange_coeff = 0.1 / (1.0 + clay_percent / 30.0)  # 1/day
+
+        # Macropore threshold - more negative in finer soils
+        macro_psi_threshold = -0.1 / (1.0 + clay_percent / 20.0)  # m
+
+        return cls(
+            w=w,
+            K_macro=K_macro,
+            theta_macro_s=theta_macro_s,
+            exchange_coeff=exchange_coeff,
+            macro_psi_threshold=macro_psi_threshold
+        )
+
+
 # =============================================================================
 # VAN GENUCHTEN WATER RETENTION FUNCTIONS
 # =============================================================================
@@ -773,6 +869,136 @@ def specific_water_capacity(
         return 0.0
 
     return float(numerator / denominator)
+
+
+# =============================================================================
+# DUAL-DOMAIN HYDRAULIC CONDUCTIVITY FUNCTIONS
+# =============================================================================
+
+def dual_domain_K_total(
+    theta: float,
+    psi: float,
+    vg_params: VanGenuchtenParameters,
+    dual_params: DualDomainParameters
+) -> float:
+    """
+    Calculate total hydraulic conductivity in dual-domain soil.
+
+    Total K = (1-w) * K_micro(θ) + w * K_macro(θ_macro)
+
+    where:
+    - K_micro is matrix conductivity from Van Genuchten-Mualem
+    - K_macro is macropore conductivity (simplified)
+    - w is macropore volume fraction
+
+    Args:
+        theta: Total volumetric water content (m³/m³)
+        psi: Pressure head (m)
+        vg_params: Van Genuchten parameters for micropore domain
+        dual_params: Dual-domain parameters
+
+    Returns:
+        Total hydraulic conductivity (m/day)
+    """
+    # Micropore (matrix) conductivity
+    K_micro = van_genuchten_mualem_K(theta, vg_params)
+
+    # Macropore conductivity - simplified model
+    # Macropores conduct when wet enough (above threshold)
+    if psi > dual_params.macro_psi_threshold:
+        # Macropores active - assume they drain quickly
+        theta_macro = min(dual_params.theta_macro_s,
+                          max(0, theta - (vg_params.theta_s - dual_params.w)))
+        K_macro = dual_params.K_macro * \
+            (theta_macro / dual_params.theta_macro_s)
+    else:
+        K_macro = 0.0
+
+    # Total conductivity as weighted sum
+    K_total = (1.0 - dual_params.w) * K_micro + dual_params.w * K_macro
+
+    return max(K_total, K_MIN_RELATIVE_TO_KSAT * vg_params.K_sat)
+
+
+def dual_domain_water_exchange(
+    theta_micro: float,
+    theta_macro: float,
+    psi_micro: float,
+    psi_macro: float,
+    dual_params: DualDomainParameters
+) -> float:
+    """
+    Calculate water exchange between micro and macropore domains.
+
+    Exchange flux = Γ * (ψ_macro - ψ_micro)
+
+    where Γ is the exchange coefficient (function of water content).
+
+    Args:
+        theta_micro: Micropore water content (m³/m³)
+        theta_macro: Macropore water content (m³/m³)
+        psi_micro: Micropore pressure head (m)
+        psi_macro: Macropore pressure head (m)
+        dual_params: Dual-domain parameters
+
+    Returns:
+        Exchange flux from macro to micro (m³/m³/day, positive = macro→micro)
+    """
+    # Exchange coefficient depends on water content in both domains
+    # Higher when both domains have water
+    gamma_base = dual_params.exchange_coeff
+    gamma_micro = gamma_base * \
+        min(1.0, theta_micro / (0.5 * dual_params.theta_macro_s))
+    gamma_macro = gamma_base * \
+        min(1.0, theta_macro / dual_params.theta_macro_s)
+    gamma = min(gamma_micro, gamma_macro)
+
+    # Exchange driven by pressure head difference
+    delta_psi = psi_macro - psi_micro
+
+    # Flux from macro to micro (positive when psi_macro > psi_micro)
+    exchange_flux = gamma * delta_psi
+
+    return exchange_flux
+
+
+def dual_domain_root_access_factor(
+    theta_micro: float,
+    theta_macro: float,
+    psi_micro: float,
+    dual_params: DualDomainParameters,
+    feddes_params: "FeddesParameters"
+) -> float:
+    """
+    Calculate root access factor for dual-domain soil.
+
+    Roots primarily access micropore water, but can also extract
+    from macropores when micropores are stressed.
+
+    Args:
+        theta_micro: Micropore water content (m³/m³)
+        theta_macro: Macropore water content (m³/m³)
+        psi_micro: Micropore pressure head (m)
+        dual_params: Dual-domain parameters
+        feddes_params: Feddes stress parameters
+
+    Returns:
+        Root access factor (0-1, higher = better root access)
+    """
+    # Base access from micropore stress function
+    alpha_micro = feddes_stress_factor(psi_micro, feddes_params)
+
+    # Bonus access from macropores when micropores are stressed
+    stress_factor = 1.0 - alpha_micro  # Higher when more stressed
+
+    # Macropore contribution increases with stress and macropore water
+    macro_contribution = stress_factor * \
+        min(1.0, theta_macro / dual_params.theta_macro_s)
+
+    # Total access (micropore dominant, macropore supplemental)
+    access_factor = alpha_micro + 0.3 * macro_contribution
+
+    return min(access_factor, 1.0)
 
 
 # =============================================================================

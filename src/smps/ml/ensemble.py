@@ -49,7 +49,7 @@ import logging
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -133,9 +133,9 @@ class BaseModelWrapper:
                     **self.config.params,
                 }
                 self.model = lgb.LGBMRegressor(**params)
-            except ImportError:
+            except ImportError as exc:
                 raise ImportError(
-                    "LightGBM not installed: pip install lightgbm")
+                    "LightGBM not installed: pip install lightgbm") from exc
 
         elif self.config.model_type == 'xgboost':
             try:
@@ -155,8 +155,9 @@ class BaseModelWrapper:
                     **self.config.params,
                 }
                 self.model = xgb.XGBRegressor(**params)
-            except ImportError:
-                raise ImportError("XGBoost not installed: pip install xgboost")
+            except ImportError as exc:
+                raise ImportError(
+                    "XGBoost not installed: pip install xgboost") from exc
 
         elif self.config.model_type == 'randomforest':
             from sklearn.ensemble import RandomForestRegressor
@@ -247,8 +248,6 @@ class BaseModelWrapper:
                 self.model.fit(
                     X_selected, y,
                     eval_set=[(X_val_selected, y_val)],
-                    early_stopping_rounds=self.config.early_stopping_rounds,
-                    verbose=self.config.verbose,
                 )
         else:
             self.model.fit(X_selected, y)
@@ -321,7 +320,7 @@ class StackingEnsemble:
 
             self.base_models.append(BaseModelWrapper(config))
 
-    def _create_cv_splitter(self, n_samples: int):
+    def _create_cv_splitter(self, _n_samples: int):
         """Create cross-validation splitter."""
         if self.config.cv_type == 'timeseries':
             return TimeSeriesSplit(n_splits=self.config.n_folds)
@@ -357,8 +356,8 @@ class StackingEnsemble:
                     **self.config.meta_params,
                 }
                 self.meta_model = lgb.LGBMRegressor(**params)
-            except ImportError:
-                raise ImportError("LightGBM not installed")
+            except ImportError as exc:
+                raise ImportError("LightGBM not installed") from exc
 
         elif self.config.meta_model == 'xgboost':
             try:
@@ -371,8 +370,8 @@ class StackingEnsemble:
                     **self.config.meta_params,
                 }
                 self.meta_model = xgb.XGBRegressor(**params)
-            except ImportError:
-                raise ImportError("XGBoost not installed")
+            except ImportError as exc:
+                raise ImportError("XGBoost not installed") from exc
 
         else:
             raise ValueError(f"Unknown meta model: {self.config.meta_model}")
@@ -381,7 +380,7 @@ class StackingEnsemble:
         self,
         X: Union[pd.DataFrame, np.ndarray],
         y: Union[pd.Series, np.ndarray],
-        sample_weight: Optional[np.ndarray] = None,
+        _sample_weight: Optional[np.ndarray] = None,
     ) -> 'StackingEnsemble':
         """
         Fit the stacking ensemble.
@@ -405,7 +404,7 @@ class StackingEnsemble:
         n_base_models = len(self.base_models)
 
         logger.info(
-            f"Fitting stacking ensemble with {n_base_models} base models...")
+            "Fitting stacking ensemble with %d base models...", n_base_models)
 
         # Initialize out-of-fold predictions
         self.oof_predictions = np.zeros((n_samples, n_base_models))
@@ -416,12 +415,12 @@ class StackingEnsemble:
         # Train base models and generate OOF predictions
         for model_idx, base_model in enumerate(self.base_models):
             logger.info(
-                f"Training base model {model_idx + 1}/{n_base_models}: {base_model.config.name}")
+                "Training base model %d/%d: %s", model_idx + 1, n_base_models, base_model.config.name)
 
             # Store fold models for later
             fold_models = []
 
-            for fold_idx, (train_idx, val_idx) in enumerate(cv.split(X, y)):
+            for _fold_idx, (train_idx, val_idx) in enumerate(cv.split(X, y)):
                 X_train_fold = X.iloc[train_idx]
                 y_train_fold = y[train_idx]
                 X_val_fold = X.iloc[val_idx]
@@ -573,7 +572,7 @@ class StackingEnsemble:
         # Aggregate across models
         aggregated = {}
 
-        for model_name, model_importance in all_importance.items():
+        for _model_name, model_importance in all_importance.items():
             for feature, imp in model_importance.items():
                 if feature not in aggregated:
                     aggregated[feature] = []
@@ -713,7 +712,7 @@ class HybridStackingEnsemble(StackingEnsemble):
             physics_pred.min(), physics_pred.max())
 
         logger.info(
-            f"Training ensemble on residuals (mean={residuals.mean():.4f}, std={residuals.std():.4f})")
+            "Training ensemble on residuals (mean=%.4f, std=%.4f)", residuals.mean(), residuals.std())
 
         # Remove physics column from features
         X_features = X.drop(columns=[physics_col])

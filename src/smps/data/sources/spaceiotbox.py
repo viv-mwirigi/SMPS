@@ -52,7 +52,7 @@ class SpaceIoTBoxConfig:
     @property
     def api_base_url(self) -> str:
         """Get versioned API base URL."""
-        return f"{self.base_url}/api/{self.api_version}"
+        return f"{self.base_url}/{self.api_version}"
 
 
 class SpaceIoTBoxClient:
@@ -185,7 +185,14 @@ class SpaceIoTBoxClient:
                     )
 
                 response.raise_for_status()
-                return response.json()
+                data = response.json()
+
+                # Check for mock data indicators
+                if self._is_mock_data(data):
+                    raise DataSourceError(
+                        "Mock data detected, no real data available")
+
+                return data
 
             except requests.exceptions.RequestException as e:
                 last_exc = e
@@ -223,6 +230,18 @@ class SpaceIoTBoxClient:
     ) -> Dict[str, Any]:
         """Make POST request."""
         return self._request("POST", endpoint, params=params, json_data=json_data)
+
+    def _is_mock_data(self, data: Dict[str, Any]) -> bool:
+        """Check if response contains mock data indicators."""
+        # Check for known mock data patterns
+        if "data" in data and isinstance(data["data"], dict):
+            mock_indicators = ["forecast", "Sunny", "temperature", "humidity"]
+            data_str = str(data["data"]).lower()
+            if any(indicator.lower() in data_str for indicator in mock_indicators):
+                return True
+        if "location" in data and data["location"] == "test":
+            return True
+        return False
 
 
 class SpaceIoTBoxWeatherSource(WeatherSource):
@@ -342,23 +361,23 @@ class SpaceIoTBoxWeatherSource(WeatherSource):
                         date=weather_date,
                         site_id=site_id,
                         precipitation_mm=self._get_value(
-                            daily_data, "precipitation", i, 0.0),
+                            daily_data, "precipitation", i),
                         et0_mm=self._get_value(
-                            daily_data, "et0_fao_evapotranspiration", i, 0.0),
+                            daily_data, "et0_fao_evapotranspiration", i),
                         temperature_mean_c=self._get_value(
-                            daily_data, "temperature_2m_mean", i, 20.0),
+                            daily_data, "temperature_2m_mean", i),
                         temperature_min_c=self._get_value(
-                            daily_data, "temperature_2m_min", i, 15.0),
+                            daily_data, "temperature_2m_min", i),
                         temperature_max_c=self._get_value(
-                            daily_data, "temperature_2m_max", i, 25.0),
+                            daily_data, "temperature_2m_max", i),
                         solar_radiation_mj_m2=self._get_value(
-                            daily_data, "shortwave_radiation_sum", i, 15.0
+                            daily_data, "shortwave_radiation_sum", i
                         ),
                         relative_humidity_mean=self._get_value(
-                            daily_data, "relative_humidity_2m_mean", i, 60.0
+                            daily_data, "relative_humidity_2m_mean", i
                         ),
                         wind_speed_mean_m_s=self._get_value(
-                            daily_data, "wind_speed_10m_mean", i, 2.0
+                            daily_data, "wind_speed_10m_mean", i
                         ),
                         source="spaceiotbox",
                         is_forecast=self._is_forecast_date(weather_date),
@@ -416,7 +435,6 @@ class SpaceIoTBoxWeatherSource(WeatherSource):
         data: Dict[str, Any],
         key: str,
         index: int,
-        default: float,
     ) -> float:
         """Safely get value from array-based response."""
         # Try multiple possible key names
@@ -429,7 +447,8 @@ class SpaceIoTBoxWeatherSource(WeatherSource):
                     val = values[index]
                     if val is not None:
                         return float(val)
-        return default
+        raise DataSourceError(
+            f"Required value '{key}' not found in response data")
 
     def _is_forecast_date(self, weather_date: date) -> bool:
         """Check if date is in the future (forecast data)."""

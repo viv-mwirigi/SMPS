@@ -304,6 +304,14 @@ class FeatureStore:
         self._feature_groups[group.name] = group
         logger.info("Registered feature group: %s", group.name)
 
+    def register_feature(self, name: str, group_name: str, metadata: FeatureMetadata):
+        """Register a feature with metadata."""
+        self._metadata_cache[name] = metadata
+        if group_name in self._feature_groups:
+            if name not in self._feature_groups[group_name].features:
+                self._feature_groups[group_name].features.append(name)
+        logger.info("Registered feature: %s in group %s", name, group_name)
+
     def get_feature_group(self, name: str) -> Optional[FeatureGroup]:
         """Get a feature group by name."""
         return self._feature_groups.get(name)

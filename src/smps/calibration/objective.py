@@ -4,15 +4,16 @@ from dataclasses import replace
 from typing import Dict, Tuple
 
 import numpy as np
+import pandas as pd
 
 from smps.calibration.metrics import kge, ubrmse
 from smps.calibration.problem import CalibrationConfig, CalibrationDataset, get_forcing_frame, infer_obs_columns, normalize_weights
 from smps.calibration.parameterization import apply_parameters_to_model_params
-from smps.physics.enhanced_water_balance import EnhancedWaterBalance
+from smps.physics.simple_water_balance import SimpleWaterBalance, ModelConfig
 
 
 def evaluate_parameters(
-    base_model: EnhancedWaterBalance,
+    base_model: SimpleWaterBalance,
     dataset: CalibrationDataset,
     config: CalibrationConfig,
     parameters: Dict[str, float],
@@ -41,12 +42,22 @@ def evaluate_parameters(
         # Clone params and reset state before each site.
         tuned_params = apply_parameters_to_model_params(
             base_model.params, parameters)
-        model = EnhancedWaterBalance(tuned_params)
+        model = SimpleWaterBalance(tuned_params)
 
         # Run and collect outputs (end-of-day theta_layer_i columns)
-        sim_df = model.run_period(
-            forcings=forcings, warmup_days=config.warmup_days, return_fluxes=False)
-        if sim_df.empty:
+        sim_df, _ = model.run_period(
+            dates=forcings[dataset.date_column],
+            precipitation=forcings['precipitation'],
+            et0=forcings['et0'],
+            warmup_days=config.warmup_days)
+
+        # Ensure sim_df is a pandas DataFrame (model.run_period may return a list)
+        if sim_df is None:
+            continue
+        if not hasattr(sim_df, "loc") or not hasattr(sim_df, "columns"):
+            sim_df = pd.DataFrame(sim_df)
+
+        if len(sim_df) == 0:
             continue
 
         # Align obs for the evaluation period
@@ -55,7 +66,8 @@ def evaluate_parameters(
             continue
 
         # Mass balance penalty
-        wb_err = np.asarray(sim_df["water_balance_error_mm"], dtype=float)
+        wb_err = sim_df.loc[:,
+                            "water_balance_error_mm"].to_numpy().astype(float)
         mb_excess = np.maximum(0.0, np.abs(wb_err) -
                                float(config.mass_balance_tolerance_mm))
         mb_penalty = float(np.mean(mb_excess * mb_excess))

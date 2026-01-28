@@ -7,7 +7,7 @@ This script:
    - Fetches weather data (precipitation, temperature, ET)
    - Fetches soil properties (from ISMN static vars or iSDA/SoilGrids)
    - Fetches NDVI/LAI (from MODIS via GEE)
-   - Runs EnhancedWaterBalance physics model
+   - Runs SimpleWaterBalance physics model
    - Compares predictions vs observations at multiple depths
 3. Computes physics-based validation metrics:
    - Standard: RMSE, MAE, Bias, R², NSE, KGE
@@ -41,7 +41,10 @@ from tqdm import tqdm
 
 # SMPS imports
 from smps.data.sources.ismn_loader import ISMNStationLoader, ISMNStationData, get_daily_soil_moisture
-from smps.physics.enhanced_water_balance import EnhancedWaterBalance, EnhancedModelParameters
+from smps.physics.simple_water_balance import (
+    SimpleWaterBalance,
+    create_simple_config_improved,
+)
 from smps.physics.pedotransfer import (
     estimate_soil_parameters_tropical,
     TropicalSoilCorrections,
@@ -926,101 +929,51 @@ class ISMNValidationRunner:
         forcings: pd.DataFrame,
         soil_params: Dict
     ) -> Optional[pd.DataFrame]:
-        """Run EnhancedWaterBalance model and return results DataFrame."""
+        """Run SimpleWaterBalance model and return results DataFrame."""
         try:
-            from smps.physics.soil_hydraulics import VanGenuchtenParameters
-
-            # Compute texture-dependent theta_r (residual water content)
-            # For high-clay oxide soils, theta_r should be very low (they drain completely)
-            # For sandy soils, theta_r is also low
-            # For silty/loamy soils, theta_r is moderate
-            clay_pct = soil_params.get('clay_pct', 20)
-            sand_pct = soil_params.get('sand_pct', 40)
-
-            # Base theta_r from texture (Rawls et al. 1982 approximation)
-            # Higher clay normally means higher theta_r, but oxide clays are different
-            if clay_pct > 30:
-                # Oxide clay correction: high-clay tropical soils drain very well
-                # Reduce theta_r progressively from 30% to 60% clay
-                clay_effect = min((clay_pct - 30) / 30.0, 1.0)
-                theta_r = 0.04 - 0.03 * clay_effect  # 0.04 at 30% clay, 0.01 at 60%
-            elif sand_pct > 70:
-                # Sandy soils have low theta_r
-                theta_r = 0.02
-            else:
-                # Standard soils
-                theta_r = 0.03 + 0.001 * clay_pct  # 0.03-0.05 for 0-20% clay
-
-            theta_r = max(0.01, min(0.10, theta_r))  # Bound between 1-10%
-
-            # Create VG parameters from soil properties
-            vg_params = VanGenuchtenParameters(
-                theta_r=theta_r,
-                theta_s=soil_params['theta_sat'],
-                alpha=soil_params['alpha'],
-                n=soil_params['n'],
-                K_sat=soil_params['ksat_mm_day'] /
-                1000  # Convert mm/day to m/day
-            )
-
-            # Configure model with 5 layers
-            config = EnhancedModelParameters(
+            # Create model config
+            config = create_simple_config_improved(
+                sand_percent=soil_params.get('sand_pct', 40),
+                clay_percent=soil_params.get('clay_pct', 20),
+                output_depth_m=0.10,
                 n_layers=5,
-                # 10, 20, 20, 25, 25 cm
-                layer_depths_m=[0.10, 0.20, 0.20, 0.25, 0.25],
-                # Same params for all layers
-                vg_params=[vg_params, vg_params,
-                           vg_params, vg_params, vg_params],
-                crop_type="savanna",  # Natural grassland vegetation for ISMN validation
-                use_green_ampt=True,
-                use_fao56_dual=True,
-                use_feddes_uptake=True,
-                use_darcy_flux=True
+                max_depth_m=1.0,
+                vegetation_fraction=0.5,  # Default
+                latitude=self.latitude if hasattr(self, 'latitude') else None,
+                longitude=self.longitude if hasattr(
+                    self, 'longitude') else None,
+                use_tropical_ptf=True,
+                apply_adaptive_calibration=True,
             )
 
-            model = EnhancedWaterBalance(config)
+            model = SimpleWaterBalance(config)
 
-            # Prepare forcings - map column names to what model expects
-            run_forcings = forcings.copy()
+            # Run model day by day
+            results = []
+            for idx, row in forcings.iterrows():
+                fluxes, output_theta = model.run_daily(
+                    precipitation_mm=row.get(
+                        'precipitation_mm', row.get('precipitation', 0)),
+                    et0_mm=row.get('et0_mm', row.get('et0', 4.0)),
+                    ndvi=row.get('ndvi', 0.4),
+                    temperature_mean_c=row.get(
+                        'temperature_mean_c', row.get('temperature', 25.0)),
+                )
 
-            # Column mapping from weather data to model inputs
-            # EnhancedWaterBalance.run_period expects: precipitation_mm, et0_mm, ndvi, temperature_max_c
-            column_mapping = {
-                'precipitation': 'precipitation_mm',  # Keep as _mm suffix for run_period
-                'temperature_mean_c': 'temperature',
-                'temperature_max_c': 'temperature_max_c',
-                'relative_humidity_mean': 'humidity',
-                'wind_speed_mean_m_s': 'wind_speed',
-                'et0': 'et0_mm',  # Keep as _mm suffix for run_period
-                'solar_radiation_mj_m2': 'solar_radiation'
-            }
+                # Get all layer theta values
+                layer_thetas = [layer.theta for layer in model.layers]
 
-            for old_col, new_col in column_mapping.items():
-                if old_col in run_forcings.columns:
-                    run_forcings[new_col] = run_forcings[old_col]
+                result_row = {
+                    'date': idx,
+                    'theta_layer_0': layer_thetas[0],
+                    'theta_layer_1': layer_thetas[1] if len(layer_thetas) > 1 else layer_thetas[0],
+                    'theta_layer_2': layer_thetas[2] if len(layer_thetas) > 2 else layer_thetas[-1],
+                    'theta_layer_3': layer_thetas[3] if len(layer_thetas) > 3 else layer_thetas[-1],
+                    'theta_layer_4': layer_thetas[4] if len(layer_thetas) > 4 else layer_thetas[-1],
+                }
+                results.append(result_row)
 
-            # Check required columns
-            required_cols = ['precipitation_mm',
-                             'temperature', 'ndvi', 'et0_mm']
-            missing_cols = [
-                col for col in required_cols if col not in run_forcings.columns]
-            if missing_cols:
-                raise ValueError(
-                    f"Missing required forcing columns: {missing_cols}")
-
-            # Run simulation using run_period method
-            # Use warmup to let the model equilibrate from initial conditions
-            warmup_days = min(30, len(run_forcings) // 4)
-            results = model.run_period(
-                forcings=run_forcings,
-                warmup_days=warmup_days,
-                return_fluxes=False
-            )
-
-            # Add dates from forcings index
-            results['date'] = forcings.index[:len(results)]
-
-            return results
+            return pd.DataFrame(results)
 
         except Exception as e:
             logger.error(f"Model run failed: {e}")
