@@ -1,0 +1,135 @@
+{
+  "created_at": "2026-02-01T08:41:13.542906",
+  "source_datasets": {
+    "F2PyW": "../data/ismn/Data_separate_files_header_20170105_20250105_12892_F2PyW_20260105",
+    "gdf6E": "../data/ismn/Data_separate_files_header_20170105_20250105_12892_gdf6E_20260105"
+  },
+  "date_range": {
+    "start": "2017-01-05 00:00:00",
+    "end": "2022-07-07 00:00:00"
+  },
+  "split_strategy": {
+    "description": "Mixed regions (West + East Africa) with temporal split + spatial holdout",
+    "temporal_split_date": "2021-12-31 00:00:00",
+    "train_date_range": "2017-01-05 00:00:00 to 2021-12-31 00:00:00",
+    "test_temporal_date_range": "2022-01-01 00:00:00 to 2022-07-07 00:00:00",
+    "spatial_holdout_stations": [
+      "Bui_Power_Authority,_Bui",
+      "CSIR-SARI,_Tanina",
+      "Dwa_Estate",
+      "Fed_Poly_Ile-Oluji",
+      "GS_Marie_Reine_Rwanza",
+      "Ggaba_Demonstration_Primary_School_-_KCCA",
+      "IPRC_Musanze",
+      "Lariak_Secondary_School",
+      "MCS-FUTA-Akure",
+      "Murungaru_Secondary_School",
+      "Nzukini_Secondary_School",
+      "Olderkesi_Secondary_School",
+      "Sacred_Heart_SHS_Nsoatre",
+      "St_Johns_Nyamagwa"
+    ],
+    "holdout_stations_west_africa": [
+      "Bui_Power_Authority,_Bui",
+      "CSIR-SARI,_Tanina",
+      "Fed_Poly_Ile-Oluji",
+      "MCS-FUTA-Akure",
+      "Sacred_Heart_SHS_Nsoatre"
+    ],
+    "holdout_stations_east_africa": [
+      "Dwa_Estate",
+      "GS_Marie_Reine_Rwanza",
+      "Ggaba_Demonstration_Primary_School_-_KCCA",
+      "IPRC_Musanze",
+      "Lariak_Secondary_School",
+      "Murungaru_Secondary_School",
+      "Nzukini_Secondary_School",
+      "Olderkesi_Secondary_School",
+      "St_Johns_Nyamagwa"
+    ]
+  },
+  "statistics": {
+    "total_observations": 80763,
+    "train_observations": 56652,
+    "test_temporal_observations": 8553,
+    "test_spatial_observations": 15558,
+    "unique_stations": 75,
+    "train_stations": 61,
+    "test_temporal_stations": 50,
+    "test_spatial_stations": 14,
+    "unique_depths_cm": [
+      10.0,
+      20.0,
+      25.0,
+      30.0,
+      40.0,
+      55.00000000000001,
+      60.0,
+      85.0,
+      100.0,
+      114.99999999999999,
+      120.00000000000001,
+      200.0
+    ],
+    "networks": [
+      "AMMA-CATCH",
+      "TAHMO"
+    ],
+    "regions": [
+      "West Africa",
+      "East Africa"
+    ]
+  },
+  "regional_distribution": {
+    "train": {
+      "west_africa_stations": 24,
+      "east_africa_stations": 37,
+      "west_africa_observations": 27217,
+      "east_africa_observations": 29435
+    },
+    "test_temporal": {
+      "west_africa_stations": 16,
+      "east_africa_stations": 34
+    },
+    "test_spatial": {
+      "west_africa_stations": 5,
+      "east_africa_stations": 9
+    }
+  },
+  "quality_thresholds": {
+    "soil_moisture_min": 0.0,
+    "soil_moisture_max": 0.6
+  },
+  "columns": [
+    "dataset",
+    "network",
+    "station",
+    "station_id",
+    "region",
+    "latitude",
+    "longitude",
+    "elevation_m",
+    "date",
+    "year",
+    "month",
+    "day_of_year",
+    "depth_cm",
+    "soil_moisture",
+    "soil_moisture_min",
+    "soil_moisture_max",
+    "soil_moisture_std",
+    "sensor_type",
+    "land_cover",
+    "climate",
+    "saturation",
+    "clay_pct",
+    "sand_pct",
+    "silt_pct",
+    "organic_carbon_pct",
+    "n_hourly_obs",
+    "total_obs_at_depth",
+    "is_outlier",
+    "data_quality_score",
+    "split"
+  ]
+}

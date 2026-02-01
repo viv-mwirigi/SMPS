@@ -1,0 +1,113 @@
+{
+  "global": {
+    "bias": {
+      "parameter": "bias_correction_additive",
+      "type": "additive",
+      "value": -0.014057990212628156,
+      "confidence": 0.7,
+      "rationale": "Global bias of -0.0176 detected. Physics is too wet."
+    },
+    "et_stress": {
+      "parameter": "et_stress_factor",
+      "type": "multiplicative",
+      "value": 0.935842557662343,
+      "confidence": 0.8,
+      "rationale": "ET stress underestimated. When soil is dry, physics predicts 0.0321 more ET than observed. Recommend ET stress function: ET = ET\u2080 \u00d7 f(\u03b8)"
+    }
+  },
+  "clusters": {
+    "0": [],
+    "1": [
+      {
+        "parameter": "infiltration_efficiency",
+        "type": "multiplicative",
+        "value": 1.1949656990587236,
+        "confidence": 0.7,
+        "conditions": {
+          "clay_pct": [
+            30,
+            100
+          ],
+          "precipitation_mm": [
+            10,
+            100
+          ]
+        },
+        "rationale": "Cluster 1 (clay): Runoff overestimated. Increase infiltration efficiency."
+      },
+      {
+        "parameter": "porosity_adjustment",
+        "type": "additive",
+        "value": 0.05077869036441298,
+        "confidence": 0.65,
+        "conditions": {},
+        "rationale": "Cluster 1: Persistent dry bias (0.102). Soil storage capacity likely underestimated."
+      }
+    ],
+    "2": [
+      {
+        "parameter": "drainage_rate_multiplier",
+        "type": "multiplicative",
+        "value": 1.1042297393172726,
+        "confidence": 0.7,
+        "conditions": {
+          "precipitation_mm": [
+            10,
+            100
+          ]
+        },
+        "rationale": "Cluster 2: After rain, physics is 0.035 too wet. Drainage too slow."
+      },
+      {
+        "parameter": "porosity_adjustment",
+        "type": "additive",
+        "value": -0.01646694725082584,
+        "confidence": 0.65,
+        "conditions": {},
+        "rationale": "Cluster 2: Persistent wet bias (-0.033). Soil storage capacity likely overestimated."
+      }
+    ],
+    "3": [
+      {
+        "parameter": "drainage_rate_multiplier",
+        "type": "multiplicative",
+        "value": 1.7068879555756333,
+        "confidence": 0.7,
+        "conditions": {
+          "precipitation_mm": [
+            10,
+            100
+          ]
+        },
+        "rationale": "Cluster 3: After rain, physics is 0.236 too wet. Drainage too slow."
+      },
+      {
+        "parameter": "porosity_adjustment",
+        "type": "additive",
+        "value": -0.08,
+        "confidence": 0.65,
+        "conditions": {},
+        "rationale": "Cluster 3: Persistent wet bias (-0.233). Soil storage capacity likely overestimated."
+      }
+    ],
+    "4": [
+      {
+        "parameter": "infiltration_efficiency",
+        "type": "multiplicative",
+        "value": 1.0658695702493088,
+        "confidence": 0.7,
+        "conditions": {
+          "clay_pct": [
+            30,
+            100
+          ],
+          "precipitation_mm": [
+            10,
+            100
+          ]
+        },
+        "rationale": "Cluster 4 (clay): Runoff overestimated. Increase infiltration efficiency."
+      }
+    ]
+  }
+}

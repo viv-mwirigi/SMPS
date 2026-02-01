@@ -1,0 +1,24 @@
+interaction,condition1,condition2,n_samples,mean_residual,std_residual,interpretation
+rain_x_texture,none,sandy,5585,0.04158685019493312,0.0519324183973538,Drainage too FAST - soil drying faster than observed
+rain_x_texture,none,loam,8789,-0.02015406479458248,0.07363516505691538,ET too LOW - soil staying wetter than observed
+rain_x_texture,none,clayey,2111,-0.08260810025808012,0.10222286792040791,ET too LOW - soil staying wetter than observed
+rain_x_texture,light,sandy,2180,0.09898770697527598,0.07149555627957356,Residuals within acceptable range
+rain_x_texture,light,loam,9382,-0.021542454683206202,0.08671224800395194,Residuals within acceptable range
+rain_x_texture,light,clayey,4138,-0.12172598442807933,0.12629701780049693,Residuals within acceptable range
+rain_x_texture,moderate,sandy,898,0.11820864043391607,0.058528039420639714,Ksat too HIGH in sandy soils - water draining too fast
+rain_x_texture,moderate,loam,4087,-0.035894983773111525,0.08964142609659326,Residuals within acceptable range
+rain_x_texture,moderate,clayey,1460,-0.12294268038403575,0.12604062180143702,Residuals within acceptable range
+rain_x_texture,heavy,sandy,155,0.12065592540901346,0.07098047632747125,Ksat too HIGH in sandy soils - water draining too fast
+rain_x_texture,heavy,loam,496,-0.04834733081811314,0.09100997763235565,Residuals within acceptable range
+rain_x_texture,heavy,clayey,248,-0.1408548382734611,0.12201427005416074,Residuals within acceptable range
+et_x_moisture_state,low,dry,168,0.12933629373311664,0.07588652768266554,ET coefficient (Kc/Kcb) too HIGH
+et_x_moisture_state,low,normal,663,-0.03441564726712909,0.10387954491412835,Residuals within acceptable range
+et_x_moisture_state,low,wet,186,-0.10979999549146818,0.10451533566315259,Drainage too SLOW - soil staying saturated
+et_x_moisture_state,moderate,dry,3547,0.09321130811223609,0.07797361169810936,ET coefficient (Kc/Kcb) too HIGH
+et_x_moisture_state,moderate,normal,16123,-0.04079700560539786,0.09762115636829154,Residuals within acceptable range
+et_x_moisture_state,moderate,wet,3812,-0.11032683758909553,0.11850398318906394,Drainage too SLOW - soil staying saturated
+et_x_moisture_state,high,dry,8317,0.0543520511183482,0.08303024083283592,Missing ET STRESS - plants still transpiring when soil dry
+et_x_moisture_state,high,normal,12003,-0.025732723924290483,0.08708672440206673,ET too LOW - not removing enough water
+et_x_moisture_state,high,wet,2495,-0.14191163637876816,0.12875835818821021,ET too LOW - not removing enough water
+et_x_moisture_state,very_high,dry,7634,0.007812637177453662,0.0451873383857811,Residuals within acceptable range
+et_x_moisture_state,very_high,normal,1685,-0.04367805474420048,0.07235812810081516,ET too LOW - not removing enough water

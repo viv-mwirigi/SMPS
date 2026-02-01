@@ -99,6 +99,13 @@ from smps.ml.uncertainty import (
     UncertaintyCalibrator,
     UncertaintyQuantifier,  # Alias for HybridUncertaintyQuantifier
 )
+from smps.ml.hybrid_features import (
+    HybridFeatureEnhancer,
+    smooth_residuals,
+    compute_residual_target,
+    combine_physics_ml_predictions,
+    prepare_hybrid_training_data,
+)
 
 __all__ = [
     # Dataset building
@@ -146,4 +153,10 @@ __all__ = [
     "HybridUncertaintyQuantifier",
     "UncertaintyQuantifier",
     "UncertaintyCalibrator",
+    # Hybrid features
+    "HybridFeatureEnhancer",
+    "smooth_residuals",
+    "compute_residual_target",
+    "combine_physics_ml_predictions",
+    "prepare_hybrid_training_data",
 ]

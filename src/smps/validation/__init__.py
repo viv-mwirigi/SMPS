@@ -8,6 +8,11 @@ This module includes:
 - Physics-based validation: mass balance, extreme events, temporal structure
 - Sensitivity analysis (Gap 11): Morris, Sobol, MCMC calibration
 """
+from smps.validation.plotting import (
+    ValidationPlotter,
+    create_model_comparison_table,
+    print_validation_summary,
+)
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Optional, Tuple, Union
@@ -119,7 +124,14 @@ __all__ = [
     'analyze_identifiability',
     'compute_jacobian',
     'run_sensitivity_analysis',
+
+    # Plotting utilities
+    'ValidationPlotter',
+    'create_model_comparison_table',
+    'print_validation_summary',
 ]
+
+# Import plotting utilities
 
 
 class MetricType(str, Enum):
