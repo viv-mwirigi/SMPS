@@ -47,8 +47,6 @@ Usage:
     python scripts/run_prepared_validation.py --max-stations 10
     python scripts/run_prepared_validation.py --skip-gee --skip-fetch
 """
-
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import lightgbm as lgb
 from smps.validation.plotting import (
     ValidationPlotter,
@@ -89,6 +87,75 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.model_selection import GroupKFold
+
+
+# =============================================================================
+# ADDITIONAL METRICS: KGE and NSE
+# =============================================================================
+
+def compute_nse(obs: np.ndarray, pred: np.ndarray) -> float:
+    """
+    Nash-Sutcliffe Efficiency.
+
+    NSE = 1 - Σ(obs - pred)² / Σ(obs - mean(obs))²
+
+    Range: (-∞, 1], with 1 being perfect prediction.
+    NSE = 0 means prediction is as good as using the mean.
+    """
+    if len(obs) < 2:
+        return np.nan
+    obs_mean = np.mean(obs)
+    numerator = np.sum((obs - pred) ** 2)
+    denominator = np.sum((obs - obs_mean) ** 2)
+    if denominator < 1e-10:
+        return np.nan
+    return 1 - numerator / denominator
+
+
+def compute_kge(obs: np.ndarray, pred: np.ndarray) -> Tuple[float, float, float, float]:
+    """
+    Kling-Gupta Efficiency with decomposition.
+
+    KGE = 1 - sqrt((r-1)² + (α-1)² + (β-1)²)
+
+    where:
+    - r = correlation coefficient
+    - α = σ_pred / σ_obs (variability ratio)
+    - β = μ_pred / μ_obs (bias ratio)
+
+    Returns: (KGE, r, alpha, beta)
+    """
+    if len(obs) < 2:
+        return np.nan, np.nan, np.nan, np.nan
+
+    # Correlation
+    obs_std = np.std(obs)
+    pred_std = np.std(pred)
+    obs_mean = np.mean(obs)
+    pred_mean = np.mean(pred)
+
+    if obs_std < 1e-10 or pred_std < 1e-10:
+        return np.nan, np.nan, np.nan, np.nan
+
+    r = np.corrcoef(obs, pred)[0, 1]
+    if np.isnan(r):
+        return np.nan, np.nan, np.nan, np.nan
+
+    # Variability ratio
+    alpha = pred_std / obs_std
+
+    # Bias ratio
+    if abs(obs_mean) < 1e-10:
+        beta = np.nan
+        kge = np.nan
+    else:
+        beta = pred_mean / obs_mean
+        kge = 1 - np.sqrt((r - 1)**2 + (alpha - 1)**2 + (beta - 1)**2)
+
+    return kge, r, alpha, beta
+
 
 # Configure logging
 warnings.filterwarnings('ignore')
@@ -131,12 +198,35 @@ class PreparedDataValidator:
         self.cache_dir = Path(cache_dir)
         self.weather_cache_dir = self.cache_dir / "weather"
         self.weather_cache_dir.mkdir(parents=True, exist_ok=True)
+        self.soil_cache_dir = self.cache_dir / "soil"
+        self.soil_cache_dir.mkdir(parents=True, exist_ok=True)
+        self.satellite_cache_dir = self.cache_dir / "satellite"
+        self.satellite_cache_dir.mkdir(parents=True, exist_ok=True)
 
         self.skip_gee = skip_gee
         self.skip_fetch = skip_fetch
 
         # Initialize data sources
         self.weather_source = OpenMeteoSource(cache_dir=self.weather_cache_dir)
+
+        # Initialize soil data source (iSDA for Africa, SoilGrids as fallback)
+        self.soil_source = None
+        self.has_isda = False
+        try:
+            from smps.data.sources.isda_authenticated import IsdaAfricaAuthenticatedSource
+            self.soil_source = IsdaAfricaAuthenticatedSource(
+                cache_dir=self.soil_cache_dir)
+            self.has_isda = True
+            logger.info("✓ iSDA Africa soil source initialized")
+        except Exception as e:
+            logger.warning(f"iSDA not available: {e}")
+            try:
+                from smps.data.sources.soil import SoilGridsSource
+                self.soil_source = SoilGridsSource(
+                    cache_dir=self.soil_cache_dir)
+                logger.info("✓ SoilGrids fallback initialized")
+            except Exception as e2:
+                logger.warning(f"SoilGrids not available: {e2}")
 
         # Try to initialize GEE
         self.has_gee = False
@@ -206,17 +296,24 @@ class PreparedDataValidator:
             "/", "_").replace(",", "_").replace(" ", "_")
         cache_file = self.weather_cache_dir / f"weather_{safe_id}.parquet"
 
-        # Check cache
+        # Check cache first - this is critical for avoiding rate limits
         if cache_file.exists():
-            cached = pd.read_parquet(cache_file)
-            # Filter to date range
-            cached = cached[(cached['date'] >= start_date)
-                            & (cached['date'] <= end_date)]
-            if len(cached) > 0:
-                logger.debug(f"  ✓ Weather cache hit: {station_id}")
-                return cached
+            try:
+                cached = pd.read_parquet(cache_file)
+                # Filter to date range
+                cached['date'] = pd.to_datetime(cached['date'])
+                cached = cached[(cached['date'] >= pd.to_datetime(start_date))
+                                & (cached['date'] <= pd.to_datetime(end_date))]
+                if len(cached) > 0:
+                    logger.debug(
+                        f"  ✓ Weather cache hit: {station_id} ({len(cached)} days)")
+                    return cached
+            except Exception as e:
+                logger.warning(f"  Cache read failed for {station_id}: {e}")
 
         if self.skip_fetch:
+            logger.warning(
+                f"  ⚠ No cached weather for {station_id}, skip_fetch=True")
             return None
 
         try:
@@ -245,15 +342,250 @@ class PreparedDataValidator:
 
             weather_df = pd.DataFrame(records)
 
-            # Cache
-            weather_df.to_parquet(cache_file)
-            logger.debug(f"  ✓ Weather fetched: {station_id}")
+            # Cache for future use
+            if len(weather_df) > 0:
+                weather_df.to_parquet(cache_file)
+                logger.debug(
+                    f"  ✓ Weather fetched and cached: {station_id} ({len(weather_df)} days)")
 
             return weather_df
 
         except Exception as e:
-            logger.warning(f"  Weather fetch failed for {station_id}: {e}")
+            logger.warning(f"  ⚠ Weather fetch failed for {station_id}: {e}")
             return None
+
+    def fetch_soil_data(
+        self,
+        station_id: str,
+        lat: float,
+        lon: float,
+        existing_clay: Optional[float] = None,
+        existing_sand: Optional[float] = None,
+    ) -> Dict[str, float]:
+        """
+        Fetch soil properties from iSDA (Africa) or SoilGrids (global).
+
+        Returns dict with: clay_pct, sand_pct, silt_pct, organic_carbon_pct, bulk_density, slope_degrees
+        Falls back to existing values if fetch fails.
+        """
+        safe_id = station_id.replace(
+            "/", "_").replace(",", "_").replace(" ", "_")
+        cache_file = self.soil_cache_dir / f"soil_{safe_id}.json"
+
+        # Check cache
+        if cache_file.exists():
+            try:
+                with open(cache_file, 'r', encoding='utf-8') as f:
+                    cached = json.load(f)
+                logger.debug(f"  ✓ Soil cache hit: {station_id}")
+                return cached
+            except Exception:
+                pass  # Cache read failed, will fetch fresh
+
+        # Default values from existing data or reasonable estimates
+        result = {
+            'clay_pct': existing_clay if existing_clay and not np.isnan(existing_clay) else None,
+            'sand_pct': existing_sand if existing_sand and not np.isnan(existing_sand) else None,
+            'silt_pct': None,
+            'organic_carbon_pct': None,
+            'bulk_density': None,
+            'slope_degrees': None,
+        }
+
+        if self.skip_fetch or self.soil_source is None:
+            return result
+
+        # Check if in Africa for iSDA
+        is_africa = -35 <= lat <= 37 and -25 <= lon <= 55
+
+        try:
+            if self.has_isda and is_africa:
+                # Fetch from iSDA
+                profile = self.soil_source.fetch_soil_profile(
+                    site_id=station_id,
+                    latitude=lat,
+                    longitude=lon,
+                    depth="0-20"
+                )
+                result['clay_pct'] = profile.clay_percent
+                result['sand_pct'] = profile.sand_percent
+                result['silt_pct'] = profile.silt_percent
+                result['organic_carbon_pct'] = getattr(
+                    profile, 'organic_carbon_percent', None)
+                result['bulk_density'] = getattr(profile, 'bulk_density', None)
+                # iSDA also provides slope
+                if hasattr(profile, 'slope_angle'):
+                    result['slope_degrees'] = profile.slope_angle
+                logger.debug(f"  ✓ iSDA soil fetched: {station_id}")
+            elif self.soil_source is not None and not self.has_isda:
+                # Use SoilGrids for non-Africa or fallback
+                # Set site coordinates for SoilGrids
+                self.soil_source._site_coordinates = {station_id: (lat, lon)}
+                profile = self.soil_source.fetch_soil_profile(
+                    site_id=station_id
+                )
+                result['clay_pct'] = profile.clay_percent
+                result['sand_pct'] = profile.sand_percent
+                result['silt_pct'] = profile.silt_percent
+                logger.debug(f"  ✓ SoilGrids soil fetched: {station_id}")
+
+            # Cache successful fetch
+            with open(cache_file, 'w', encoding='utf-8') as f:
+                json.dump(result, f)
+
+        except Exception as e:
+            logger.warning(f"  ⚠ Soil fetch failed for {station_id}: {e}")
+
+        return result
+
+    def fetch_satellite_data(
+        self,
+        station_id: str,
+        lat: float,
+        lon: float,
+        start_date: datetime,
+        end_date: datetime,
+    ) -> Dict[str, float]:
+        """
+        Fetch satellite vegetation data (NDVI, LAI) with caching.
+
+        For crop irrigation applications, NDVI is CRITICAL because:
+        1. Kc (crop coefficient) = f(NDVI) → accurate crop water requirements
+        2. ETc = Kc × ET0 → irrigation scheduling
+        3. Vegetation fraction → ET partitioning (transpiration vs soil evaporation)
+        4. Crop stress detection → proactive water management
+
+        Data sources (in priority order):
+        1. GEE Sentinel-2/Landsat (if authenticated) - highest resolution
+        2. MODIS NDVI API (no auth required) - reliable fallback
+
+        Returns dict with: ndvi_mean, lai_mean, ndvi_min, ndvi_max, ndvi_std
+        """
+        safe_id = station_id.replace(
+            "/", "_").replace(",", "_").replace(" ", "_")
+        cache_file = self.satellite_cache_dir / f"satellite_{safe_id}.json"
+
+        # Check cache
+        if cache_file.exists():
+            try:
+                with open(cache_file, 'r', encoding='utf-8') as f:
+                    cached = json.load(f)
+                logger.debug(f"  ✓ Satellite cache hit: {station_id}")
+                return cached
+            except Exception:
+                pass  # Cache read failed, will fetch fresh
+
+        result = {
+            'ndvi_mean': None,
+            'lai_mean': None,
+            'ndvi_min': None,
+            'ndvi_max': None,
+            'ndvi_std': None,
+        }
+
+        # Try GEE first (best quality)
+        if not self.skip_gee and self.has_gee:
+            try:
+                veg_data = self.satellite_source.fetch_vegetation_data(
+                    lat=lat,
+                    lon=lon,
+                    start_date=start_date.strftime("%Y-%m-%d"),
+                    end_date=end_date.strftime("%Y-%m-%d")
+                )
+
+                if veg_data and len(veg_data) > 0:
+                    ndvi_values = [
+                        obs.ndvi for obs in veg_data if obs.ndvi is not None]
+                    if ndvi_values:
+                        result['ndvi_mean'] = float(np.mean(ndvi_values))
+                        result['ndvi_min'] = float(np.min(ndvi_values))
+                        result['ndvi_max'] = float(np.max(ndvi_values))
+                        result['ndvi_std'] = float(np.std(ndvi_values))
+                        result['source'] = 'GEE'
+
+            except Exception as e:
+                logger.debug(f"  GEE fetch failed: {e}, trying MODIS fallback")
+
+        # Fallback to MODIS AppEEARS API (no authentication required for simple queries)
+        if result['ndvi_mean'] is None and not self.skip_fetch:
+            try:
+                result = self._fetch_modis_ndvi_simple(
+                    lat, lon, start_date, end_date)
+                if result['ndvi_mean'] is not None:
+                    result['source'] = 'MODIS'
+            except Exception as e:
+                logger.debug(f"  MODIS fallback failed: {e}")
+
+        # Cache result
+        if result['ndvi_mean'] is not None:
+            try:
+                with open(cache_file, 'w', encoding='utf-8') as f:
+                    json.dump(result, f)
+                logger.debug(
+                    f"  ✓ Satellite: {station_id} NDVI={result['ndvi_mean']:.2f} ({result.get('source', 'unknown')})")
+            except Exception:
+                pass
+
+        return result
+
+    def _fetch_modis_ndvi_simple(
+        self,
+        lat: float,
+        lon: float,
+        start_date: datetime,
+        end_date: datetime,
+    ) -> Dict[str, float]:
+        """
+        Fetch MODIS NDVI using simple HTTP request to NASA AppEEARS.
+        This is a lightweight alternative that doesn't require GEE authentication.
+        """
+        import requests
+
+        result = {
+            'ndvi_mean': None,
+            'lai_mean': None,
+            'ndvi_min': None,
+            'ndvi_max': None,
+            'ndvi_std': None,
+        }
+
+        # Use MODIS MOD13Q1 (250m, 16-day NDVI)
+        # This endpoint provides point queries without authentication
+        try:
+            # Try the simpler MODIS Web Service
+            base_url = "https://modis.ornl.gov/rst/api/v1/MOD13Q1/subset"
+            params = {
+                "latitude": lat,
+                "longitude": lon,
+                "startDate": f"A{start_date.year}{start_date.timetuple().tm_yday:03d}",
+                "endDate": f"A{end_date.year}{end_date.timetuple().tm_yday:03d}",
+                "kmAboveBelow": 0,
+                "kmLeftRight": 0,
+            }
+
+            response = requests.get(base_url, params=params, timeout=30)
+
+            if response.status_code == 200:
+                data = response.json()
+                if 'subset' in data:
+                    ndvi_values = []
+                    for item in data['subset']:
+                        if item.get('band') == '250m_16_days_NDVI':
+                            # MODIS NDVI is scaled by 10000
+                            for val in item.get('data', []):
+                                if val > -2000:  # Valid range
+                                    ndvi_values.append(val / 10000.0)
+
+                    if ndvi_values:
+                        result['ndvi_mean'] = float(np.mean(ndvi_values))
+                        result['ndvi_min'] = float(np.min(ndvi_values))
+                        result['ndvi_max'] = float(np.max(ndvi_values))
+                        result['ndvi_std'] = float(np.std(ndvi_values))
+
+        except Exception:
+            pass  # MODIS API not available
+
+        return result
 
     def run_physics_model(
         self,
@@ -264,6 +596,8 @@ class PreparedDataValidator:
         lon: float,
         elevation_m: float,
         observed_mean: Optional[float] = None,
+        slope_percent: Optional[float] = None,
+        ndvi_mean: Optional[float] = None,
     ) -> pd.DataFrame:
         """Run SimpleWaterBalance physics model."""
         # Create config with tropical PTFs
@@ -277,10 +611,11 @@ class PreparedDataValidator:
             latitude=lat,
             longitude=lon,
             elevation_m=elevation_m if not np.isnan(elevation_m) else 200,
-            slope_percent=5.0,
+            slope_percent=slope_percent if slope_percent is not None else 5.0,
             observed_mean=observed_mean,
             use_tropical_ptf=True,
             apply_adaptive_calibration=True,
+            ndvi_mean=ndvi_mean,
         )
 
         model = SimpleWaterBalance(config)
@@ -368,13 +703,69 @@ class PreparedDataValidator:
                     on='date',
                     how='left'
                 )
+                # Fill any remaining NaN values with interpolation or forward fill
+                weather_cols = ['precipitation_mm', 'et0_mm', 'temperature_mean_c',
+                                'temperature_min_c', 'temperature_max_c']
+                for col in weather_cols:
+                    if col in station_df.columns:
+                        station_df[col] = station_df[col].ffill().bfill()
             else:
-                # Fill with defaults if no weather
-                station_df['precipitation_mm'] = 0
-                station_df['et0_mm'] = 3
-                station_df['temperature_mean_c'] = 25
+                # CRITICAL: Skip stations without weather data - don't use fake defaults
+                logger.warning(
+                    f"  ⚠ Skipping {station_id}: No weather data available")
+                continue
 
-            # 2. Run physics model
+            # 2. Fetch/update soil properties if missing or from iSDA
+            soil_data = self.fetch_soil_data(
+                station_id, lat, lon,
+                existing_clay=loc.get('clay_pct'),
+                existing_sand=loc.get('sand_pct'),
+            )
+
+            # Update soil columns with fetched data
+            if soil_data['clay_pct'] is not None:
+                station_df['clay_pct'] = soil_data['clay_pct']
+            if soil_data['sand_pct'] is not None:
+                station_df['sand_pct'] = soil_data['sand_pct']
+            if soil_data['silt_pct'] is not None:
+                station_df['silt_pct'] = soil_data['silt_pct']
+            if soil_data['organic_carbon_pct'] is not None:
+                station_df['organic_carbon_pct'] = soil_data['organic_carbon_pct']
+            if soil_data['slope_degrees'] is not None:
+                station_df['slope_degrees'] = soil_data['slope_degrees']
+
+            # Get final soil values for physics model (use station data or fetched)
+            clay_pct = station_df['clay_pct'].iloc[0] if 'clay_pct' in station_df.columns else None
+            sand_pct = station_df['sand_pct'].iloc[0] if 'sand_pct' in station_df.columns else None
+
+            # Skip if no soil data available
+            if clay_pct is None or np.isnan(clay_pct) or sand_pct is None or np.isnan(sand_pct):
+                logger.warning(
+                    f"  ⚠ Skipping {station_id}: No soil texture data available")
+                continue
+
+            # Get slope (from iSDA/SoilGrids or estimate from elevation)
+            slope_percent = 5.0  # Default
+            if soil_data.get('slope_degrees') is not None:
+                slope_percent = np.tan(np.radians(
+                    soil_data['slope_degrees'])) * 100
+            elif 'slope_degrees' in station_df.columns and station_df['slope_degrees'].notna().any():
+                slope_deg = station_df['slope_degrees'].iloc[0]
+                slope_percent = np.tan(np.radians(slope_deg)) * 100
+
+            # 3. Fetch satellite data (NDVI/LAI) for physics model calibration
+            satellite_data = self.fetch_satellite_data(
+                station_id, lat, lon, start_date, end_date
+            )
+            ndvi_mean = satellite_data.get('ndvi_mean')
+
+            # Add NDVI features to station data if available
+            if ndvi_mean is not None:
+                station_df['ndvi_mean'] = ndvi_mean
+            if satellite_data.get('lai_mean') is not None:
+                station_df['lai_mean'] = satellite_data['lai_mean']
+
+            # 4. Run physics model
             physics_input = station_df[[
                 'date', 'precipitation_mm', 'et0_mm']].drop_duplicates('date')
             physics_input = physics_input.sort_values(
@@ -382,14 +773,21 @@ class PreparedDataValidator:
 
             obs_mean = station_df['soil_moisture'].mean()
 
+            # Get elevation - use actual value, not default
+            elevation_m = loc.get('elevation_m', 200)
+            if elevation_m is None or (isinstance(elevation_m, float) and np.isnan(elevation_m)):
+                elevation_m = 200  # Only use default if truly missing
+
             physics_results = self.run_physics_model(
                 physics_input,
-                sand_pct=loc['sand_pct'],
-                clay_pct=loc['clay_pct'],
+                sand_pct=sand_pct,
+                clay_pct=clay_pct,
                 lat=lat,
                 lon=lon,
-                elevation_m=loc['elevation_m'],
+                elevation_m=elevation_m,
                 observed_mean=obs_mean,
+                slope_percent=slope_percent,
+                ndvi_mean=ndvi_mean,
             )
 
             # Merge physics
@@ -399,7 +797,7 @@ class PreparedDataValidator:
                 how='left'
             )
 
-            # 3. Select appropriate physics prior based on depth
+            # 5. Select appropriate physics prior based on depth
             def get_physics_prior(row):
                 depth = row['depth_cm']
                 if depth <= 15:
@@ -412,7 +810,7 @@ class PreparedDataValidator:
             station_df['physics_prior'] = station_df.apply(
                 get_physics_prior, axis=1)
 
-            # 4. Compute residual (what physics model misses)
+            # 6. Compute residual (what physics model misses)
             station_df['residual'] = station_df['soil_moisture'] - \
                 station_df['physics_prior']
 
@@ -553,11 +951,133 @@ class PreparedDataValidator:
         result['is_surface'] = (result['depth_cm'] <= 15).astype(int)
         result['is_deep'] = (result['depth_cm'] > 50).astype(int)
 
-        # 8. Spatial features
-        result['lat_normalized'] = (
-            result['latitude'] - result['latitude'].mean()) / result['latitude'].std()
-        result['lon_normalized'] = (
-            result['longitude'] - result['longitude'].mean()) / result['longitude'].std()
+        # 8. FIX #2: PHYSICAL SOIL ENCODING (instead of lat/lon fingerprints)
+        # These force ML to learn "Clay soils store more water" instead of
+        # "Station at (7.5°N, 5.2°E) behaves like this"
+        result = self._add_physical_soil_features(result)
+
+        # 9. LAI estimation from NDVI (for irrigation applications)
+        result = self._add_lai_from_ndvi(result)
+
+        # NOTE: lat_normalized and lon_normalized are REMOVED (FIX #1)
+        # They act as station fingerprints allowing ML to memorize geography
+
+        return result
+
+    def _add_physical_soil_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        FIX #2: Add physically meaningful soil features.
+
+        These encode soil behavior that ML can generalize:
+        - Porosity: How much water soil can hold
+        - Field capacity: Maximum retained water after drainage
+        - Wilting point: Minimum plant-available water
+        - Available water capacity: FC - WP (usable water storage)
+        - Drainage class: How fast soil drains (from texture)
+        - Texture class: Simplified soil type
+        """
+        result = df.copy()
+
+        # Use tropical PTF to estimate hydraulic parameters
+        if 'sand_pct' in result.columns and 'clay_pct' in result.columns:
+            # Porosity (saturated water content) - Saxton & Rawls PTF
+            sand = result['sand_pct'].fillna(40) / 100
+            clay = result['clay_pct'].fillna(25) / 100
+            silt = (100 - result['sand_pct'].fillna(40) -
+                    result['clay_pct'].fillna(25)) / 100
+            organic = result['organic_carbon_pct'].fillna(
+                1.0) / 100 if 'organic_carbon_pct' in result.columns else 0.01
+
+            # Porosity (θs) - Saxton & Rawls (2006)
+            result['porosity'] = 0.332 - 0.0007251 * \
+                (sand * 100) + 0.1276 * np.log10(clay * 100 + 1)
+
+            # Field capacity (θ at -33 kPa)
+            result['field_capacity'] = (
+                0.2576 - 0.002 * (sand * 100) + 0.0036 * (clay * 100) +
+                0.0299 * (organic * 100) - 0.00006 *
+                (sand * 100) * (clay * 100)
+            )
+
+            # Wilting point (θ at -1500 kPa)
+            result['wilting_point'] = (
+                0.026 + 0.005 * (clay * 100) + 0.0158 * (organic * 100)
+            )
+
+            # Available water capacity (plant-usable storage)
+            result['available_water_capacity'] = result['field_capacity'] - \
+                result['wilting_point']
+
+            # Saturated hydraulic conductivity (drainage rate) - Cosby PTF
+            # log10(Ksat) = -0.6 + 0.0126*sand% - 0.0064*clay%
+            result['log_ksat'] = -0.6 + 0.0126 * \
+                (sand * 100) - 0.0064 * (clay * 100)
+
+            # Drainage class (categorical to numeric)
+            # High clay = slow drainage (0), High sand = fast drainage (1)
+            result['drainage_index'] = (sand - clay + 1) / 2  # Normalized 0-1
+
+            # Texture class index (simplified USDA texture triangle)
+            # 0 = clay-dominated, 1 = balanced, 2 = sand-dominated
+            conditions = [
+                (clay >= 0.40),  # Clay-dominated
+                (sand >= 0.70),  # Sand-dominated
+            ]
+            choices = [0, 2]
+            result['texture_class'] = np.select(conditions, choices, default=1)
+
+            # Water retention ratio (FC / porosity) - soil's ability to hold water
+            result['water_retention_ratio'] = result['field_capacity'] / \
+                result['porosity'].clip(lower=0.2)
+
+            # Soil permeability index (sand/clay ratio affects permeability)
+            result['permeability_index'] = (
+                sand / clay.clip(lower=0.05)).clip(upper=10)
+
+            logger.info(
+                "  Added physical soil features: porosity, field_capacity, AWC, drainage_index")
+
+        return result
+
+    def _add_lai_from_ndvi(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        FIX #5: Estimate Leaf Area Index (LAI) from NDVI.
+
+        LAI is crucial for irrigation applications:
+        - Higher LAI = more transpiration = more crop water demand
+        - LAI is used in FAO-56 dual crop coefficient method
+
+        Empirical relationship: LAI = f(NDVI)
+        Common formula: LAI = (NDVI - NDVI_min) / (k * (NDVI_max - NDVI_min))
+        Or: LAI = -ln((1 - NDVI) / (1 + NDVI)) / k  (Beer-Lambert based)
+        """
+        result = df.copy()
+
+        if 'ndvi_mean' in result.columns:
+            ndvi = result['ndvi_mean'].fillna(0.3).clip(0.05, 0.95)
+
+            # Beer-Lambert based LAI estimation (Baret & Guyot, 1991)
+            # LAI = -ln(1 - fAPAR) / k, where fAPAR ≈ 1.25 * NDVI - 0.1
+            fapar = (1.25 * ndvi - 0.1).clip(0.01, 0.95)
+            k_extinction = 0.5  # Typical extinction coefficient for crops
+            result['lai_estimated'] = -np.log(1 - fapar) / k_extinction
+
+            # Clipped LAI (realistic range 0-8)
+            result['lai_estimated'] = result['lai_estimated'].clip(0, 8)
+
+            # Vegetation fraction (ground cover)
+            result['vegetation_fraction'] = ((ndvi - 0.1) / 0.6).clip(0, 1)
+
+            # Crop coefficient (Kc) estimation from NDVI for irrigation
+            # Kc = 1.2 * NDVI + 0.1 (simplified FAO-56 relationship)
+            result['kc_estimated'] = (1.2 * ndvi + 0.1).clip(0.15, 1.2)
+
+            # Potential crop ET (ETc = Kc * ET0)
+            if 'et0_mm' in result.columns:
+                result['etc_estimated'] = result['kc_estimated'] * \
+                    result['et0_mm']
+
+            logger.info("  Added LAI and irrigation features from NDVI")
 
         return result
 
@@ -613,6 +1133,8 @@ class PreparedDataValidator:
 
         # Define feature columns - STRICT NO-LEAKAGE policy
         # Any feature derived from observed soil_moisture is EXCLUDED
+        # FIX #1: Remove raw lat/lon - they act as station fingerprints!
+        # ML learns "station at 7.5°N behaves like X" instead of physics
         exclude_cols = [
             'station_id', 'network', 'station', 'region', 'dataset', 'date',
             # Target and observed values - NEVER use as features
@@ -621,6 +1143,8 @@ class PreparedDataValidator:
             'residual',
             # Metadata
             'sensor_type', 'land_cover', 'climate', 'is_outlier',
+            # GEOGRAPHY FINGERPRINTS - REMOVED to force learning hydrology!
+            'latitude', 'longitude', 'lat_normalized', 'lon_normalized',
             'physics_prior_surface', 'physics_prior_root', 'physics_prior_deep',
             # Any feature derived from observed soil moisture (LEAKAGE)
             'physics_obs_ratio', 'physics_obs_diff',
@@ -652,17 +1176,24 @@ class PreparedDataValidator:
             f"  Training: {X_train.shape[0]:,} samples, {X_train.shape[1]} features")
         logger.info(f"  Validation: {X_val.shape[0]:,} samples")
 
-        # LightGBM parameters
+        # FIX #4: Limit ML capacity to force learning physical relationships
+        # Shallow trees + more data per leaf + random feature sampling
+        # This prevents memorizing station fingerprints
         params = {
             'objective': 'regression',
             'metric': 'rmse',
             'boosting_type': 'gbdt',
-            'num_leaves': 31,
-            'learning_rate': 0.05,
-            'feature_fraction': 0.8,
-            'bagging_fraction': 0.8,
-            'bagging_freq': 5,
-            'min_child_samples': 20,
+            # FIX #4: Shallow trees (was 31 leaves → unlimited depth)
+            'max_depth': 5,
+            'num_leaves': 20,            # FIX #4: Fewer leaves (was 31)
+            'learning_rate': 0.03,       # Slower learning
+            # FIX #4: Only 60% features per tree (was 0.8)
+            'feature_fraction': 0.6,
+            'bagging_fraction': 0.7,     # 70% samples per tree (was 0.8)
+            'bagging_freq': 3,           # More frequent subsampling
+            'min_child_samples': 100,    # FIX #4: More data per leaf (was 20)
+            'lambda_l1': 0.1,            # L1 regularization
+            'lambda_l2': 1.0,            # L2 regularization
             'verbose': -1,
             'n_jobs': -1,
             'random_state': 42,
@@ -682,6 +1213,121 @@ class PreparedDataValidator:
         )
 
         return model, feature_cols
+
+    def train_hybrid_model_with_site_cv(
+        self,
+        df: pd.DataFrame,
+        horizon: str = '24h',
+        n_folds: int = 5,
+    ) -> Tuple[lgb.Booster, List[str]]:
+        """
+        FIX #3: Train with site-blocked cross-validation (GroupKFold).
+
+        This ensures ML NEVER sees a test site during training.
+        Without this, LightGBM can cheat by memorizing station patterns.
+
+        Returns the best model from cross-validation folds.
+        """
+        # Get feature columns (same exclusion logic)
+        exclude_cols = [
+            'station_id', 'network', 'station', 'region', 'dataset', 'date',
+            'soil_moisture', 'soil_moisture_min', 'soil_moisture_max', 'soil_moisture_std',
+            'residual', 'sensor_type', 'land_cover', 'climate', 'is_outlier',
+            # GEOGRAPHY FINGERPRINTS - REMOVED
+            'latitude', 'longitude', 'lat_normalized', 'lon_normalized',
+            'physics_prior_surface', 'physics_prior_root', 'physics_prior_deep',
+            'physics_obs_ratio', 'physics_obs_diff',
+        ]
+        exclude_cols += [c for c in df.columns if c.startswith(
+            'target_') or c.startswith('residual_target_')]
+        exclude_cols += [c for c in df.columns if c.startswith(
+            'sm_lag_') or c.startswith('sm_rolling_') or c.startswith('residual_lag_')]
+        exclude_cols += [c for c in df.columns if c.startswith(
+            'sm_mean') or c.startswith('sm_std') or c.startswith('sm_change')]
+
+        feature_cols = [
+            c for c in df.columns
+            if c not in exclude_cols
+            and df[c].dtype in ['float64', 'int64', 'float32', 'int32']
+        ]
+
+        target_col = f'residual_target_{horizon}'
+
+        # Filter valid data
+        valid_mask = df[target_col].notna()
+        df_valid = df[valid_mask].copy()
+
+        # Get station groups for GroupKFold
+        groups = df_valid['station_id'].values
+
+        X, y = self.prepare_ml_data(df_valid, target_col, feature_cols)
+
+        # GroupKFold ensures sites don't leak between train/val
+        gkf = GroupKFold(n_splits=n_folds)
+
+        best_model = None
+        best_val_rmse = float('inf')
+        fold_scores = []
+
+        logger.info(
+            f"  Site-blocked {n_folds}-fold CV on {df_valid['station_id'].nunique()} stations")
+
+        params = {
+            'objective': 'regression',
+            'metric': 'rmse',
+            'boosting_type': 'gbdt',
+            'max_depth': 5,
+            'num_leaves': 20,
+            'learning_rate': 0.03,
+            'feature_fraction': 0.6,
+            'bagging_fraction': 0.7,
+            'bagging_freq': 3,
+            'min_child_samples': 100,
+            'lambda_l1': 0.1,
+            'lambda_l2': 1.0,
+            'verbose': -1,
+            'n_jobs': -1,
+            'random_state': 42,
+        }
+
+        for fold, (train_idx, val_idx) in enumerate(gkf.split(X, y, groups)):
+            X_train_fold, X_val_fold = X[train_idx], X[val_idx]
+            y_train_fold, y_val_fold = y[train_idx], y[val_idx]
+
+            # Verify no site leakage
+            train_sites = set(groups[train_idx])
+            val_sites = set(groups[val_idx])
+            assert len(train_sites & val_sites) == 0, "Site leakage detected!"
+
+            train_data = lgb.Dataset(
+                X_train_fold, label=y_train_fold, feature_name=feature_cols)
+            val_data = lgb.Dataset(
+                X_val_fold, label=y_val_fold, reference=train_data)
+
+            model = lgb.train(
+                params,
+                train_data,
+                num_boost_round=500,
+                valid_sets=[val_data],
+                valid_names=['val'],
+                callbacks=[lgb.early_stopping(50, verbose=False)]
+            )
+
+            val_pred = model.predict(X_val_fold)
+            val_rmse = np.sqrt(mean_squared_error(y_val_fold, val_pred))
+            fold_scores.append(val_rmse)
+
+            if val_rmse < best_val_rmse:
+                best_val_rmse = val_rmse
+                best_model = model
+
+            logger.info(
+                f"    Fold {fold+1}: val_rmse={val_rmse:.4f}, train_sites={len(train_sites)}, val_sites={len(val_sites)}")
+
+        logger.info(
+            f"  CV mean RMSE: {np.mean(fold_scores):.4f} ± {np.std(fold_scores):.4f}")
+
+        return best_model, feature_cols
 
     def evaluate_model(
         self,
@@ -711,26 +1357,44 @@ class PreparedDataValidator:
         # Clip to valid range
         y_hybrid_pred = np.clip(y_hybrid_pred, 0, 0.6)
 
-        # Metrics
+        # Standard metrics
         rmse = np.sqrt(mean_squared_error(y_obs, y_hybrid_pred))
         mae = mean_absolute_error(y_obs, y_hybrid_pred)
         r2 = r2_score(y_obs, y_hybrid_pred)
         bias = np.mean(y_hybrid_pred - y_obs)
 
+        # KGE and NSE metrics
+        nse = compute_nse(y_obs, y_hybrid_pred)
+        kge, kge_r, kge_alpha, kge_beta = compute_kge(y_obs, y_hybrid_pred)
+
         # Physics-only metrics
         physics_rmse = np.sqrt(mean_squared_error(y_obs, physics_prior))
         physics_r2 = r2_score(y_obs, physics_prior)
+        physics_nse = compute_nse(y_obs, physics_prior)
+        physics_kge, physics_kge_r, physics_kge_alpha, physics_kge_beta = compute_kge(
+            y_obs, physics_prior)
 
         return {
             'horizon': horizon,
             'n_samples': len(y_obs),
+            # Hybrid metrics
             'hybrid_rmse': rmse,
             'hybrid_mae': mae,
             'hybrid_r2': r2,
             'hybrid_bias': bias,
+            'hybrid_nse': nse,
+            'hybrid_kge': kge,
+            'hybrid_kge_r': kge_r,
+            'hybrid_kge_alpha': kge_alpha,
+            'hybrid_kge_beta': kge_beta,
+            # Physics metrics
             'physics_rmse': physics_rmse,
             'physics_r2': physics_r2,
-            'improvement_pct': (physics_rmse - rmse) / physics_rmse * 100,
+            'physics_nse': physics_nse,
+            'physics_kge': physics_kge,
+            # Improvement
+            'improvement_rmse_pct': (physics_rmse - rmse) / physics_rmse * 100,
+            'improvement_kge': kge - physics_kge if not np.isnan(kge) and not np.isnan(physics_kge) else np.nan,
         }
 
     def evaluate_per_site(
@@ -773,6 +1437,13 @@ class PreparedDataValidator:
             # Get metadata
             row = site_df.iloc[0]
 
+            # Compute KGE and NSE
+            hybrid_nse = compute_nse(y_obs, y_pred)
+            hybrid_kge, hybrid_kge_r, hybrid_kge_alpha, hybrid_kge_beta = compute_kge(
+                y_obs, y_pred)
+            physics_nse = compute_nse(y_obs, y_physics)
+            physics_kge, _, _, _ = compute_kge(y_obs, y_physics)
+
             site_results.append({
                 'station_id': station_id,
                 'network': row.get('network', 'unknown'),
@@ -781,12 +1452,22 @@ class PreparedDataValidator:
                 'longitude': row.get('longitude', np.nan),
                 'n_samples': len(site_df),
                 'horizon': horizon,
+                # Hybrid metrics
                 'hybrid_rmse': np.sqrt(mean_squared_error(y_obs, y_pred)),
                 'hybrid_mae': mean_absolute_error(y_obs, y_pred),
                 'hybrid_r2': r2_score(y_obs, y_pred) if len(y_obs) > 1 else np.nan,
                 'hybrid_bias': np.mean(y_pred - y_obs),
+                'hybrid_nse': hybrid_nse,
+                'hybrid_kge': hybrid_kge,
+                'hybrid_kge_r': hybrid_kge_r,
+                'hybrid_kge_alpha': hybrid_kge_alpha,
+                'hybrid_kge_beta': hybrid_kge_beta,
+                # Physics metrics
                 'physics_rmse': np.sqrt(mean_squared_error(y_obs, y_physics)),
                 'physics_r2': r2_score(y_obs, y_physics) if len(y_obs) > 1 else np.nan,
+                'physics_nse': physics_nse,
+                'physics_kge': physics_kge,
+                # Observation stats
                 'mean_obs_sm': np.mean(y_obs),
                 'std_obs_sm': np.std(y_obs),
             })
@@ -800,10 +1481,22 @@ class PreparedDataValidator:
         print("=" * 70)
         print(f"📁 Data: {self.prepared_data_dir}")
         print(f"📤 Output: {self.output_dir}")
-        print(f"☀️  Weather: Open-Meteo API")
-        print(f"🌍 Satellite: {'GEE' if self.has_gee else 'SKIPPED'}")
-        print(f"🔬 Physics: SimpleWaterBalance (tropical PTFs)")
-        print(f"🤖 ML: LightGBM residual learner")
+        print("☀️  Weather: Open-Meteo API")
+
+        # Satellite data status - NDVI is critical for irrigation
+        if self.has_gee:
+            sat_status = "GEE Sentinel-2/Landsat (high-res NDVI)"
+        elif not self.skip_fetch:
+            sat_status = "MODIS NDVI (fallback)"
+        else:
+            sat_status = "Disabled (skip_fetch=True)"
+
+        print(f"🌍 Satellite: {sat_status}")
+
+        print(
+            f"🧪 Soil: {'iSDA Africa' if self.has_isda else 'SoilGrids (global)'}")
+        print("🔬 Physics: SimpleWaterBalance (tropical PTFs)")
+        print("🤖 ML: LightGBM residual learner")
         print("=" * 70 + "\n")
 
         # 1. Load prepared data
@@ -852,13 +1545,18 @@ class PreparedDataValidator:
             f"✓ Saved canonical table: {self.output_dir / 'canonical_table_train.csv'}")
 
         # 5. Train models for each horizon
+        # FIX #3: Use site-blocked cross-validation (GroupKFold)
+        # This ensures ML never sees test sites during training
         logger.info("\n" + "=" * 70)
-        logger.info("STEP 4: Train Hybrid Models")
+        logger.info("STEP 4: Train Hybrid Models (with Site-Blocked CV)")
         logger.info("=" * 70)
+        logger.info(
+            "NOTE: Using GroupKFold to prevent station fingerprint learning")
 
         all_results = []
 
-        # Create validation split from training data
+        # Create validation split from training data (for final evaluation only)
+        # The actual training uses site-blocked CV internally
         train_dates = train_with_targets['date']
         val_split_date = train_dates.quantile(0.8)
 
@@ -870,8 +1568,10 @@ class PreparedDataValidator:
         for horizon in HORIZONS.keys():
             logger.info(f"\n--- Training for {horizon} horizon ---")
 
-            model, feature_cols = self.train_hybrid_model(
-                train_split, val_split, horizon
+            # FIX #3: Use site-blocked CV instead of simple train/val split
+            # This trains with GroupKFold ensuring no site leakage
+            model, feature_cols = self.train_hybrid_model_with_site_cv(
+                train_with_targets, horizon, n_folds=5
             )
             self.models[horizon] = (model, feature_cols)
 
@@ -922,7 +1622,7 @@ class PreparedDataValidator:
         pivot = results_df.pivot_table(
             index='horizon',
             columns='split',
-            values=['hybrid_rmse', 'physics_rmse', 'improvement_pct']
+            values=['hybrid_rmse', 'physics_rmse', 'improvement_rmse_pct']
         ).round(4)
         print(pivot)
 
@@ -995,8 +1695,8 @@ def main():
         help="Limit number of stations (for testing)"
     )
     parser.add_argument(
-        "--skip-gee", action="store_true", default=True,
-        help="Skip Google Earth Engine (faster)"
+        "--use-gee", action="store_true", default=True,
+        help="Enable Google Earth Engine for satellite data (NDVI/LAI)"
     )
     parser.add_argument(
         "--skip-fetch", action="store_true", default=False,
@@ -1008,7 +1708,7 @@ def main():
     validator = PreparedDataValidator(
         prepared_data_dir=args.prepared_dir,
         output_dir=args.output_dir,
-        skip_gee=args.skip_gee,
+        skip_gee=not args.use_gee,
         skip_fetch=args.skip_fetch,
     )
 

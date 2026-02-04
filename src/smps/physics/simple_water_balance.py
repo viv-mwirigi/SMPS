@@ -1762,6 +1762,7 @@ def create_simple_config_improved(
     apply_adaptive_calibration: bool = True,
     soil_type: str = "nitisol",
     crop_type: str = "savanna",
+    ndvi_mean: Optional[float] = None,
 ) -> ModelConfig:
     """
     Create an improved model configuration with tropical PTFs and adaptive calibration.
@@ -1826,6 +1827,7 @@ def create_simple_config_improved(
             observed_stats=obs_stats,
             elevation_m=elevation_m,
             slope_percent=slope_percent,
+            ndvi_mean=ndvi_mean,
         )
 
         if calibrator is not None:

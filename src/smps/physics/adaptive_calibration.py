@@ -46,6 +46,108 @@ class ClimateZone(Enum):
     TEMPERATE = "Cfb"                # Oceanic/temperate
 
 
+class SoilClimateRegime(Enum):
+    """
+    Soil-climate regimes derived from ML residual analysis on ISMN data.
+
+    These regimes are designed to work with NEW SITES not in the training data.
+    Each regime has calibrated physics corrections based on observed biases.
+
+    The classification is based on:
+    - Clay content (affects water retention and drainage)
+    - Elevation (affects ET and temperature)
+    - Precipitation regime (affects water balance)
+    - Geographic region (affects soil mineralogy, especially oxide clays)
+
+    Corrections were derived from residual analysis on 61 ISMN stations.
+    """
+    # Cluster 0: Semi-arid lowlands, moderate clay, well-calibrated
+    SEMI_ARID_LOWLAND = 0
+
+    # Cluster 1: Highland savanna, LOW clay, DRY BIAS → needs more water storage
+    HIGHLAND_SAVANNA_LOW_CLAY = 1
+
+    # Cluster 2: Moderate clay across climates, slight WET BIAS → faster drainage
+    MODERATE_CLAY_MIXED = 2
+
+    # Cluster 3: HIGH clay East African highlands, SEVERE WET BIAS → much faster drainage
+    HIGH_CLAY_OXIDE = 3
+
+    # Cluster 4: Wet tropical highlands, moderate clay, well-calibrated
+    WET_TROPICAL_HIGHLAND = 4
+
+
+def classify_soil_climate_regime(
+    latitude: float,
+    longitude: float,
+    clay_percent: float,
+    elevation_m: float,
+    mean_annual_precip_mm: float,
+) -> SoilClimateRegime:
+    """
+    Classify a site into a soil-climate regime for physics corrections.
+
+    This function is designed for DEPLOYMENT TO NEW SITES not in training data.
+    It uses only site characteristics that can be obtained from:
+    - Coordinates (latitude, longitude)
+    - Soil databases (iSDA for Africa, SoilGrids globally)
+    - Climate databases (WorldClim, ERA5)
+
+    The classification rules were derived from K-means clustering of ISMN sites
+    followed by analysis of what site characteristics predict cluster membership.
+
+    Args:
+        latitude: Site latitude (degrees)
+        longitude: Site longitude (degrees)
+        clay_percent: Clay content (%, from soil database)
+        elevation_m: Elevation (m, from DEM)
+        mean_annual_precip_mm: Mean annual precipitation (mm/year)
+
+    Returns:
+        SoilClimateRegime enum indicating which correction regime to apply
+
+    Example:
+        >>> regime = classify_soil_climate_regime(
+        ...     latitude=-2.0, longitude=36.0,
+        ...     clay_percent=55, elevation_m=1500,
+        ...     mean_annual_precip_mm=1800
+        ... )
+        >>> regime
+        <SoilClimateRegime.HIGH_CLAY_OXIDE: 3>
+    """
+    mean_precip_per_day = mean_annual_precip_mm / 365.0
+    is_highland = elevation_m > 1000
+    is_east_africa = 25 <= longitude <= 45  # East African Rift region
+
+    # Decision tree based on cluster analysis
+    # Priority order matters - more specific conditions first
+
+    # Regime 4: Wet tropical highland (precip > 3000mm/year AND highland)
+    if mean_precip_per_day > 8 and is_highland:
+        return SoilClimateRegime.WET_TROPICAL_HIGHLAND
+
+    # Regime 3: High clay (>45%) in East African highlands
+    # These have oxide clays that drain much faster than PTFs predict
+    if clay_percent > 45 and is_east_africa and is_highland:
+        return SoilClimateRegime.HIGH_CLAY_OXIDE
+
+    # Also include high clay (>50%) highlands elsewhere
+    if clay_percent > 50 and is_highland and mean_precip_per_day > 4:
+        return SoilClimateRegime.HIGH_CLAY_OXIDE
+
+    # Regime 0: Semi-arid lowlands (precip < 900mm/year, low elevation)
+    if mean_precip_per_day < 2.5 and not is_highland:
+        return SoilClimateRegime.SEMI_ARID_LOWLAND
+
+    # Regime 1: Highland with LOW clay - these have dry bias
+    if is_highland and clay_percent < 25 and mean_precip_per_day < 4:
+        return SoilClimateRegime.HIGHLAND_SAVANNA_LOW_CLAY
+
+    # Regime 2: Default - moderate clay, moderate conditions
+    # This is the most common regime and has slight wet bias
+    return SoilClimateRegime.MODERATE_CLAY_MIXED
+
+
 class LandCoverType(Enum):
     """Land cover types affecting ET and root distribution."""
     CROPLAND = "cropland"            # Agricultural crops
@@ -327,29 +429,16 @@ class AdaptivePhysicsCalibrator:
         Returns:
             Estimated cluster ID (0-4)
         """
-        clay = site.clay_percent
-        is_highland = site.elevation_m > 1000 if hasattr(
-            site, 'elevation_m') else False
-        is_east_africa = 25 <= site.longitude <= 45
-
-        # Cluster 4: Wet tropical (very high precip > 10 mm/day)
-        if mean_precip_per_day > 8 and is_highland:
-            return 4
-
-        # Cluster 3: High clay (>45%) East African highlands
-        if clay > 45 and is_east_africa and is_highland:
-            return 3
-
-        # Cluster 0: Semi-arid (low precip, low elevation)
-        if mean_precip_per_day < 2.5 and not is_highland:
-            return 0
-
-        # Cluster 1: Highland savanna with lower clay
-        if is_highland and clay < 25 and mean_precip_per_day < 4:
-            return 1
-
-        # Cluster 2: Moderate clay, moderate conditions (most common)
-        return 2
+        # Use the standalone classification function for consistency
+        regime = classify_soil_climate_regime(
+            latitude=site.latitude,
+            longitude=site.longitude,
+            clay_percent=site.clay_percent,
+            elevation_m=site.elevation_m if hasattr(
+                site, 'elevation_m') else 200.0,
+            mean_annual_precip_mm=mean_precip_per_day * 365.0,
+        )
+        return regime.value
 
     def _derive_parameters(self) -> AdaptiveCalibrationParameters:
         """Derive adaptive parameters from site characteristics."""

@@ -1,0 +1,12 @@
+{
+  "clay_pct": 14.1,
+  "sand_pct": 68.7,
+  "silt_pct": 17.2,
+  "porosity": 0.433,
+  "field_capacity": 0.231,
+  "wilting_point": 0.128,
+  "bulk_density": 1.5025499999999998,
+  "slope_degrees": 5.0,
+  "source": "isda_africa_api",
+  "confidence": 0.9
+}

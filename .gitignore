@@ -49,6 +49,10 @@ Thumbs.db
 # Logs
 *.log
 
+# Results and generated data
+results/
+*.csv
+
 # Sensitive files
 secrets/
 *.key

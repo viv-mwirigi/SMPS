@@ -179,6 +179,37 @@ class SoilMoistureModel(Protocol):
         ...
 
 
+@dataclass
+class PhysicsModelOutput:
+    """Output from physics-based water balance model"""
+    date: Date
+    psi_surface_kpa: float  # Matric potential in surface layer (kPa)
+    psi_root_kpa: float     # Matric potential in root zone (kPa)
+    # Matric potential in deep layer (kPa)
+    psi_deep_kpa: Optional[float] = None
+
+    # Water balance fluxes (mm)
+    precipitation_mm: float = 0.0
+    infiltration_mm: float = 0.0
+    runoff_mm: float = 0.0
+    evaporation_mm: float = 0.0
+    transpiration_mm: float = 0.0
+    drainage_mm: float = 0.0
+
+    # Model diagnostics
+    water_balance_error_mm: float = 0.0
+    converged: bool = True
+
+    def compute_theta_from_psi(self, van_genuchten_params: 'VanGenuchtenParams') -> 'PhysicsModelOutput':
+        """
+        Compute volumetric water content from matric potential.
+        This is a no-op since we operate in ψ space, but kept for compatibility.
+        """
+        # The model already operates in ψ space, so no conversion needed
+        # This method exists for API compatibility
+        return self
+
+
 # Pydantic models for API serialization
 class PredictionRequest(BaseModel):
     """Request for soil moisture prediction"""
