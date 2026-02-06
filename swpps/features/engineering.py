@@ -27,6 +27,13 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from swpps.core.types import VanGenuchtenParams
+from swpps.physics.van_genuchten import (
+    potential_from_water_content,
+    specific_water_capacity,
+    water_content_from_potential,
+)
+
 logger = logging.getLogger("swpps.features.engineering")
 
 
@@ -67,6 +74,7 @@ class FeatureConfig:
 
     # Soil hydraulic parameters (for physics features)
     # These can be overridden with site-specific values
+    vg_params: Optional[VanGenuchtenParams] = None
     Ksat_mm_day: float = 100.0  # Saturated hydraulic conductivity
     theta_sat: float = 0.45     # Saturated water content
     theta_res: float = 0.05     # Residual water content
@@ -95,9 +103,29 @@ class FeatureEngineer:
     - State: Current soil water status
     """
 
-    def __init__(self, config: Optional[FeatureConfig] = None):
+    def __init__(self, config: Optional[FeatureConfig] = None, *, vg_params: Optional[VanGenuchtenParams] = None):
         self.config = config or FeatureConfig()
+        if vg_params is not None:
+            self.config.vg_params = vg_params
         self.feature_names: List[str] = []
+
+    def _get_vg_params(self) -> VanGenuchtenParams:
+        """Return the Van Genuchten params to use for θ↔ψ conversions.
+
+        Preference order:
+        1) Explicit `FeatureConfig.vg_params` (keeps train/infer consistent)
+        2) Constructed from scalar config fields (legacy/default behavior)
+        """
+        if self.config.vg_params is not None:
+            return self.config.vg_params
+
+        return VanGenuchtenParams(
+            theta_r=float(self.config.theta_res),
+            theta_s=float(self.config.theta_sat),
+            alpha=float(self.config.alpha_vg),
+            n=float(self.config.n_vg),
+            K_sat=float(self.config.Ksat_mm_day),
+        )
 
     def create_features(
         self,
@@ -897,17 +925,14 @@ class FeatureEngineer:
         θ = θr + (θs - θr) / [1 + (α|ψ|)^n]^m
         where m = 1 - 1/n
         """
-        theta_s = self.config.theta_sat
-        theta_r = self.config.theta_res
-        alpha = self.config.alpha_vg
-        n = self.config.n_vg
-        m = 1 - 1/n
-
-        psi_abs = np.abs(psi)
-        Se = (1 + (alpha * psi_abs) ** n) ** (-m)
-        theta = theta_r + (theta_s - theta_r) * Se
-
-        return theta
+        params = self._get_vg_params()
+        psi_values = pd.to_numeric(psi, errors="coerce").to_numpy(dtype=float)
+        theta_values = np.array([
+            water_content_from_potential(
+                p, params) if np.isfinite(p) else np.nan
+            for p in psi_values
+        ], dtype=float)
+        return pd.Series(theta_values, index=psi.index)
 
     def _theta_to_psi(self, theta: pd.Series) -> pd.Series:
         """
@@ -915,20 +940,15 @@ class FeatureEngineer:
 
         Inverse Van Genuchten equation.
         """
-        theta_s = self.config.theta_sat
-        theta_r = self.config.theta_res
-        alpha = self.config.alpha_vg
-        n = self.config.n_vg
-        m = 1 - 1/n
-
-        # Effective saturation
-        theta_clipped = np.clip(theta, theta_r + 0.001, theta_s - 0.001)
-        Se = (theta_clipped - theta_r) / (theta_s - theta_r)
-
-        # Inverse VG
-        psi = -(1/alpha) * (Se ** (-1/m) - 1) ** (1/n)
-
-        return psi
+        params = self._get_vg_params()
+        theta_values = pd.to_numeric(
+            theta, errors="coerce").to_numpy(dtype=float)
+        psi_values = np.array([
+            potential_from_water_content(
+                t, params) if np.isfinite(t) else np.nan
+            for t in theta_values
+        ], dtype=float)
+        return pd.Series(psi_values, index=theta.index)
 
     def _retention_curve_slope(self, psi: pd.Series) -> pd.Series:
         """
@@ -940,33 +960,16 @@ class FeatureEngineer:
 
         dψ/dθ = dψ/dSe × dSe/dθ
         """
-        theta_s = self.config.theta_sat
-        theta_r = self.config.theta_res
-        alpha = self.config.alpha_vg
-        n = self.config.n_vg
-        m = 1 - 1/n
+        params = self._get_vg_params()
+        psi_values = pd.to_numeric(psi, errors="coerce").to_numpy(dtype=float)
 
-        # θ from ψ
-        theta = self._psi_to_theta(psi)
-
-        # Se
-        Se = np.clip((theta - theta_r) / (theta_s - theta_r), 0.001, 0.999)
-
-        # dθ/dψ from Van Genuchten (derivative)
-        psi_abs = np.abs(psi).clip(lower=0.1)
-
-        # dSe/d|ψ| = -m × n × α^n × |ψ|^(n-1) × (1 + (α|ψ|)^n)^(-m-1)
-        term = (alpha * psi_abs) ** n
-        dSe_dpsi = -m * n * (alpha ** n) * (psi_abs **
-                                            (n-1)) * ((1 + term) ** (-m - 1))
-
-        # dθ/dψ = (θs - θr) × dSe/dψ
-        dtheta_dpsi = (theta_s - theta_r) * dSe_dpsi
-
-        # dψ/dθ = 1 / (dθ/dψ)
-        dpsi_dtheta = 1 / (dtheta_dpsi + 1e-10)
-
-        return dpsi_dtheta
+        # specific_water_capacity returns dθ/dψ (1/kPa); we want dψ/dθ
+        dtheta_dpsi = np.array([
+            specific_water_capacity(p, params) if np.isfinite(p) else np.nan
+            for p in psi_values
+        ], dtype=float)
+        dpsi_dtheta = 1.0 / (dtheta_dpsi + 1e-12)
+        return pd.Series(dpsi_dtheta, index=psi.index)
 
     def _add_temporal_features(self, df: pd.DataFrame) -> None:
         """Add time-based features."""

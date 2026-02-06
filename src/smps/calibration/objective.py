@@ -1,119 +1,306 @@
-from __future__ import annotations
+"""
+Objective Functions for Calibration.
 
-from dataclasses import replace
-from typing import Dict, Tuple
+Provides various objective functions for parameter optimization:
+- RMSE (minimize error)
+- NSE (maximize efficiency)
+- KGE (maximize efficiency)
+- Multi-objective combinations
+"""
 
 import numpy as np
-import pandas as pd
-
-from smps.calibration.metrics import kge, ubrmse
-from smps.calibration.problem import CalibrationConfig, CalibrationDataset, get_forcing_frame, infer_obs_columns, normalize_weights
-from smps.calibration.parameterization import apply_parameters_to_model_params
-from smps.physics.simple_water_balance import SimpleWaterBalance, ModelConfig
+from typing import Callable, List, Optional, Tuple
 
 
-def evaluate_parameters(
-    base_model: SimpleWaterBalance,
-    dataset: CalibrationDataset,
-    config: CalibrationConfig,
-    parameters: Dict[str, float],
-) -> Tuple[float, Dict[str, float]]:
-    """Compute objective + diagnostics for a parameter set."""
+class ObjectiveFunction:
+    """
+    Wrapper for objective functions used in calibration.
 
-    df_all = dataset.df
-    obs_cols = config.obs_theta_columns or infer_obs_columns(df_all)
-    if not obs_cols:
-        raise ValueError(
-            "No observation columns found. Provide obs_theta_columns or columns starting with 'theta_obs_'.")
+    Handles sign conventions (minimize vs maximize) and
+    combines multiple objectives.
+    """
 
-    depth_w = normalize_weights(config.depth_weights, len(obs_cols))
+    def __init__(
+        self,
+        name: str,
+        func: Callable[[np.ndarray, np.ndarray], float],
+        minimize: bool = True,
+        weight: float = 1.0,
+    ):
+        """
+        Initialize objective function.
 
-    all_ubrmse = []
-    all_one_minus_kge = []
-    all_mb_penalty = []
+        Args:
+            name: Name of the objective
+            func: Function taking (observed, predicted) -> score
+            minimize: True if lower is better
+            weight: Weight for multi-objective optimization
+        """
+        self.name = name
+        self.func = func
+        self.minimize = minimize
+        self.weight = weight
 
-    for group_key in dataset.group_keys():
-        df_site = dataset.for_group(group_key)
-        if dataset.date_column in df_site.columns:
-            df_site = df_site.sort_values(dataset.date_column)
+    def __call__(
+        self,
+        observed: np.ndarray,
+        predicted: np.ndarray,
+    ) -> float:
+        """
+        Evaluate objective.
 
-        forcings = get_forcing_frame(df_site)
+        Returns value suitable for minimization (multiply by -1 if needed).
+        """
+        score = self.func(observed, predicted)
 
-        # Clone params and reset state before each site.
-        tuned_params = apply_parameters_to_model_params(
-            base_model.params, parameters)
-        model = SimpleWaterBalance(tuned_params)
+        if not self.minimize:
+            # Convert maximize to minimize
+            score = -score
 
-        # Run and collect outputs (end-of-day theta_layer_i columns)
-        sim_df, _ = model.run_period(
-            dates=forcings[dataset.date_column],
-            precipitation=forcings['precipitation'],
-            et0=forcings['et0'],
-            warmup_days=config.warmup_days)
+        return score * self.weight
 
-        # Ensure sim_df is a pandas DataFrame (model.run_period may return a list)
-        if sim_df is None:
-            continue
-        if not hasattr(sim_df, "loc") or not hasattr(sim_df, "columns"):
-            sim_df = pd.DataFrame(sim_df)
 
-        if len(sim_df) == 0:
-            continue
+def rmse_objective(
+    observed: np.ndarray,
+    predicted: np.ndarray,
+) -> float:
+    """
+    Root Mean Square Error objective.
 
-        # Align obs for the evaluation period
-        eval_df = df_site.iloc[config.warmup_days:].copy()
-        if eval_df.empty:
-            continue
+    RMSE = sqrt(mean((obs - pred)²))
 
-        # Mass balance penalty
-        wb_err = sim_df.loc[:,
-                            "water_balance_error_mm"].to_numpy().astype(float)
-        mb_excess = np.maximum(0.0, np.abs(wb_err) -
-                               float(config.mass_balance_tolerance_mm))
-        mb_penalty = float(np.mean(mb_excess * mb_excess))
-        all_mb_penalty.append(mb_penalty)
+    Lower is better.
+    """
+    obs = np.asarray(observed).flatten()
+    pred = np.asarray(predicted).flatten()
 
-        for j, col in enumerate(obs_cols):
-            if col not in eval_df.columns:
-                continue
+    valid = np.isfinite(obs) & np.isfinite(pred)
+    if np.sum(valid) < 2:
+        return 1e6
 
-            obs = np.asarray(eval_df[col], dtype=float)
+    return np.sqrt(np.mean((obs[valid] - pred[valid]) ** 2))
 
-            sim_col = f"theta_layer_{j}"
-            if sim_col not in sim_df.columns:
-                continue
-            sim = np.asarray(sim_df[sim_col], dtype=float)
 
-            u = ubrmse(sim, obs)
-            # normalize by obs std (robust to scale)
-            std = float(np.nanstd(obs))
-            denom = std if std > 1e-6 else 1.0
-            u_norm = float(u / denom) if np.isfinite(u) else float("nan")
-            all_ubrmse.append(float(depth_w[j]) * u_norm)
+def mae_objective(
+    observed: np.ndarray,
+    predicted: np.ndarray,
+) -> float:
+    """
+    Mean Absolute Error objective.
 
-            k = kge(sim, obs)
-            one_minus = float(1.0 - k) if np.isfinite(k) else 1.0
-            all_one_minus_kge.append(float(depth_w[j]) * one_minus)
+    MAE = mean(|obs - pred|)
 
-    # Aggregate; if nothing computed, return large objective.
-    if not all_ubrmse and not all_one_minus_kge:
-        return 1e6, {"n_terms": 0.0}
+    Lower is better.
+    """
+    obs = np.asarray(observed).flatten()
+    pred = np.asarray(predicted).flatten()
 
-    u_term = float(np.nansum(all_ubrmse))
-    k_term = float(np.nansum(all_one_minus_kge))
-    mb_term = float(np.nanmean(all_mb_penalty)) if all_mb_penalty else 0.0
+    valid = np.isfinite(obs) & np.isfinite(pred)
+    if np.sum(valid) < 2:
+        return 1e6
 
-    obj = (
-        float(config.w_ubrmse) * u_term
-        + float(config.w_kge) * k_term
-        + float(config.w_mass_balance) * mb_term
-    )
+    return np.mean(np.abs(obs[valid] - pred[valid]))
 
-    diagnostics = {
-        "ubrmse_norm_weighted": u_term,
-        "one_minus_kge_weighted": k_term,
-        "mass_balance_penalty": mb_term,
-        "objective": obj,
+
+def nse_objective(
+    observed: np.ndarray,
+    predicted: np.ndarray,
+) -> float:
+    """
+    Nash-Sutcliffe Efficiency objective.
+
+    NSE = 1 - Σ(obs - pred)² / Σ(obs - mean(obs))²
+
+    Higher is better (max = 1).
+    """
+    obs = np.asarray(observed).flatten()
+    pred = np.asarray(predicted).flatten()
+
+    valid = np.isfinite(obs) & np.isfinite(pred)
+    if np.sum(valid) < 2:
+        return -1e6
+
+    obs_v = obs[valid]
+    pred_v = pred[valid]
+
+    obs_mean = np.mean(obs_v)
+    ss_res = np.sum((obs_v - pred_v) ** 2)
+    ss_tot = np.sum((obs_v - obs_mean) ** 2)
+
+    if ss_tot < 1e-10:
+        return -1e6
+
+    return 1.0 - ss_res / ss_tot
+
+
+def kge_objective(
+    observed: np.ndarray,
+    predicted: np.ndarray,
+) -> float:
+    """
+    Kling-Gupta Efficiency objective.
+
+    KGE = 1 - sqrt((r-1)² + (α-1)² + (β-1)²)
+
+    Higher is better (max = 1).
+    """
+    obs = np.asarray(observed).flatten()
+    pred = np.asarray(predicted).flatten()
+
+    valid = np.isfinite(obs) & np.isfinite(pred)
+    if np.sum(valid) < 2:
+        return -1e6
+
+    obs_v = obs[valid]
+    pred_v = pred[valid]
+
+    # Correlation
+    r = np.corrcoef(obs_v, pred_v)[0, 1]
+
+    # Variability ratio
+    std_obs = np.std(obs_v)
+    std_pred = np.std(pred_v)
+    alpha = std_pred / std_obs if std_obs > 1e-10 else 1.0
+
+    # Bias ratio
+    mean_obs = np.mean(obs_v)
+    mean_pred = np.mean(pred_v)
+    beta = mean_pred / mean_obs if abs(mean_obs) > 1e-10 else 1.0
+
+    if not np.isfinite(r):
+        return -1e6
+
+    return 1.0 - np.sqrt((r - 1)**2 + (alpha - 1)**2 + (beta - 1)**2)
+
+
+def kge_np_objective(
+    observed: np.ndarray,
+    predicted: np.ndarray,
+) -> float:
+    """
+    Non-parametric KGE (KGE') objective.
+
+    Uses Spearman correlation instead of Pearson for
+    robustness to outliers.
+
+    Higher is better (max = 1).
+    """
+    from scipy.stats import spearmanr
+
+    obs = np.asarray(observed).flatten()
+    pred = np.asarray(predicted).flatten()
+
+    valid = np.isfinite(obs) & np.isfinite(pred)
+    if np.sum(valid) < 2:
+        return -1e6
+
+    obs_v = obs[valid]
+    pred_v = pred[valid]
+
+    # Spearman correlation
+    r_sp, _ = spearmanr(obs_v, pred_v)
+
+    # Variability ratio (using CV)
+    cv_obs = np.std(obs_v) / np.mean(obs_v) if np.mean(obs_v) != 0 else 0
+    cv_pred = np.std(pred_v) / np.mean(pred_v) if np.mean(pred_v) != 0 else 0
+    alpha = cv_pred / cv_obs if cv_obs > 1e-10 else 1.0
+
+    # Bias ratio
+    beta = np.mean(pred_v) / \
+        np.mean(obs_v) if abs(np.mean(obs_v)) > 1e-10 else 1.0
+
+    if not np.isfinite(r_sp):
+        return -1e6
+
+    return 1.0 - np.sqrt((r_sp - 1)**2 + (alpha - 1)**2 + (beta - 1)**2)
+
+
+def log_nse_objective(
+    observed: np.ndarray,
+    predicted: np.ndarray,
+    eps: float = 1.0,
+) -> float:
+    """
+    Log-transformed NSE objective.
+
+    Emphasizes low flows / dry conditions.
+
+    Higher is better.
+    """
+    obs = np.asarray(observed).flatten()
+    pred = np.asarray(predicted).flatten()
+
+    # For matric potential, work with absolute values
+    obs_abs = np.abs(obs) + eps
+    pred_abs = np.abs(pred) + eps
+
+    valid = np.isfinite(obs_abs) & np.isfinite(pred_abs)
+    if np.sum(valid) < 2:
+        return -1e6
+
+    log_obs = np.log(obs_abs[valid])
+    log_pred = np.log(pred_abs[valid])
+
+    mean_log_obs = np.mean(log_obs)
+    ss_res = np.sum((log_obs - log_pred) ** 2)
+    ss_tot = np.sum((log_obs - mean_log_obs) ** 2)
+
+    if ss_tot < 1e-10:
+        return -1e6
+
+    return 1.0 - ss_res / ss_tot
+
+
+def multi_objective(
+    observed: np.ndarray,
+    predicted: np.ndarray,
+    objectives: List[ObjectiveFunction],
+) -> float:
+    """
+    Combine multiple objectives into weighted sum.
+
+    Args:
+        observed: Observed values
+        predicted: Predicted values
+        objectives: List of ObjectiveFunction instances
+
+    Returns:
+        Weighted sum of objectives (for minimization)
+    """
+    total = 0.0
+
+    for obj in objectives:
+        total += obj(observed, predicted)
+
+    return total
+
+
+def create_default_multi_objective() -> List[ObjectiveFunction]:
+    """
+    Create default multi-objective setup.
+
+    Combines KGE and RMSE with appropriate weights.
+    """
+    return [
+        ObjectiveFunction("KGE", kge_objective, minimize=False, weight=1.0),
+        ObjectiveFunction("RMSE", rmse_objective, minimize=True, weight=0.01),
+    ]
+
+
+def compute_all_objectives(
+    observed: np.ndarray,
+    predicted: np.ndarray,
+) -> dict:
+    """
+    Compute all available objective values.
+
+    Returns:
+        Dictionary of objective name -> value
+    """
+    return {
+        "RMSE": rmse_objective(observed, predicted),
+        "MAE": mae_objective(observed, predicted),
+        "NSE": nse_objective(observed, predicted),
+        "KGE": kge_objective(observed, predicted),
+        "logNSE": log_nse_objective(observed, predicted),
     }
-
-    return obj, diagnostics

@@ -320,11 +320,17 @@ class PhysicsModelOutput:
         """
         # Delayed import to avoid circular dependency
         from swpps.physics.van_genuchten import (
-            VanGenuchtenParams, water_content_from_potential
+            estimate_van_genuchten_params,
+            water_content_from_potential,
         )
 
         if vg_params is None:
-            vg_params = VanGenuchtenParams()
+            # Default to a reasonable loam-like profile.
+            vg_params = estimate_van_genuchten_params(
+                sand_percent=40.0,
+                clay_percent=20.0,
+                organic_matter_percent=2.0,
+            )
 
         self.theta_surface = water_content_from_potential(
             self.psi_surface_kpa, vg_params
@@ -399,11 +405,16 @@ class PredictionResult:
             Self with theta_predicted populated
         """
         from swpps.physics.van_genuchten import (
-            VanGenuchtenParams, water_content_from_potential
+            estimate_van_genuchten_params,
+            water_content_from_potential,
         )
 
         if vg_params is None:
-            vg_params = VanGenuchtenParams()
+            vg_params = estimate_van_genuchten_params(
+                sand_percent=40.0,
+                clay_percent=20.0,
+                organic_matter_percent=2.0,
+            )
 
         self.theta_predicted = water_content_from_potential(
             self.psi_predicted_kpa, vg_params
@@ -416,7 +427,16 @@ class PredictionResult:
 class IrrigationDecision:
     """Irrigation decision with timing and amount."""
     should_irrigate: bool
-    urgency: str  # "immediate", "soon", "scheduled", "none"
+
+    # High-level urgency for UI/ops
+    urgency: str = "none"  # "immediate", "soon", "scheduled", "none"
+
+    # Action-style interface (kept for compatibility with existing pipeline code)
+    action: Optional[str] = None  # e.g. "irrigate_now", "schedule", "wait"
+    amount_mm: float = 0.0
+    status: Optional[str] = None
+    current_psi_kpa: Optional[MatricPotential] = None
+    scheduled_time_hours: Optional[float] = None
 
     # When to irrigate
     recommended_time: Optional[datetime] = None

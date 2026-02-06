@@ -1,0 +1,55 @@
+{
+  "timestamp": "2026-02-06T00:00:00Z",
+  "reproducibility_manager": {
+    "master_seed": 42,
+    "component_seeds": {
+      "sklearn": 1608637542,
+      "lightgbm": 3421126067,
+      "torch": 4083286876,
+      "numpy": 787846414,
+      "python_random": 3143890026,
+      "cv_split": 3348747335,
+      "data_split": 2571218620,
+      "feature_engineering": 2563451924,
+      "physics_validation": 670094950,
+      "sensitivity_analysis": 1914837113,
+      "ensemble_generation": 669991378,
+      "bootstrap": 429389014,
+      "hyperopt": 249467210
+    },
+    "enforce_determinism": true,
+    "initialized": false,
+    "python_version": "3.13.11 (main, Dec  8 2025, 11:43:54) [GCC 15.2.0]",
+    "numpy_version": "2.4.1",
+    "environment_variables": {
+      "PYTHONHASHSEED": "3143890026",
+      "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+      "LIGHTGBM_SEED": "3421126067"
+    }
+  },
+  "environment_validation": {
+    "python_version": "3.13.11 (main, Dec  8 2025, 11:43:54) [GCC 15.2.0]",
+    "numpy_version": "2.4.1",
+    "pandas_version": "3.0.0",
+    "sklearn_version": "1.8.0",
+    "lightgbm_version": "4.6.0",
+    "all_versions_pinned": true,
+    "issues": []
+  },
+  "data_versioning_status": {
+    "provenance_dir_exists": true,
+    "dvc_available": false
+  },
+  "execution_order_status": {
+    "tasks_registered": 7,
+    "execution_plan": [
+      "load_raw_data",
+      "validate_data",
+      "preprocess_data",
+      "engineer_features",
+      "train_model",
+      "physics_validation",
+      "cross_validation"
+    ]
+  }
+}

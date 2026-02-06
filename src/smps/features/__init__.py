@@ -1,15 +1,13 @@
-"""Feature engineering utilities for soil moisture prediction."""
+"""
+Feature engineering module for soil water potential prediction.
+"""
 
-from smps.features.engineering import FeatureEngineer
-from smps.features.advanced import (
-    AdvancedFeatureEngineer,
-    create_temporal_features,
-    create_spatial_features,
+from smps.features.engineer import (
+    FeatureEngineer,
+    FeatureConfig,
 )
 
 __all__ = [
     "FeatureEngineer",
-    "AdvancedFeatureEngineer",
-    "create_temporal_features",
-    "create_spatial_features",
+    "FeatureConfig",
 ]

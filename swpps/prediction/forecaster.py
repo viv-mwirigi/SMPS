@@ -13,8 +13,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from swpps.core.types import MatricPotential, PredictionResult, VanGenuchtenParams
-from swpps.physics.water_balance import TensionSpaceWaterBalance
+from swpps.core.types import MatricPotential, PredictionResult, SoilMoistureStatus, VanGenuchtenParams
+from swpps.physics.van_genuchten import water_content_from_potential
+from swpps.physics.water_balance import LayerConfig, TensionSpaceWaterBalance, WaterBalanceConfig
 from swpps.ml.hybrid_model import HybridTensionModel, HybridModelConfig
 from swpps.features.engineering import FeatureEngineer, FeatureConfig
 
@@ -63,17 +64,31 @@ class SoilWaterForecaster:
         self.config = config or ForecastConfig()
         self.vg_params = vg_params
 
-        # Initialize physics model
-        self.physics_model = TensionSpaceWaterBalance(
-            vg_params=vg_params,
-            root_depth_m=self.config.root_depth_m,
+        # Initialize physics model (daily timestep water balance)
+        # Use a small 3-layer profile to preserve surface/root/deep dynamics.
+        layer_thickness = 1.0 / 3.0
+        layers = [
+            LayerConfig(
+                depth_top_m=i * layer_thickness,
+                depth_bottom_m=(i + 1) * layer_thickness,
+                van_genuchten=vg_params,
+            )
+            for i in range(3)
+        ]
+        wb_config = WaterBalanceConfig(
+            layers=layers,
+            initial_psi_kpa=-50.0,
         )
+        self.physics_model = TensionSpaceWaterBalance(wb_config)
 
         # ML model (will be set after training)
         self.hybrid_model: Optional[HybridTensionModel] = None
 
         # Feature engineer
-        self.feature_engineer = FeatureEngineer(self.config.feature_config)
+        self.feature_engineer = FeatureEngineer(
+            self.config.feature_config,
+            vg_params=self.vg_params,
+        )
 
         # Track state
         self.is_fitted = False
@@ -163,38 +178,47 @@ class SoilWaterForecaster:
         return results
 
     def _run_physics_simulation(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Run physics model over historical data."""
-        results = []
+        """Run physics model over historical data.
 
-        # Initialize with first observation if available
-        psi_init = df.iloc[0].get("psi_observed_kpa", -50.0)
+        The physics model is daily. If the input is sub-daily, we aggregate
+        to daily totals/means for forcing.
+        """
+        if not isinstance(df.index, pd.DatetimeIndex):
+            raise ValueError("training_data must have a DatetimeIndex")
+
+        # Aggregate forcing to daily
+        daily = pd.DataFrame(index=df.resample("1D").mean().index)
+        daily["precipitation_mm"] = df.get("precipitation", df.get(
+            "precipitation_mm", 0.0)).resample("1D").sum()
+        daily["et0_mm"] = df.get("evapotranspiration", df.get(
+            "et0_mm", 0.0)).resample("1D").sum()
+        daily["irrigation_mm"] = df.get("irrigation", df.get(
+            "irrigation_mm", 0.0)).resample("1D").sum()
+        daily["ndvi"] = df.get("ndvi", np.nan).resample("1D").mean()
+
+        psi_init = float(df.iloc[0].get("psi_observed_kpa", -50.0))
         self.physics_model.reset(psi_init)
 
-        for idx, row in df.iterrows():
-            # Extract forcing data
-            precip = row.get("precipitation", 0.0)
-            et = row.get("evapotranspiration", 0.0)
-            irrig = row.get("irrigation", 0.0)
-            temp = row.get("temperature_2m", 20.0)
-
-            # Step physics model
-            output = self.physics_model.step(
-                dt_hours=self.config.physics_dt_hours,
-                precipitation_mm=precip,
-                et_mm=et,
-                irrigation_mm=irrig,
-                temperature_c=temp,
+        outputs = []
+        for day, row in daily.iterrows():
+            out = self.physics_model.step(
+                current_date=day.date(),
+                precipitation_mm=float(row.get("precipitation_mm", 0.0)),
+                et0_mm=float(row.get("et0_mm", 0.0)),
+                ndvi=(None if not np.isfinite(row.get("ndvi", np.nan))
+                      else float(row.get("ndvi"))),
+                irrigation_mm=float(row.get("irrigation_mm", 0.0)),
             )
-
-            results.append({
-                "psi_surface_kpa": output.psi_surface_kpa,
-                "psi_root_kpa": output.psi_root_kpa,
-                "et_physics_mm": output.et_actual_mm,
-                "drainage_physics_mm": output.drainage_mm,
-                "runoff_physics_mm": output.runoff_mm,
+            outputs.append({
+                "psi_surface_kpa": out.psi_surface_kpa,
+                "psi_root_kpa": out.psi_root_kpa,
+                "drainage_physics_mm": out.drainage_mm,
+                "runoff_physics_mm": out.runoff_mm,
             })
 
-        return pd.DataFrame(results, index=df.index)
+        daily_out = pd.DataFrame(outputs, index=daily.index)
+        # Expand daily outputs back to the original index for feature creation
+        return daily_out.reindex(df.index, method="ffill")
 
     def _run_physics_forecast(
         self,
@@ -202,36 +226,50 @@ class SoilWaterForecaster:
         weather_forecast: pd.DataFrame,
         irrigation_schedule: Optional[pd.DataFrame],
     ) -> pd.DataFrame:
-        """Run physics model forward with forecast weather."""
-        results = []
+        """Run physics model forward with forecast weather.
 
-        # Initialize with current state
-        psi_current = current_state.get("psi_kpa", -50.0)
+        Expects a DatetimeIndex; aggregates to daily forcings.
+        """
+        if not isinstance(weather_forecast.index, pd.DatetimeIndex):
+            raise ValueError("weather_forecast must have a DatetimeIndex")
+
+        # Aggregate to daily
+        daily = pd.DataFrame(
+            index=weather_forecast.resample("1D").mean().index)
+        daily["precipitation_mm"] = weather_forecast.get(
+            "precipitation", weather_forecast.get("precipitation_mm", 0.0)).resample("1D").sum()
+        daily["et0_mm"] = weather_forecast.get(
+            "evapotranspiration", weather_forecast.get("et0_mm", 0.0)).resample("1D").sum()
+        daily["ndvi"] = weather_forecast.get(
+            "ndvi", np.nan).resample("1D").mean()
+
+        # Daily irrigation schedule (optional)
+        daily_irrig = None
+        if irrigation_schedule is not None and isinstance(irrigation_schedule.index, pd.DatetimeIndex):
+            daily_irrig = irrigation_schedule["amount_mm"].resample("1D").sum()
+
+        psi_current = float(current_state.get("psi_kpa", -50.0))
         self.physics_model.reset(psi_current)
 
-        for idx, row in weather_forecast.iterrows():
-            # Get irrigation if scheduled
-            irrig = 0.0
-            if irrigation_schedule is not None and idx in irrigation_schedule.index:
-                irrig = irrigation_schedule.loc[idx, "amount_mm"]
-
-            # Step physics
-            output = self.physics_model.step(
-                dt_hours=self.config.physics_dt_hours,
-                precipitation_mm=row.get("precipitation", 0.0),
-                et_mm=row.get("evapotranspiration", 0.0),
-                irrigation_mm=irrig,
-                temperature_c=row.get("temperature_2m", 20.0),
+        rows = []
+        for day, row in daily.iterrows():
+            irrig_mm = float(
+                daily_irrig.loc[day]) if daily_irrig is not None and day in daily_irrig.index else 0.0
+            out = self.physics_model.step(
+                current_date=day.date(),
+                precipitation_mm=float(row.get("precipitation_mm", 0.0)),
+                et0_mm=float(row.get("et0_mm", 0.0)),
+                ndvi=(None if not np.isfinite(row.get("ndvi", np.nan))
+                      else float(row.get("ndvi"))),
+                irrigation_mm=irrig_mm,
             )
-
-            results.append({
-                "datetime": idx,
-                "psi_physics_kpa": output.psi_root_kpa,
-                "psi_surface_kpa": output.psi_surface_kpa,
-                "et_physics_mm": output.et_actual_mm,
+            rows.append({
+                "datetime": day,
+                "psi_physics_kpa": out.psi_root_kpa,
+                "psi_surface_kpa": out.psi_surface_kpa,
             })
 
-        return pd.DataFrame(results).set_index("datetime")
+        return pd.DataFrame(rows).set_index("datetime")
 
     def _prepare_forecast_features(
         self,
@@ -298,15 +336,27 @@ class SoilWaterForecaster:
             psi_lower = psi_pred - 20
             psi_upper = psi_pred + 20
 
-        return PredictionResult(
-            prediction_kpa=MatricPotential(psi_pred),
-            uncertainty_kpa=psi_std,
-            confidence_lower_kpa=psi_lower,
-            confidence_upper_kpa=psi_upper,
-            horizon_hours=horizon,
+        psi_pred_f = float(psi_pred)
+        psi_phys_f = float(physics_pred)
+        psi_std_f = float(max(0.0, psi_std))
+        conf = float(np.clip(1.0 - (psi_std_f / 200.0), 0.0, 1.0))
+
+        result = PredictionResult(
             timestamp=datetime.now(),
-            model_version="swpps-1.0",
+            horizon_hours=int(horizon),
+            psi_predicted_kpa=MatricPotential(psi_pred_f),
+            psi_lower_bound_kpa=MatricPotential(float(psi_lower)),
+            psi_upper_bound_kpa=MatricPotential(float(psi_upper)),
+            psi_physics_kpa=MatricPotential(psi_phys_f),
+            psi_ml_residual_kpa=float(psi_pred_f - psi_phys_f),
+            status=SoilMoistureStatus.from_potential(psi_pred_f),
+            confidence=conf,
+            uncertainty_kpa=psi_std_f,
+            model_version="swpps-forecaster-1.0",
+            theta_predicted=water_content_from_potential(
+                psi_pred_f, self.vg_params),
         )
+        return result
 
 
 def create_forecaster(
@@ -329,8 +379,22 @@ def create_forecaster(
     """
     from swpps.physics.van_genuchten import estimate_van_genuchten_params
 
-    # Get Van Genuchten parameters for soil type
-    vg_params = estimate_van_genuchten_params(texture_class=soil_texture)
+    texture = (soil_texture or "loam").lower()
+    texture_map = {
+        "sand": (90.0, 5.0),
+        "loamy_sand": (80.0, 8.0),
+        "sandy_loam": (65.0, 12.0),
+        "loam": (40.0, 20.0),
+        "silt_loam": (20.0, 15.0),
+        "clay_loam": (30.0, 35.0),
+        "clay": (20.0, 50.0),
+    }
+    sand_pct, clay_pct = texture_map.get(texture, (40.0, 20.0))
+    vg_params = estimate_van_genuchten_params(
+        sand_percent=sand_pct,
+        clay_percent=clay_pct,
+        organic_matter_percent=2.0,
+    )
 
     # Create configuration
     config = ForecastConfig(

@@ -239,7 +239,7 @@ class TensionSpaceWaterBalance:
             infil_result = partition_infiltration(
                 precip_mm=infiltration_mm,
                 precip_duration_hr=self.config.precip_duration_hr,
-                Ksat_mm_day=vg.Ksat_mm_day,
+                Ksat_mm_day=vg.K_sat,
                 theta_current=self.layers[0].theta,
                 theta_sat=vg.theta_s,
                 tropical_corrections=self.config.tropical_corrections,

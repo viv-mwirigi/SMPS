@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
+import numpy as np
 
 from swpps.core.types import (
     IrrigationDecision,
@@ -35,9 +36,14 @@ from swpps.core.types import (
 from swpps.core.config import SWPPSConfig, load_config, save_config
 from swpps.core.exceptions import ConfigurationError, SWPPSError
 from swpps.physics.van_genuchten import estimate_van_genuchten_params
-from swpps.physics.water_balance import TensionSpaceWaterBalance
-from swpps.data.weather import OpenMeteoClient
-from swpps.data.sensors import WaziGateClient, SensorDataManager
+from swpps.physics.water_balance import (
+    TensionSpaceWaterBalance,
+    WaterBalanceConfig,
+    LayerConfig,
+)
+from swpps.data.weather import OpenMeteoClient, WeatherFetchRequest
+from swpps.data.sensors import SensorDataManager
+from swpps.core.config import PlotConfig, SensorConfig
 from swpps.features.engineering import FeatureEngineer, FeatureConfig
 from swpps.ml.hybrid_model import HybridTensionModel, HybridModelConfig
 from swpps.prediction.forecaster import SoilWaterForecaster, ForecastConfig
@@ -78,8 +84,12 @@ class PipelineConfig:
     actuation_enabled: bool = False  # Disabled by default for safety
 
     # Timing
-    prediction_interval_minutes: int = 15
-    training_interval_hours: int = 24
+    # Spec: update predictions every 6 hours as new data arrives
+    prediction_interval_minutes: int = 360
+    # Spec: dynamic retraining every 2–10 days
+    retrain_min_days: int = 2
+    retrain_max_days: int = 10
+    retrain_base_days: int = 7
 
     # Paths
     model_dir: Path = field(default_factory=lambda: Path("./models"))
@@ -129,16 +139,32 @@ class SWPPSPipeline:
 
     def _init_soil_parameters(self) -> None:
         """Initialize Van Genuchten parameters for soil."""
-        if self.config.sand_fraction and self.config.clay_fraction:
-            self.vg_params = estimate_van_genuchten_params(
-                sand_fraction=self.config.sand_fraction,
-                clay_fraction=self.config.clay_fraction,
-                organic_matter=self.config.organic_matter,
-            )
+        def _to_percent(x: float) -> float:
+            # Accept either 0–1 fractions or 0–100 percentages.
+            return float(x * 100.0) if 0.0 <= x <= 1.0 else float(x)
+
+        if self.config.sand_fraction is not None and self.config.clay_fraction is not None:
+            sand_pct = _to_percent(self.config.sand_fraction)
+            clay_pct = _to_percent(self.config.clay_fraction)
         else:
-            self.vg_params = estimate_van_genuchten_params(
-                texture_class=self.config.soil_texture,
-            )
+            texture = (self.config.soil_texture or "loam").lower().replace(
+                " ", "_")
+            texture_map = {
+                "sand": (90.0, 5.0),
+                "loamy_sand": (80.0, 8.0),
+                "sandy_loam": (65.0, 12.0),
+                "loam": (40.0, 20.0),
+                "silt_loam": (20.0, 15.0),
+                "clay_loam": (30.0, 35.0),
+                "clay": (20.0, 50.0),
+            }
+            sand_pct, clay_pct = texture_map.get(texture, (40.0, 20.0))
+
+        self.vg_params = estimate_van_genuchten_params(
+            sand_percent=float(sand_pct),
+            clay_percent=float(clay_pct),
+            organic_matter_percent=float(self.config.organic_matter),
+        )
 
         logger.info("Soil parameters: θs=%.3f, θr=%.3f, α=%.4f, n=%.3f",
                     self.vg_params.theta_s, self.vg_params.theta_r,
@@ -146,33 +172,62 @@ class SWPPSPipeline:
 
     def _init_data_clients(self) -> None:
         """Initialize data collection clients."""
-        # Weather client
+        # Weather client (OpenMeteoClient takes a cache_dir, location is in request)
         self.weather_client = OpenMeteoClient(
-            latitude=self.config.latitude,
-            longitude=self.config.longitude,
+            cache_dir=self.config.data_dir / "cache" / "weather"
         )
 
-        # Sensor client (WaziGate)
-        if self.config.device_id:
-            wazigate = WaziGateClient(
-                base_url=self.config.gateway_url,
-                port=self.config.gateway_port,
+        # Sensor manager
+        if self.config.device_id and self.config.tension_sensor_ids:
+            plot_config = PlotConfig(
+                plot_id=1,
+                name=self.config.site_id,
+                latitude=self.config.latitude,
+                longitude=self.config.longitude,
+                crop_type=self.config.crop_type,
+                soil_type=self.config.soil_texture,
+                moisture_sensors=[
+                    SensorConfig(
+                        device_id=self.config.device_id,
+                        sensor_id=sensor_id,
+                        sensor_type="tension",
+                        unit="cbar",
+                    )
+                    for sensor_id in self.config.tension_sensor_ids
+                ],
             )
+
+            api_url = str(self.config.gateway_url).rstrip("/")
+            if self.config.gateway_port and ":" not in api_url.split("//")[-1]:
+                api_url = f"{api_url}:{self.config.gateway_port}"
+            if not api_url.startswith("http"):
+                api_url = f"http://{api_url}"
+
             self.sensor_manager = SensorDataManager(
-                client=wazigate,
-                device_id=self.config.device_id,
-                tension_sensor_ids=self.config.tension_sensor_ids,
+                plot_config=plot_config,
+                api_url=api_url,
+                token=None,
             )
         else:
             self.sensor_manager = None
-            logger.warning("No device ID configured - sensor data unavailable")
+            logger.warning(
+                "Sensor manager not configured (device_id or sensor_ids missing)")
 
     def _init_physics_model(self) -> None:
         """Initialize physics water balance model."""
-        self.physics_model = TensionSpaceWaterBalance(
-            vg_params=self.vg_params,
-            root_depth_m=self.config.root_depth_m,
+        # Build a minimal 1-layer root-zone model (0 .. root_depth_m).
+        layers = [
+            LayerConfig(
+                depth_top_m=0.0,
+                depth_bottom_m=float(self.config.root_depth_m),
+                van_genuchten=self.vg_params,
+            )
+        ]
+        wb_config = WaterBalanceConfig(
+            layers=layers,
+            initial_psi_kpa=-50.0,
         )
+        self.physics_model = TensionSpaceWaterBalance(wb_config)
 
     def _init_ml_model(self) -> None:
         """Initialize or load ML model."""
@@ -206,6 +261,8 @@ class SWPPSPipeline:
         decision_config = DecisionConfig(
             crop_type=self.config.crop_type,
             irrigation_enabled=self.config.actuation_enabled,
+            vg_params=self.vg_params,
+            root_depth_m=self.config.root_depth_m,
         )
         self.decision_engine = IrrigationDecisionEngine(decision_config)
 
@@ -250,7 +307,6 @@ class SWPPSPipeline:
         }
 
         try:
-            # Step 1: Get current sensor state
             current_state = self._get_current_state()
             result["current_state"] = current_state
 
@@ -261,10 +317,10 @@ class SWPPSPipeline:
             forecasts = self._generate_forecasts(current_state, weather_data)
             result["forecasts"] = {
                 h: {
-                    "prediction_kpa": float(p.prediction_kpa),
+                    "prediction_kpa": float(p.psi_predicted_kpa),
                     "uncertainty_kpa": float(p.uncertainty_kpa),
-                    "lower_kpa": float(p.confidence_lower_kpa),
-                    "upper_kpa": float(p.confidence_upper_kpa),
+                    "lower_kpa": float(p.psi_lower_bound_kpa),
+                    "upper_kpa": float(p.psi_upper_bound_kpa),
                 }
                 for h, p in forecasts.items()
             }
@@ -325,15 +381,31 @@ class SWPPSPipeline:
 
     def _fetch_weather(self) -> pd.DataFrame:
         """Fetch weather data and forecasts."""
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=7)  # Last week for features
+        end_dt = datetime.now()
+        start_dt = end_dt - timedelta(days=7)  # recent history for features
 
-        weather = self.weather_client.fetch_daily_weather(
-            start_date=start_date,
-            end_date=end_date + timedelta(days=7),  # Include forecast
+        req = WeatherFetchRequest(
+            latitude=self.config.latitude,
+            longitude=self.config.longitude,
+            start_date=start_dt.date(),
+            end_date=(end_dt + timedelta(days=7)).date(),
+            timezone="UTC",
         )
-
-        return weather
+        daily_list = self.weather_client.fetch_daily_weather(req)
+        df = pd.DataFrame([
+            {
+                "date": w.date,
+                "precipitation_sum": w.precipitation_mm,
+                "et0_fao_evapotranspiration": w.et0_mm,
+                "temperature_2m_mean": w.temperature_mean_c,
+                "relative_humidity_2m_mean": w.relative_humidity_mean,
+                "shortwave_radiation_sum": w.solar_radiation_mj_m2,
+                "wind_speed_10m_mean": w.wind_speed_m_s,
+            }
+            for w in daily_list
+        ])
+        df["date"] = pd.to_datetime(df["date"])
+        return df.set_index("date")
 
     def _generate_forecasts(
         self,
@@ -360,26 +432,26 @@ class SWPPSPipeline:
         weather_data: pd.DataFrame,
     ) -> pd.DataFrame:
         """Run physics model forward."""
-        # Initialize with current state
-        psi_init = current_state.get("psi_kpa", -50.0)
+        psi_init = float(current_state.get("psi_kpa", -50.0))
         self.physics_model.reset(psi_init)
 
-        results = []
+        rows = []
         for idx, row in weather_data.iterrows():
-            output = self.physics_model.step(
-                dt_hours=1.0,
-                precipitation_mm=row.get(
-                    "precipitation_sum", 0) / 24,  # Daily to hourly
-                et_mm=row.get("et0_fao_evapotranspiration", 0) / 24,
-                irrigation_mm=0,  # Could integrate schedule here
-                temperature_c=row.get("temperature_2m_mean", 20),
+            out = self.physics_model.step(
+                current_date=idx.date(),
+                precipitation_mm=float(row.get("precipitation_sum", 0.0)),
+                et0_mm=float(row.get("et0_fao_evapotranspiration", 0.0)),
+                ndvi=float(row.get("ndvi")) if "ndvi" in weather_data.columns and pd.notna(
+                    row.get("ndvi")) else None,
+                irrigation_mm=0.0,
             )
-            results.append({
+            rows.append({
                 "date": idx,
-                "psi_physics_kpa": output.psi_root_kpa,
+                "psi_physics_kpa": out.psi_root_kpa,
+                "psi_surface_kpa": out.psi_surface_kpa,
             })
 
-        return pd.DataFrame(results).set_index("date")
+        return pd.DataFrame(rows).set_index("date")
 
     def _generate_physics_forecasts(
         self,
@@ -391,30 +463,60 @@ class SWPPSPipeline:
         now = datetime.now()
 
         for horizon in self.config.horizons:
-            target_time = now + timedelta(hours=horizon)
-
-            # Find closest physics prediction
             if horizon == 0:
-                psi_pred = current_state.get("psi_kpa", -50.0)
+                psi_pred = float(current_state.get("psi_kpa", -50.0))
+                psi_phys = psi_pred
             else:
-                # Use physics forecast (daily resolution)
-                days_ahead = horizon // 24
-                if days_ahead < len(physics_df):
-                    psi_pred = physics_df.iloc[days_ahead]["psi_physics_kpa"]
+                days_ahead = max(0, int(horizon // 24))
+                if len(physics_df) == 0:
+                    psi_phys = float(current_state.get("psi_kpa", -50.0))
+                elif days_ahead < len(physics_df):
+                    psi_phys = float(
+                        physics_df.iloc[days_ahead]["psi_physics_kpa"])
                 else:
-                    psi_pred = physics_df.iloc[-1]["psi_physics_kpa"]
+                    psi_phys = float(physics_df.iloc[-1]["psi_physics_kpa"])
+                psi_pred = psi_phys
+
+            std = float(10.0 + horizon * 0.1)
+            lower = float(psi_pred - 2 * std)
+            upper = float(psi_pred + 2 * std)
 
             forecasts[horizon] = PredictionResult(
-                prediction_kpa=MatricPotential(psi_pred),
-                uncertainty_kpa=10.0 + horizon * 0.1,  # Increasing uncertainty
-                confidence_lower_kpa=psi_pred - 20 - horizon * 0.2,
-                confidence_upper_kpa=psi_pred + 20 + horizon * 0.2,
-                horizon_hours=horizon,
                 timestamp=now,
+                horizon_hours=int(horizon),
+                psi_predicted_kpa=MatricPotential(psi_pred),
+                psi_lower_bound_kpa=MatricPotential(lower),
+                psi_upper_bound_kpa=MatricPotential(upper),
+                psi_physics_kpa=MatricPotential(psi_phys),
+                psi_ml_residual_kpa=0.0,
+                status=SoilMoistureStatus.from_potential(psi_pred),
+                confidence=float(np.clip(1.0 - (std / 200.0), 0.0, 1.0)),
+                uncertainty_kpa=std,
                 model_version="swpps-physics-1.0",
             )
 
         return forecasts
+
+    def get_prediction_curve(self) -> pd.DataFrame:
+        """Return a time-based prediction curve for UI/API consumption.
+
+        Columns include the forecasted ψ curve plus bounds and the trigger threshold.
+        """
+        if not self.current_predictions:
+            return pd.DataFrame()
+
+        now = datetime.now()
+        rows = []
+        for h, p in sorted(self.current_predictions.items(), key=lambda kv: kv[0]):
+            rows.append({
+                "timestamp": now + timedelta(hours=int(h)),
+                "horizon_hours": int(h),
+                "psi_predicted_kpa": float(p.psi_predicted_kpa),
+                "psi_lower_kpa": float(p.psi_lower_bound_kpa),
+                "psi_upper_kpa": float(p.psi_upper_bound_kpa),
+                "trigger_threshold_kpa": float(self.decision_engine.trigger_threshold),
+            })
+        return pd.DataFrame(rows).set_index("timestamp")
 
     def _generate_hybrid_forecasts(
         self,
@@ -546,18 +648,27 @@ class SWPPSPipeline:
 
     def _training_loop(self) -> None:
         """Continuous training loop."""
-        interval = self.config.training_interval_hours * 3600
-
         # Initial delay
         self._stop_event.wait(60)
 
+        last_success = True
+
         while not self._stop_event.is_set():
             try:
-                self.train_model()
+                result = self.train_model()
+                last_success = bool(result.get("success"))
             except Exception as e:
                 logger.error("Training loop error: %s", str(e))
+                last_success = False
 
-            self._stop_event.wait(interval)
+            # Dynamic interval in [min, max] days.
+            base_days = int(self.config.retrain_base_days)
+            if not last_success:
+                base_days = int(self.config.retrain_min_days)
+
+            days = int(np.clip(base_days, self.config.retrain_min_days,
+                       self.config.retrain_max_days))
+            self._stop_event.wait(days * 24 * 3600)
 
     # -------------------------------------------------------------------------
     # Status and Configuration

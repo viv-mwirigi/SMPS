@@ -125,14 +125,23 @@ from swpps.calibration import (
 )
 
 # Main pipeline
+# NOTE: There is also a `swpps/pipeline/` package; load the file-based
+# orchestrator pipeline explicitly but in a path-portable way.
 import importlib.util
-spec = importlib.util.spec_from_file_location(
-    'pipeline', '/home/viv/SMPS/swpps/pipeline.py')
-pipeline_module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(pipeline_module)
-SWPPSPipeline = pipeline_module.SWPPSPipeline
-PipelineConfig = pipeline_module.PipelineConfig
-create_pipeline = pipeline_module.create_pipeline
+from pathlib import Path
+
+_pipeline_path = Path(__file__).resolve().parent / "pipeline.py"
+_spec = importlib.util.spec_from_file_location(
+    "swpps._pipeline_file", str(_pipeline_path))
+if _spec is None or _spec.loader is None:
+    raise ImportError(f"Could not load SWPPSPipeline from {_pipeline_path}")
+
+_pipeline_module = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_pipeline_module)
+
+SWPPSPipeline = _pipeline_module.SWPPSPipeline
+PipelineConfig = _pipeline_module.PipelineConfig
+create_pipeline = _pipeline_module.create_pipeline
 
 __all__ = [
     # Version

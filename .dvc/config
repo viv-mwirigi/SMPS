@@ -1,0 +1,54 @@
+# DVC Configuration for SMPS Data Versioning
+# Ensures complete data provenance and reproducibility
+
+# Core data directories to version
+data/
+    # Raw data sources
+    raw/
+        satellite/
+        soil/
+        weather/
+        ismn/
+
+    # Processed datasets
+    prepared/
+        ismn_soil_moisture_full.csv
+        ismn_soil_moisture_test_spatial.csv
+        ismn_soil_moisture_test_temporal.csv
+        ismn_soil_moisture_test.csv
+        ismn_soil_moisture_train.csv
+        yield_test.csv
+        yield_train.csv
+
+    # Cache directories (versioned for reproducibility)
+    cache/
+        satellite/
+        soil/
+        weather/
+
+# Results directories (tracked for reproducibility)
+results/
+    theta_space_full/
+    theta_space_honest/
+    theta_space_honest_no_past_theta/
+    theta_space_v4/
+
+# Model artifacts
+models/
+    *.pkl
+    *.txt
+    *.joblib
+
+# Configuration files that affect results
+config/
+    *.yaml
+    *.yml
+    *.json
+
+# Scripts (versioned to ensure exact reproduction)
+scripts/
+    *.py
+
+# Notebooks (tracked for analysis reproducibility)
+notebooks/
+    *.ipynb

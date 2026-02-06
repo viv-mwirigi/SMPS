@@ -125,6 +125,46 @@ class TestVanGenuchten:
         assert 1 <= params.K_sat <= 10000
 
 
+class TestFeatureEngineeringConversions:
+    def test_feature_engineer_uses_vg_params_for_conversions(self):
+        vg = VanGenuchtenParams(
+            theta_r=0.04,
+            theta_s=0.42,
+            alpha=0.06,
+            n=1.7,
+            K_sat=500,
+        )
+
+        # Intentionally set conflicting scalar config values; vg_params should win.
+        cfg = FeatureConfig(
+            theta_sat=0.60,
+            theta_res=0.10,
+            alpha_vg=0.2,
+            n_vg=3.0,
+        )
+
+        fe = FeatureEngineer(cfg, vg_params=vg)
+
+        psi = pd.Series([-10.0, -33.0, -100.0])
+        theta_expected = pd.Series(
+            [water_content_from_potential(p, vg) for p in psi],
+            index=psi.index,
+        )
+        theta_actual = fe._psi_to_theta(psi)
+
+        assert np.allclose(theta_actual.values,
+                           theta_expected.values, atol=1e-10)
+
+        # Roundtrip θ -> ψ should match canonical conversion
+        theta_in = pd.Series([0.20, 0.25, 0.30])
+        psi_expected = pd.Series(
+            [potential_from_water_content(t, vg) for t in theta_in],
+            index=theta_in.index,
+        )
+        psi_actual = fe._theta_to_psi(theta_in)
+        assert np.allclose(psi_actual.values, psi_expected.values, atol=1e-10)
+
+
 # =============================================================================
 # WATER BALANCE TESTS
 # =============================================================================

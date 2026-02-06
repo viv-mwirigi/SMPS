@@ -19,42 +19,73 @@ Usage:
     python scripts/run_theta_space_validation.py --results-dir results/theta_v1
 """
 
-from swpps.physics.tropical import TropicalSoilCorrections
-from swpps.physics.van_genuchten import (
+from smps.physics.tropical import TropicalSoilCorrections
+from smps.physics.van_genuchten import (
     tropical_ptf_van_genuchten,
     water_content_from_potential,
     VanGenuchtenParams,
 )
-from swpps.ml.retention_learning import (
+from smps.ml.retention_learning import (
     evaluate_theta_space_metrics,
 )
-from swpps.ml.training import (
+from smps.ml.training import (
     prepare_features_with_sequences,
     ResidualTrainer,
     TrainingConfig,
     create_residual_targets,
 )
-from swpps.data import DataPipeline, DataPipelineConfig
+from smps.ml.uncertainty import PsiUncertaintyResult
+from smps.ml.evaluation import EnhancedEvaluator
+from smps.data import DataPipeline, DataPipelineConfig
+from smps.core.settings import settings
 from tqdm import tqdm
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Optional, Tuple
-from datetime import datetime
-import logging
-import json
 import argparse
+import json
+import logging
+import re
+import logging
+import re
+from datetime import datetime
 from pathlib import Path
 import sys
+from typing import Dict, List, Optional, Tuple
 
-project_root = Path(__file__).parent.parent
+# Ensure local imports work when running as a script
+project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root))
 
-
+# Set up logging with centralized settings
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=getattr(logging, settings.log_level),
+    format=settings.log_format,
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(settings.logs_dir / "theta_space_validation.log")
+    ]
 )
 logger = logging.getLogger(__name__)
+
+
+def _filter_feature_cols(feature_cols: List[str], ablation: str) -> List[str]:
+    """Apply feature ablations by filtering feature column names."""
+    if ablation == "full":
+        return feature_cols
+
+    if ablation == "no_past_theta":
+        # Remove all explicit soil moisture memory features.
+        # Keep physics/weather sequential features intact.
+        drop_patterns = [
+            r"^soil_moisture_lag\d+d$",
+            r"^soil_moisture_roll\d+d_(mean|std|sum)$",
+            r"^soil_moisture_diff\d+d$",
+            r"^soil_moisture_trend\d+d$",
+        ]
+        combined = re.compile("|".join(drop_patterns))
+        return [c for c in feature_cols if not combined.search(c)]
+
+    raise ValueError(f"Unknown ablation: {ablation}")
 
 
 class ThetaSpaceValidator:
@@ -64,10 +95,13 @@ class ThetaSpaceValidator:
     NO static PTF assumptions - corrections learned per site/management.
     """
 
-    def __init__(self, prepared_data_dir: Path, results_dir: Path):
-        self.prepared_data_dir = prepared_data_dir
-        self.results_dir = results_dir
+    def __init__(self, prepared_data_dir: Optional[Path] = None, results_dir: Optional[Path] = None):
+        self.prepared_data_dir = prepared_data_dir or settings.data_dir / "prepared"
+        self.results_dir = results_dir or settings.results_dir / "theta_space_validation"
         self.results_dir.mkdir(parents=True, exist_ok=True)
+
+        # Feature ablation mode (set by CLI)
+        self.ablation: str = "full"
 
         # Load data
         self.train_df = pd.read_csv(
@@ -188,7 +222,7 @@ class ThetaSpaceValidator:
         logger.info("THETA-SPACE VALIDATION (Direct θ Training + Dynamic PTF)")
         logger.info("="*80)
 
-        horizons = [0, 24, 72, 168]
+        horizons = [24, 72, 168]
 
         # Step 1: Build canonical tables
         logger.info("\nStep 1: Building canonical tables...")
@@ -219,17 +253,40 @@ class ThetaSpaceValidator:
             'stress_index',  # Plant stress indicator
         ]
 
+        # NOTE: sequential_target_cols controls which variables get lag/roll/diff features.
+        # For ablations, we may exclude soil_moisture sequences to avoid a pure autoregressor.
+        sequential_target_cols = None
+        if hasattr(self, "ablation") and self.ablation == "no_past_theta":
+            sequential_target_cols = [
+                # Keep physics priors as state proxies
+                "physics_prior_surface",
+                "physics_prior_root",
+                "physics_prior_deep",
+            ]
+
         canonical_train, all_features = prepare_features_with_sequences(
-            canonical_train, static_features, dynamic_features,
-            lag_days=[1, 2, 3, 7, 14], rolling_windows=[3, 7, 14]
+            canonical_train,
+            static_features,
+            dynamic_features,
+            lag_days=[1, 2, 3, 7, 14],
+            rolling_windows=[3, 7, 14],
+            sequential_target_cols=sequential_target_cols,
         )
         canonical_test_temporal, _ = prepare_features_with_sequences(
-            canonical_test_temporal, static_features, dynamic_features,
-            lag_days=[1, 2, 3, 7, 14], rolling_windows=[3, 7, 14]
+            canonical_test_temporal,
+            static_features,
+            dynamic_features,
+            lag_days=[1, 2, 3, 7, 14],
+            rolling_windows=[3, 7, 14],
+            sequential_target_cols=sequential_target_cols,
         )
         canonical_test_spatial, _ = prepare_features_with_sequences(
-            canonical_test_spatial, static_features, dynamic_features,
-            lag_days=[1, 2, 3, 7, 14], rolling_windows=[3, 7, 14]
+            canonical_test_spatial,
+            static_features,
+            dynamic_features,
+            lag_days=[1, 2, 3, 7, 14],
+            rolling_windows=[3, 7, 14],
+            sequential_target_cols=sequential_target_cols,
         )
 
         # Filter to available features
@@ -237,6 +294,10 @@ class ThetaSpaceValidator:
                         if f in canonical_train.columns
                         and f in canonical_test_temporal.columns
                         and f in canonical_test_spatial.columns]
+
+        # Apply any feature ablation.
+        if hasattr(self, "ablation"):
+            feature_cols = _filter_feature_cols(feature_cols, self.ablation)
 
         # Add soil texture as DYNAMIC feature (changes with management/season)
         for df in [canonical_train, canonical_test_temporal, canonical_test_spatial]:
@@ -280,12 +341,17 @@ class ThetaSpaceValidator:
             use_site_blocked_cv=True, n_cv_folds=5,
             n_estimators=1000, learning_rate=0.03, max_depth=6,  # Shallower trees
             num_leaves=31,  # Fewer leaves to reduce overfitting
+            enable_uncertainty=True,  # Enable uncertainty quantification
+            uncertainty_method="ensemble",
+            n_uncertainty_models=10,
         ))
 
         # Create θ-space residual targets (DIRECT θ training)
         canonical_train_targets = create_residual_targets(
             canonical_train, horizons, physics_col='physics_theta_surface',
-            observed_col='soil_moisture'
+            observed_col='soil_moisture',
+            group_cols=['station_id', 'depth_cm'],
+            date_col='date',
         )
 
         training_results = {}
@@ -332,50 +398,138 @@ class ThetaSpaceValidator:
             ('test_temporal', canonical_test_temporal),
             ('test_spatial', canonical_test_spatial)
         ]:
+            # Add future-aligned targets/physics for honest horizon evaluation
+            split_aligned = create_residual_targets(
+                split_df,
+                horizons,
+                physics_col='physics_theta_surface',
+                observed_col='soil_moisture',
+                group_cols=['station_id', 'depth_cm'],
+                date_col='date',
+            )
             for horizon in horizons:
                 if horizon not in training_results:
                     continue
 
                 model, _ = training_results[horizon]
 
-                valid_mask = split_df[feature_cols].notna().all(axis=1)
-                valid_df = split_df[valid_mask].copy()
+                target_col = f'target_{horizon}h'
+                physics_future_col = f'physics_{horizon}h'
+
+                valid_mask = split_aligned[feature_cols].notna().all(axis=1)
+                valid_mask &= split_aligned[target_col].notna(
+                ) & split_aligned[physics_future_col].notna()
+                valid_df = split_aligned[valid_mask].copy()
 
                 if len(valid_df) < 10:
                     continue
 
-                # Predict θ residual
-                residual_pred = model.predict(valid_df[feature_cols])
-                physics_theta = valid_df['physics_theta_surface'].values
+                # Predict θ residual with uncertainty
+                residual_pred, uncertainty_results = trainer.predict_with_uncertainty(
+                    model, valid_df[feature_cols], feature_cols
+                )
+                physics_theta = valid_df[physics_future_col].values
                 predicted_theta = np.clip(
                     physics_theta + residual_pred, 0.0, 0.6)
 
-                # θ-space metrics (PRIMARY)
-                theta_metrics = evaluate_theta_space_metrics(
-                    valid_df['soil_moisture'].values, predicted_theta
+                # Enhanced evaluation with uncertainty
+                evaluator = EnhancedEvaluator()
+
+                # Add baselines
+                persistence_theta = np.clip(
+                    valid_df['soil_moisture'].values, 0.0, 0.6)
+                evaluator.add_baseline(
+                    "persistence", persistence_theta, valid_df[target_col].values)
+
+                evaluator.add_baseline(
+                    "physics_only", physics_theta, valid_df[target_col].values)
+
+                # Evaluate model with uncertainty
+                theta_metrics = evaluator.evaluate_predictions(
+                    predicted_theta, valid_df[target_col].values, uncertainty_results
                 )
 
-                # IRRIGATION-RELEVANT metrics
-                irrigation_metrics = self._compute_irrigation_metrics(
-                    valid_df['soil_moisture'].values, predicted_theta,
+                # Irrigation-relevant metrics
+                irrigation_metrics = evaluator.evaluate_irrigation_metrics(
+                    predicted_theta, valid_df[target_col].values,
                     valid_df['station_id'].values, valid_df
                 )
 
+                # Get legacy metrics for backward compatibility
+                persistence_metrics = evaluate_theta_space_metrics(
+                    valid_df[target_col].values, persistence_theta
+                )
+                physics_only_metrics = evaluate_theta_space_metrics(
+                    valid_df[target_col].values, physics_theta
+                )
+                legacy_theta_metrics = evaluate_theta_space_metrics(
+                    valid_df[target_col].values, predicted_theta
+                )
+
+                # Store comprehensive results
+                baseline_comparisons = evaluator.compare_to_baselines(
+                    predicted_theta, valid_df[target_col].values, uncertainty_results
+                )
+
                 all_results[split_name][horizon] = {
-                    'theta': theta_metrics,
-                    'irrigation': irrigation_metrics,
+                    'theta': {
+                        'rmse': theta_metrics.rmse,
+                        'mae': theta_metrics.mae,
+                        'r2': theta_metrics.r2,
+                        'kge': theta_metrics.kge,
+                        'nse': theta_metrics.nse,
+                        'coverage_80': theta_metrics.coverage_80,
+                        'coverage_95': theta_metrics.coverage_95,
+                        'mean_uncertainty': theta_metrics.mean_uncertainty,
+                        'reliable_predictions_pct': theta_metrics.reliable_predictions_pct,
+                    },
+                    'baselines': {
+                        'persistence': persistence_metrics,
+                        'physics_only': physics_only_metrics,
+                    },
+                    'irrigation': {
+                        'paw_rmse': irrigation_metrics.paw_rmse,
+                        'paw_bias': irrigation_metrics.paw_bias,
+                        'paw_r2': irrigation_metrics.paw_r2,
+                        'stress_accuracy': irrigation_metrics.stress_accuracy,
+                        'stress_precision': irrigation_metrics.stress_precision,
+                        'stress_recall': irrigation_metrics.stress_recall,
+                        'irrigation_decisions_rmse': irrigation_metrics.irrigation_decisions_rmse,
+                        'over_irrigation_rate': irrigation_metrics.over_irrigation_rate,
+                        'under_irrigation_rate': irrigation_metrics.under_irrigation_rate,
+                    },
+                    'baseline_comparisons': baseline_comparisons,
                     'n_samples': len(valid_df),
                 }
 
-                # Save predictions
-                pd.DataFrame({
+                # Save predictions with uncertainty
+                predictions_df = pd.DataFrame({
                     'station_id': valid_df['station_id'].values,
                     'date': valid_df['date'].values,
-                    'observed_theta': valid_df['soil_moisture'].values,
+                    'target_date': valid_df[f'date_plus_{horizon}h'].values if f'date_plus_{horizon}h' in valid_df.columns else valid_df['date'].values,
+                    'observed_theta': valid_df[target_col].values,
                     'physics_theta': physics_theta,
                     'predicted_theta': predicted_theta,
                     'residual': residual_pred,
-                }).to_csv(self.results_dir / f'predictions_{split_name}_{horizon}h.csv', index=False)
+                })
+
+                # Add uncertainty columns if available
+                if uncertainty_results:
+                    predictions_df['psi_uncertainty'] = [
+                        r.psi_std for r in uncertainty_results]
+                    predictions_df['psi_lower_bound'] = [
+                        r.psi_interval_lower for r in uncertainty_results]
+                    predictions_df['psi_upper_bound'] = [
+                        r.psi_interval_upper for r in uncertainty_results]
+                    predictions_df['confidence_score'] = [
+                        r.confidence_score for r in uncertainty_results]
+                    predictions_df['is_reliable'] = [
+                        r.is_reliable for r in uncertainty_results]
+                    predictions_df['uncertainty_category'] = [
+                        r.uncertainty_category for r in uncertainty_results]
+
+                predictions_df.to_csv(
+                    self.results_dir / f'predictions_{split_name}_{horizon}h.csv', index=False)
 
         # Step 5: Report results
         logger.info("\n" + "="*80)
@@ -388,9 +542,16 @@ class ThetaSpaceValidator:
             for horizon in horizons:
                 if horizon in all_results[split_name]:
                     r = all_results[split_name][horizon]
-                    logger.info(f"    {horizon}h: KGE={r['theta']['kge']:.3f}, "
-                                f"RMSE={r['theta']['rmse']:.4f} m³/m³, "
-                                f"R²={r['theta']['r2']:.3f}")
+                    theta = r['theta']
+                    uncertainty_info = ""
+                    if theta.get('coverage_80') is not None:
+                        uncertainty_info = f", Coverage_80={theta['coverage_80']:.1%}"
+                    if theta.get('mean_uncertainty') is not None:
+                        uncertainty_info += f", Uncertainty={theta['mean_uncertainty']:.4f}"
+
+                    logger.info(f"    {horizon}h: KGE={theta['kge']:.3f}, "
+                                f"RMSE={theta['rmse']:.4f} m³/m³, "
+                                f"R²={theta['r2']:.3f}{uncertainty_info}")
 
             logger.info("  IRRIGATION METRICS (Plant-available water focus):")
             for horizon in horizons:
@@ -398,10 +559,24 @@ class ThetaSpaceValidator:
                     r = all_results[split_name][horizon]
                     irr = r['irrigation']
                     logger.info(f"    {horizon}h: PAW_RMSE={irr['paw_rmse']:.4f}, "
-                                f"Stress_Acc={irr['stress_accuracy']:.3f}")
+                                f"Stress_Acc={irr['stress_accuracy']:.3f}, "
+                                f"Over-irrigation={irr['over_irrigation_rate']:.1%}")
+
+            logger.info("  BASELINE COMPARISONS:")
+            for horizon in horizons:
+                if horizon in all_results[split_name]:
+                    r = all_results[split_name][horizon]
+                    comparisons = r.get('baseline_comparisons', {})
+                    for baseline_name, comp in comparisons.items():
+                        if comp.get('significant_improvement'):
+                            sig_marker = " ✓"
+                        else:
+                            sig_marker = ""
+                        logger.info(f"    {horizon}h vs {baseline_name}: "
+                                    f"{comp['rmse_improvement']:.1%} improvement{sig_marker}")
 
         # Save JSON
-        with open(self.results_dir / 'validation_results.json', 'w') as f:
+        with open(self.results_dir / 'validation_results.json', 'w', encoding='utf-8') as f:
             json.dump({
                 'results': all_results,
                 'metadata': {
@@ -412,6 +587,7 @@ class ThetaSpaceValidator:
                     'n_stations_train': canonical_train['station_id'].nunique(),
                     'horizons': horizons,
                     'n_features': len(feature_cols),
+                    'ablation': getattr(self, 'ablation', 'full'),
                     'timestamp': datetime.now().isoformat(),
                     'note': 'Direct θ training with dynamic PTF corrections and irrigation metrics'
                 }
@@ -494,13 +670,24 @@ def main():
     parser.add_argument("--skip-weather-fetch", action="store_true")
     parser.add_argument("--results-dir", type=str,
                         default="results/theta_space_v1")
+    parser.add_argument(
+        "--ablation",
+        type=str,
+        default="full",
+        choices=["full", "no_past_theta"],
+        help="Feature ablation mode. 'no_past_theta' removes soil_moisture lag/roll/diff/trend features.",
+    )
     args = parser.parse_args()
 
-    project_root = Path(__file__).parent.parent
-    validator = ThetaSpaceValidator(
-        project_root / "data" / "prepared",
-        project_root / args.results_dir
-    )
+    # Use settings-based defaults if not specified
+    prepared_data_dir = settings.data_dir / \
+        "prepared" if not hasattr(
+            args, 'prepared_data_dir') else args.prepared_data_dir
+    results_dir = settings.results_dir / \
+        args.results_dir if args.results_dir else settings.results_dir / "theta_space_validation"
+
+    validator = ThetaSpaceValidator(prepared_data_dir, results_dir)
+    validator.ablation = args.ablation
     validator.run_validation(args.max_stations, args.skip_weather_fetch)
 
 

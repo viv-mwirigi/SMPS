@@ -1,162 +1,69 @@
 """
-SMPS Machine Learning Module.
+Machine Learning module for soil water potential prediction.
 
-Provides hybrid physics-ML models for soil moisture prediction.
+This module provides residual learning models that correct
+physics model predictions using gradient boosting.
 
-Architecture:
-------------
-1. Physics Model: Generates physics-based priors at multiple depths
-2. Feature Engineering: Climate forcings, static attributes, temporal patterns
-3. Residual Learning: ML model learns residuals from physics baseline
-4. Stacking Ensemble: LightGBM + XGBoost with meta-learner
-5. Uncertainty Quantification: Quantile regression, ensemble uncertainty
-
-Key Components:
-- CanonicalDatasetBuilder: Unified feature space construction
-- FeatureStore: Feature versioning and caching
-- ResidualLearner: Learns physics model residuals
-- StackingEnsemble: Multi-model ensemble with meta-learning
-- SHAPExplainer: Feature importance and interpretability
-- Validation: Temporal, spatial, and spatio-temporal splits
-- Uncertainty: Quantile regression, conformal prediction
-
-Usage:
-------
->>> from smps.ml import (
-...     CanonicalDatasetBuilder,
-...     HybridSoilMoistureModel,
-...     StackingEnsemble,
-...     DataSplitter,
-...     HybridUncertaintyQuantifier,
-... )
->>>
->>> # Build dataset from SpaceIoTBox + Physics
->>> builder = CanonicalDatasetBuilder()
->>> dataset = builder.build(site_id, start_date, end_date)
->>>
->>> # Split data temporally (train on past, test on future)
->>> splitter = DataSplitter(SplitConfig(train_years=[2020,2021,2022]))
->>> train, val, test = splitter.temporal_split(dataset)
->>>
->>> # Train hybrid model with uncertainty
->>> model = HybridSoilMoistureModel()
->>> model.fit(train)
->>>
->>> # Predict with uncertainty
->>> predictions = model.predict(test, return_uncertainty=True)
+Philosophy:
+- Train and evaluate in ψ-space (matric potential) where physics is valid
+- Use standard PTF for θ conversion (no site-specific calibration)
+- Site-specific PTF calibration = overfitting with zero transferability
 """
 
-from smps.ml.dataset_builder import (
-    CanonicalDatasetBuilder,
-    FeatureConfig,
-    DatasetConfig,
-)
-from smps.ml.feature_store import (
-    FeatureStore,
-    FeatureGroup,
-    FeatureMetadata,
-)
 from smps.ml.hybrid_model import (
-    HybridSoilMoistureModel,
+    HybridModelConfig,
+    HybridTensionModel,
     ResidualLearner,
-    PhysicsResidualTarget,
 )
-from smps.ml.ensemble import (
-    StackingEnsemble,
-    HybridStackingEnsemble,
-    MultiDepthEnsemble,
-    EnsembleConfig,
-    BaseModelConfig,
-)
-from smps.ml.explainer import (
-    SHAPExplainer,
-    FeatureImportance,
-)
-from smps.ml.trainer import (
-    TrainingOrchestrator,
+from smps.ml.training import (
     TrainingConfig,
-    TrainingResults,
-    train_site,
+    ResidualTrainer,
+    create_residual_targets,
+    create_matric_residual_targets,
+    create_prediction_features,
+    # New training utilities
+    SiteBlockedCV,
+    HorizonTrainingResult,
+    # Sequential feature engineering
+    add_sequential_features,
+    prepare_features_with_sequences,
+    # Site bias correction
+    compute_site_bias_corrections,
+    apply_site_bias_correction,
+    create_matric_residual_targets_debiased,
 )
-from smps.ml.validation import (
-    DataSplitter,
-    SplitConfig,
-    MetricsCalculator,
-    MetricsResult,
-    BaselineModels,
-    BaselineComparison,
-    ValidationRunner,
-    ValidationResult,
+from smps.ml.retention_learning import (
+    # PSI-space evaluation (recommended)
+    evaluate_psi_space_metrics,
+    evaluate_log_psi_space_metrics,
 )
-from smps.ml.uncertainty import (
-    UncertaintyConfig,
-    PredictionWithUncertainty,
-    QuantileRegressor,
-    EnsembleUncertainty,
-    ConformalPredictor,
-    CQRPredictor,
-    HybridUncertaintyQuantifier,
-    UncertaintyCalibrator,
-    UncertaintyQuantifier,  # Alias for HybridUncertaintyQuantifier
-)
-from smps.ml.hybrid_features import (
-    HybridFeatureEnhancer,
-    smooth_residuals,
-    compute_residual_target,
-    combine_physics_ml_predictions,
-    prepare_hybrid_training_data,
+from smps.ml.residual_model import (
+    ResidualModel,
+    ResidualConfig,
 )
 
 __all__ = [
-    # Dataset building
-    "CanonicalDatasetBuilder",
-    "FeatureConfig",
-    "DatasetConfig",
-    # Feature store
-    "FeatureStore",
-    "FeatureGroup",
-    "FeatureMetadata",
-    # Hybrid model
-    "HybridSoilMoistureModel",
+    "HybridModelConfig",
+    "HybridTensionModel",
     "ResidualLearner",
-    "PhysicsResidualTarget",
-    # Ensemble
-    "StackingEnsemble",
-    "HybridStackingEnsemble",
-    "MultiDepthEnsemble",
-    "EnsembleConfig",
-    "BaseModelConfig",
-    # Explainability
-    "SHAPExplainer",
-    "FeatureImportance",
-    # Training
-    "TrainingOrchestrator",
     "TrainingConfig",
-    "TrainingResults",
-    "train_site",
-    # Validation
-    "DataSplitter",
-    "SplitConfig",
-    "MetricsCalculator",
-    "MetricsResult",
-    "BaselineModels",
-    "BaselineComparison",
-    "ValidationRunner",
-    "ValidationResult",
-    # Uncertainty
-    "UncertaintyConfig",
-    "PredictionWithUncertainty",
-    "QuantileRegressor",
-    "EnsembleUncertainty",
-    "ConformalPredictor",
-    "CQRPredictor",
-    "HybridUncertaintyQuantifier",
-    "UncertaintyQuantifier",
-    "UncertaintyCalibrator",
-    # Hybrid features
-    "HybridFeatureEnhancer",
-    "smooth_residuals",
-    "compute_residual_target",
-    "combine_physics_ml_predictions",
-    "prepare_hybrid_training_data",
+    "ResidualTrainer",
+    "add_sequential_features",
+    "prepare_features_with_sequences",
+    "ModelEvaluatorExtended",
+    "create_residual_targets",
+    "create_matric_residual_targets",
+    "create_matric_residual_targets_debiased",
+    "compute_site_bias_corrections",
+    "apply_site_bias_correction",
+    "create_prediction_features",
+    # New training utilities
+    "SiteBlockedCV",
+    "HorizonTrainingResult",
+    # PSI-space evaluation
+    "evaluate_psi_space_metrics",
+    "evaluate_log_psi_space_metrics",
+    # Residual Model
+    "ResidualModel",
+    "ResidualConfig",
 ]

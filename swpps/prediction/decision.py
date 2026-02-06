@@ -23,6 +23,7 @@ from swpps.core.types import (
     MatricPotential,
     PredictionResult,
     SoilMoistureStatus,
+    VanGenuchtenParams,
 )
 from swpps.core.constants import (
     CROP_THRESHOLDS,
@@ -57,6 +58,10 @@ class DecisionConfig:
 
     # Maximum irrigation amount per event (mm)
     max_irrigation_mm: float = 30.0
+
+    # Optional physics parameters for physically-based refill amount
+    vg_params: Optional[VanGenuchtenParams] = None
+    root_depth_m: float = 0.30
 
     # Whether irrigation is allowed (can be disabled for manual control)
     irrigation_enabled: bool = True
@@ -230,21 +235,28 @@ class IrrigationDecisionEngine:
         This uses a simplified approach based on the water needed
         to change matric potential from current to target.
         """
-        # Simple linear approximation
-        # Typical: 1 mm water changes psi by ~5-10 kPa in root zone
-        psi_deficit = self.refill_target - current_psi  # Positive value
+        # Preferred: use Van Genuchten to compute the θ deficit to refill target,
+        # then convert to an equivalent mm over root depth.
+        if self.config.vg_params is not None:
+            from swpps.physics.van_genuchten import water_content_from_potential
 
-        # Convert to mm (empirical relationship)
-        # This should ideally use Van Genuchten, but we use a simple approximation
-        mm_per_kpa = 0.15  # Rough average for loam soils
+            vg = self.config.vg_params
+            theta_now = water_content_from_potential(float(current_psi), vg)
+            theta_target = water_content_from_potential(
+                float(self.refill_target), vg)
 
-        gross_amount = abs(psi_deficit) * mm_per_kpa
+            # If already wetter than target, no refill.
+            dtheta = max(0.0, float(theta_target - theta_now))
+            gross_amount = dtheta * \
+                float(self.config.root_depth_m) * 1000.0  # m -> mm
+        else:
+            # Fallback: simple linear approximation
+            psi_deficit = self.refill_target - current_psi  # Positive value
+            mm_per_kpa = 0.15
+            gross_amount = abs(psi_deficit) * mm_per_kpa
 
-        # Account for efficiency
         net_amount = gross_amount / self.config.irrigation_efficiency
-
-        # Apply limits
-        return min(net_amount, self.config.max_irrigation_mm)
+        return min(float(net_amount), float(self.config.max_irrigation_mm))
 
     def _recently_irrigated(self, current_time: datetime) -> bool:
         """Check if irrigation occurred recently."""
@@ -268,15 +280,37 @@ class IrrigationDecisionEngine:
         if status is None:
             status = SoilMoistureStatus.from_potential(current_psi)
 
+        if action == IrrigationAction.IRRIGATE_NOW:
+            urgency = "immediate"
+        elif action == IrrigationAction.SCHEDULE:
+            urgency = "scheduled"
+        elif action == IrrigationAction.MONITOR:
+            urgency = "soon"
+        elif action == IrrigationAction.NO_ACTION:
+            urgency = "none"
+        else:
+            urgency = "none"
+
+        recommended_time = None
+        time_until_critical_hours = None
+        if action == IrrigationAction.SCHEDULE:
+            recommended_time = datetime.now() + timedelta(hours=float(scheduled_hours))
+            time_until_critical_hours = float(scheduled_hours)
+
         return IrrigationDecision(
             should_irrigate=action in (IrrigationAction.IRRIGATE_NOW,
                                        IrrigationAction.SCHEDULE),
+            urgency=urgency,
             action=action.value,
-            amount_mm=amount_mm,
+            amount_mm=float(amount_mm),
             reason=reason,
             current_psi_kpa=current_psi,
             status=status.value,
             scheduled_time_hours=scheduled_hours if action == IrrigationAction.SCHEDULE else None,
+            recommended_time=recommended_time,
+            time_until_critical_hours=time_until_critical_hours,
+            recommended_amount_mm=float(amount_mm) if action in (
+                IrrigationAction.IRRIGATE_NOW, IrrigationAction.SCHEDULE) else None,
         )
 
     def confirm_irrigation(self, irrigation_time: datetime, amount_mm: float) -> None:

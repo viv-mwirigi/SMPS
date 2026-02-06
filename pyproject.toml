@@ -1,35 +1,96 @@
 [build-system]
-requires = ["setuptools>=45", "wheel"]
+requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "smps"
 version = "0.1.0"
-description = "Soil Moisture Prediction System"
-requires-python = ">=3.9"
+description = "Soil Water Potential Prediction System - Physics-ML hybrid for irrigation optimization"
+requires-python = ">=3.9,<3.14"
 dependencies = [
-    "numpy",
-    "pandas",
-    "scipy",
-    "requests",
-    "matplotlib",
-    "tqdm",
-    "pydantic",
-    "pydantic-settings",
+    "numpy==2.4.1",
+    "pandas==3.0.0",
+    "scipy==1.16.3",
+    "scikit-learn==1.8.0",
+    "lightgbm==4.6.0",
+    "matplotlib==3.10.8",
+    "tqdm==4.67.1",
+    "pydantic==2.12.5",
+    "pydantic-settings==2.12.0",
+    "requests==2.32.5",
+    "python-dateutil==2.9.0.post0",
+    "joblib==1.5.3",
+    "psutil==7.2.2",
+    "pyyaml==6.0.3",
+    "dvc==3.16.1",
+    "dvc-gdrive==2.20.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest",
-    "pytest-cov",
+    "pytest==9.0.2",
+    "pytest-cov==7.0.0",
+    "black==23.7.0",
+    "isort==5.12.0",
+    "mypy==1.5.1",
+    "pre-commit==3.4.0",
+    "ruff==0.0.285",
+]
+ml = [
+    "optuna==4.7.0",
+    "mlflow==3.8.1",
+    "SALib==1.4.7",
+]
+data = [
+    "earthengine-api==0.1.374",
+    "geopandas==0.13.2",
+    "xarray==2023.7.0",
+    "netcdf4==1.6.4",
+]
+reproducibility = [
+    "dvc[all]==3.16.1",
+    "gitpython==3.1.32",
+    "dvc-gdrive==2.20.0",
 ]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
 [tool.pytest.ini_options]
 markers = [
     "integration: marks tests as integration tests requiring external services",
     "physics_pass: reproducible physics pass/fail suite (spec-driven)",
+    "reproducibility: marks tests as reproducibility tests",
 ]
 # Skip integration tests by default
 addopts = "-m 'not integration'"
+
+[tool.black]
+line-length = 88
+target-version = ['py39']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+line_length = 88
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true

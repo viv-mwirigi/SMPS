@@ -1,131 +1,354 @@
 """
-Physical constants, default values, and system-wide constants.
+Universal constants and irrigation thresholds for SWPPS.
+
+The key advantage of using matric potential is that these thresholds
+are UNIVERSAL - they work for any soil type without calibration.
 """
-import numpy as np
-from typing import Dict, Final, Tuple, List
 
-# Physical constants
-WATER_DENSITY: Final[float] = 1000.0  # kg/m³
-GRAVITY: Final[float] = 9.81  # m/s²
-LATENT_HEAT_VAPORIZATION: Final[float] = 2.45e6  # J/kg
-
-#
-# System constants
-MAX_SOIL_MOISTURE: Final[float] = 0.5  # m³/m³ (saturation)
-MIN_SOIL_MOISTURE: Final[float] = 0.01  # m³/m³ (residual)
-MAX_SOIL_TENSION: Final[float] = 1500.0  # kPa (oven dry)
-MIN_SOIL_TENSION: Final[float] = 0.0  # kPa (saturation)
-
-# Numerical stability
-EPSILON: Final[float] = 1e-10
+from dataclasses import dataclass
+from enum import Enum
+from typing import Dict
 
 
-# Data source parameters
-DATA_SOURCE_CONFIGS = {
-    "isdasoil": {
-        "base_url": "https://api.isda-africa.com",
-        "properties": ["clay", "sand", "silt", "bdod", "carbon_organic"],
-        "depths": ["0-20cm", "20-50cm"],
-        "rate_limit_per_hour": 600,
-    },
-    "era5": {
-        "variables": ["total_precipitation", "2m_temperature", "surface_solar_radiation_downwards"],
-        "resolution_km": 31,
-        "temporal_resolution": "hourly",
-    },
-    "grafs": {
-        "resolution_km": 10,
-        "depths": ["0-5cm", "0-100cm"],
-        "temporal_resolution": "daily",
-    }
+# =============================================================================
+# IRRIGATION ACTION TYPES
+# =============================================================================
+
+class IrrigationAction(Enum):
+    """Possible irrigation actions."""
+
+    NO_ACTION = "no_action"       # No irrigation needed
+    MONITOR = "monitor"           # Continue monitoring, getting close
+    SCHEDULE = "schedule"         # Schedule irrigation for future
+    IRRIGATE_NOW = "irrigate_now"  # Irrigate immediately
+
+
+# =============================================================================
+# MATRIC POTENTIAL REFERENCE SCALE (kPa)
+# =============================================================================
+# These are universal thresholds that apply to ALL soil types!
+# This is the fundamental advantage over VWC-based systems.
+
+@dataclass(frozen=True)
+class MatricPotentialRange:
+    """Universal matric potential ranges for plant-water relations."""
+
+    # Saturation and field capacity
+    SATURATION: float = 0.0              # Fully saturated
+    AIR_ENTRY: float = -2.0              # Air begins entering pores
+    VERY_WET: float = -5.0               # Very wet, may cause root issues
+    FIELD_CAPACITY: float = -33.0        # Maximum held against gravity
+
+    # Optimal range for most crops
+    OPTIMAL_UPPER: float = -33.0         # Upper optimal bound
+    OPTIMAL_MIDDLE: float = -60.0        # Middle of optimal range
+    OPTIMAL_LOWER: float = -100.0        # Lower optimal bound
+
+    # Stress thresholds
+    STRESS_ONSET: float = -200.0         # Beginning of stress
+    MODERATE_STRESS: float = -500.0      # Significant stress
+    SEVERE_STRESS: float = -1000.0       # Severe stress
+    PERMANENT_WILTING: float = -1500.0   # Plants cannot extract water
+
+    # Extreme values
+    AIR_DRY: float = -10000.0           # Air-dry soil
+    OVEN_DRY: float = -1000000.0        # Oven-dry soil (theoretical)
+
+
+# =============================================================================
+# UNIVERSAL IRRIGATION THRESHOLDS
+# =============================================================================
+
+IRRIGATION_THRESHOLDS: Dict[str, float] = {
+    # Status boundaries (kPa)
+    "saturation": 0.0,
+    "field_capacity_kpa": -33.0,
+    "optimal_upper_kpa": -33.0,
+    "optimal_lower_kpa": -100.0,
+    "stress_threshold_kpa": -200.0,
+    "moderate_stress_kpa": -500.0,
+    "severe_stress_kpa": -1000.0,
+    "wilting_point_kpa": -1500.0,
+
+    # Decision thresholds
+    "too_wet_kpa": -10.0,            # Below this, don't irrigate
+    "refill_target_kpa": -25.0,      # Target after irrigation
+    "irrigate_below_kpa": -80.0,     # Default irrigation trigger
 }
 
-# Default model parameters
-DEFAULT_LIGHTGBM_PARAMS: Final[Dict] = {
-    "objective": "regression",
-    "metric": "rmse",
-    "boosting_type": "gbdt",
-    "num_leaves": 31,
+
+# =============================================================================
+# CROP-SPECIFIC THRESHOLDS
+# =============================================================================
+# Different crops have different tolerance to water stress.
+# These thresholds determine when to irrigate for each crop.
+# Keys: irrigate_below_kpa, refill_to_kpa, stress_threshold_kpa
+
+CROP_THRESHOLDS: Dict[str, Dict[str, float]] = {
+    # High water requirement crops
+    "lettuce": {
+        "irrigate_below_kpa": -40.0,
+        "refill_to_kpa": -15.0,
+        "stress_threshold_kpa": -80.0,
+        "description": "Shallow roots, sensitive to water stress",
+    },
+    "spinach": {
+        "irrigate_below_kpa": -40.0,
+        "refill_to_kpa": -15.0,
+        "stress_threshold_kpa": -80.0,
+        "description": "Leafy green, needs consistent moisture",
+    },
+    "celery": {
+        "irrigate_below_kpa": -30.0,
+        "refill_to_kpa": -10.0,
+        "stress_threshold_kpa": -60.0,
+        "description": "Very sensitive to water stress",
+    },
+
+    # Moderate water requirement
+    "tomato": {
+        "irrigate_below_kpa": -80.0,
+        "refill_to_kpa": -25.0,
+        "stress_threshold_kpa": -150.0,
+        "description": "Moderate tolerance, deeper roots",
+    },
+    "pepper": {
+        "irrigate_below_kpa": -70.0,
+        "refill_to_kpa": -25.0,
+        "stress_threshold_kpa": -120.0,
+        "description": "Moderate water needs",
+    },
+    "eggplant": {
+        "irrigate_below_kpa": -80.0,
+        "refill_to_kpa": -25.0,
+        "stress_threshold_kpa": -150.0,
+        "description": "Similar to tomato",
+    },
+    "cucumber": {
+        "irrigate_below_kpa": -50.0,
+        "refill_to_kpa": -20.0,
+        "stress_threshold_kpa": -100.0,
+        "description": "Shallow roots, moderate needs",
+    },
+
+    # Lower water requirement / drought tolerant
+    "maize": {
+        "irrigate_below_kpa": -100.0,
+        "refill_to_kpa": -30.0,
+        "stress_threshold_kpa": -300.0,
+        "description": "Deeper roots, tolerates some stress",
+    },
+    "sorghum": {
+        "irrigate_below_kpa": -150.0,
+        "refill_to_kpa": -40.0,
+        "stress_threshold_kpa": -500.0,
+        "description": "Drought tolerant",
+    },
+    "wheat": {
+        "irrigate_below_kpa": -100.0,
+        "refill_to_kpa": -30.0,
+        "stress_threshold_kpa": -300.0,
+        "description": "Moderate drought tolerance",
+    },
+    "rice": {
+        "irrigate_below_kpa": -20.0,
+        "refill_to_kpa": -5.0,
+        "stress_threshold_kpa": -40.0,
+        "description": "Requires flooded or saturated conditions",
+    },
+
+    # Root crops
+    "potato": {
+        "irrigate_below_kpa": -60.0,
+        "refill_to_kpa": -20.0,
+        "stress_threshold_kpa": -100.0,
+        "description": "Sensitive to stress during tuber formation",
+    },
+    "carrot": {
+        "irrigate_below_kpa": -70.0,
+        "refill_to_kpa": -25.0,
+        "stress_threshold_kpa": -120.0,
+        "description": "Moderate needs, consistent moisture",
+    },
+    "onion": {
+        "irrigate_below_kpa": -60.0,
+        "refill_to_kpa": -20.0,
+        "stress_threshold_kpa": -100.0,
+        "description": "Shallow roots",
+    },
+
+    # Tree crops
+    "citrus": {
+        "irrigate_below_kpa": -80.0,
+        "refill_to_kpa": -25.0,
+        "stress_threshold_kpa": -200.0,
+        "description": "Deep roots, moderate drought tolerance",
+    },
+    "mango": {
+        "irrigate_below_kpa": -100.0,
+        "refill_to_kpa": -30.0,
+        "stress_threshold_kpa": -300.0,
+        "description": "Tolerates some drought",
+    },
+    "avocado": {
+        "irrigate_below_kpa": -50.0,
+        "refill_to_kpa": -20.0,
+        "stress_threshold_kpa": -100.0,
+        "description": "Shallow roots, sensitive",
+    },
+
+    # Legumes
+    "bean": {
+        "irrigate_below_kpa": -70.0,
+        "refill_to_kpa": -25.0,
+        "stress_threshold_kpa": -150.0,
+        "description": "Moderate water needs",
+    },
+    "groundnut": {
+        "irrigate_below_kpa": -100.0,
+        "refill_to_kpa": -30.0,
+        "stress_threshold_kpa": -300.0,
+        "description": "Some drought tolerance",
+    },
+    "cowpea": {
+        "irrigate_below_kpa": -150.0,
+        "refill_to_kpa": -40.0,
+        "stress_threshold_kpa": -400.0,
+        "description": "Good drought tolerance",
+    },
+
+    # Generic/default for unknown crops
+    "generic": {
+        "irrigate_below_kpa": -80.0,
+        "refill_to_kpa": -25.0,
+        "stress_threshold_kpa": -200.0,
+        "description": "Conservative default values",
+    },
+}
+
+
+# =============================================================================
+# PHYSICAL CONSTANTS
+# =============================================================================
+
+PHYSICAL_CONSTANTS = {
+    # Water properties
+    "water_density_kg_m3": 1000.0,
+    "water_specific_heat_j_kg_k": 4186.0,
+    "latent_heat_vaporization_mj_kg": 2.45,
+
+    # Air properties
+    "psychrometric_constant_kpa_c": 0.0665,  # At sea level
+
+    # Soil-water constants
+    "gravity_m_s2": 9.81,
+
+    # Conversions
+    "kpa_to_m_water": 0.102,  # 1 kPa = 0.102 m water head
+    "cbar_to_kpa": 1.0,       # 1 cbar = 1 kPa
+    "bar_to_kpa": 100.0,      # 1 bar = 100 kPa
+    "psi_to_kpa": 6.895,      # 1 psi = 6.895 kPa
+}
+
+
+# =============================================================================
+# WEATHER API CONFIGURATION
+# =============================================================================
+
+OPENMETEO_CONFIG = {
+    "historical_url": "https://archive-api.open-meteo.com/v1/era5",
+    "forecast_url": "https://api.open-meteo.com/v1/forecast",
+    "max_retries": 3,  # Reduced from 5
+    "backoff_seconds": 5.0,  # Increased from 2.0
+    "timeout_seconds": 30,
+    "min_request_interval": 3.0,  # Increased from 2.0
+
+    # Variables to fetch
+    "daily_variables": [
+        "temperature_2m_max",
+        "temperature_2m_min",
+        "temperature_2m_mean",
+        "precipitation_sum",
+        "et0_fao_evapotranspiration",
+        "shortwave_radiation_sum",
+        "relative_humidity_2m_mean",
+        "wind_speed_10m_mean",
+    ],
+    "hourly_variables": [
+        "temperature_2m",
+        "relative_humidity_2m",
+        "precipitation",
+        "et0_fao_evapotranspiration",
+        "soil_moisture_0_to_7cm",
+        "soil_temperature_0_to_7cm",
+    ],
+}
+
+
+# =============================================================================
+# MODEL CONFIGURATION DEFAULTS
+# =============================================================================
+
+MODEL_DEFAULTS = {
+    # Physics model
+    "n_layers": 3,
+    "max_depth_m": 1.0,
+    "warmup_days": 30,
+
+    # ML model
+    "ml_model_type": "lightgbm",
+    "n_estimators": 2000,
+    "early_stopping_rounds": 100,
+    "learning_rate": 0.015,
     "max_depth": 8,
-    "learning_rate": 0.05,
-    "feature_fraction": 0.8,
-    "bagging_fraction": 0.8,
-    "bagging_freq": 5,
-    "min_data_in_leaf": 20,
-    "verbosity": -1,
-    "seed": 42
+
+    # Forecast horizons (hours)
+    "forecast_horizons": [0, 6, 24, 72, 168],
+
+    # Feature engineering
+    "lag_days": [1, 3, 7, 14],
+    "rolling_windows": [7, 14, 30],
+
+    # Training
+    "validation_fraction": 0.15,
+    "min_training_samples": 30,
+    "retrain_interval_days": 7,
 }
 
-# Uncertainty quantification constants
-UNCERTAINTY_CONSTANTS: Final[Dict[str, float]] = {
-    "default_coverage": 0.9,
-    "min_ensemble_members": 3,
-    "max_ensemble_members": 20,
-    "calibration_min_samples": 100,
-    "prediction_interval_tolerance": 0.05,  # Allowed deviation from nominal coverage
-    "drift_detection_window": 30  # Days for detecting prediction drift
-}
 
-# Error thresholds for quality flags
-QUALITY_THRESHOLDS: Final[Dict[str, float]] = {
-    "rmse_good": 0.05,  # m³/m³
-    "rmse_acceptable": 0.08,
-    "rmse_poor": 0.12,
-    "bias_good": 0.02,
-    "bias_acceptable": 0.05,
-    "correlation_good": 0.8,
-    "correlation_acceptable": 0.6
-}
+# =============================================================================
+# SENSOR CONFIGURATION
+# =============================================================================
 
-# Remote sensing constants
-SENTINEL_BANDS: Final[Dict[str, Tuple[float, float]]] = {
-    "B2": (0.458, 0.523),  # Blue
-    "B3": (0.543, 0.578),  # Green
-    "B4": (0.650, 0.680),  # Red
-    "B8": (0.785, 0.900),  # NIR
-    "B11": (1.565, 1.655),  # SWIR1
-    "B12": (2.100, 2.280)   # SWIR2
-}
-
-# Vegetation indices formulas
-VEGETATION_INDICES: Final[Dict[str, str]] = {
-    "NDVI": "(B8 - B4) / (B8 + B4)",
-    "EVI": "2.5 * (B8 - B4) / (B8 + 6 * B4 - 7.5 * B2 + 1)",
-    "NDWI": "(B3 - B8) / (B3 + B8)",
-    "MSAVI": "(2 * B8 + 1 - sqrt((2 * B8 + 1)^2 - 8 * (B8 - B4))) / 2"
-}
-
-# SAR backscatter ranges (dB)
-SENTINEL1_BACKSCATTER_RANGES: Final[Dict[str, Tuple[float, float]]] = {
-    "VV_dry": (-20, -10),
-    "VV_moist": (-15, -5),
-    "VV_wet": (-10, 0),
-    "VH_dry": (-25, -15),
-    "VH_moist": (-20, -10),
-    "VH_wet": (-15, -5)
-}
-
-# Unit conversion factors
-UNIT_CONVERSIONS: Final[Dict[str, float]] = {
-    "mm_to_m": 0.001,
-    "m_to_mm": 1000.0,
-    "celsius_to_kelvin": 273.15,
-    "kPa_to_bar": 0.01,
-    "bar_to_kPa": 100.0,
-    "joule_to_calorie": 0.239006,
-    "hectare_to_sqm": 10000.0,
-    "inch_to_mm": 25.4,
-    "mm_to_inch": 0.0393701,
-    "acre_to_hectare": 0.404686
-}
-# Feature names (for consistency)
-FEATURE_GROUPS: Final[Dict[str, List[str]]] = {
-    "physics": ["theta_phys_surface", "theta_phys_root", "physics_residual"],
-    "temporal": ["soil_moisture_lag_1d", "soil_moisture_lag_7d", 
-                 "soil_moisture_rolling_mean_7d", "soil_moisture_rolling_std_7d"],
-    "meteorological": ["precip_1d_sum", "precip_7d_sum", "et0_1d_sum", "et0_7d_sum",
-                       "temperature_mean_7d", "vapor_pressure_deficit_mean_7d"],
-    "remote_sensing": ["ndvi", "ndvi_anomaly", "sar_vv_mean", "sar_vh_mean"],
-    "static": ["sand_percent", "silt_percent", "clay_percent", 
-               "field_capacity", "wilting_point", "elevation", "slope"]
+SENSOR_TYPES = {
+    "watermark": {
+        "unit": "cbar",
+        "range": (0, 200),
+        "accuracy_cbar": 2,
+        "description": "Granular matrix sensor (Irrometer)",
+    },
+    "tensiometer": {
+        "unit": "cbar",
+        "range": (0, 85),
+        "accuracy_cbar": 1,
+        "description": "Water-filled tube with ceramic tip",
+    },
+    "mps6": {
+        "unit": "kPa",
+        "range": (-100000, 0),
+        "accuracy_kpa": 5,
+        "description": "METER MPS-6 dielectric water potential sensor",
+    },
+    "teros21": {
+        "unit": "kPa",
+        "range": (-100000, 0),
+        "accuracy_kpa": 5,
+        "description": "METER TEROS 21 water potential sensor",
+    },
+    "capacitive": {
+        "unit": "percent",
+        "range": (0, 100),
+        "description": "Volumetric water content sensor (needs conversion)",
+        "needs_conversion": True,
+    },
 }
